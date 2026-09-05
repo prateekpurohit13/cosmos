@@ -229,6 +229,22 @@ void test_simulator_seed_drives_fault_stream() {
     std::cout << "[PASS] test_simulator_seed_drives_fault_stream" << std::endl;
 }
 
+void test_simulator_virtual_clock() {
+    using namespace cosmos::literals;
+    cosmos::Simulator sim;
+    assert(sim.now() == cosmos::Time::zero());
+    assert(sim.clock().now_ns() == 0);
+
+    sim.advance_time(500_ms);
+    assert(sim.now() == cosmos::Time::zero() + 500_ms);
+    assert(sim.clock().now_ns() == 500'000'000);
+
+    sim.clock().advance_to(cosmos::Time::zero() + 2_s);
+    assert(sim.now() == cosmos::Time::zero() + 2_s);
+
+    std::cout << "[PASS] test_simulator_virtual_clock" << std::endl;
+}
+
 int main() {
     test_slot_is_empty_by_default();
     test_slot_holds_and_releases_an_injector();
@@ -240,6 +256,7 @@ int main() {
     test_oom_decision_endpoint_rates_do_not_draw();
     test_oom_decision_is_deterministic_for_fixed_seed();
     test_simulator_seed_drives_fault_stream();
+    test_simulator_virtual_clock();
     std::cout << "All simulator tests passed successfully!" << std::endl;
     return 0;
 }

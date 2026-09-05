@@ -73,7 +73,7 @@ gcc -g -DCOSMOS_SIM \
     -Wl,--wrap=malloc -Wl,--wrap=free \
     -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join \
     -Wl,--wrap=pthread_mutex_lock -Wl,--wrap=pthread_mutex_unlock \
-    -Wl,--wrap=clock_gettime -Wl,--wrap=nanosleep \
+    -Wl,--wrap=clock_gettime -Wl,--wrap=nanosleep -Wl,--wrap=clock_nanosleep \
     -Wl,--wrap=socket -Wl,--wrap=send -Wl,--wrap=recv \
     -Wl,--wrap=write -Wl,--wrap=fsync \
     -Wl,--wrap=getrandom \

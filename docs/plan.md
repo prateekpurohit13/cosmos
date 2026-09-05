@@ -111,6 +111,7 @@ Determinism comes from controlling six key subsystems via standard function wrap
 | `pthread_mutex_unlock(...)`| `__wrap_pthread_mutex_unlock` | Unlocks sim mutex; unblocks waiting tasks to Ready Queue | Standard `libpthread` |
 | `clock_gettime(clk, ts)` | `__wrap_clock_gettime` | Returns virtual simulation clock time | Standard `libc` `clock_gettime` |
 | `nanosleep(req, rem)` | `__wrap_nanosleep` | Suspends current task until virtual time reaches `now + req` | Standard `libc` `nanosleep` |
+| `clock_nanosleep(clk, flags, req, rem)` | `__wrap_clock_nanosleep` | Suspends current task until `now + req`, or until `req` as an absolute deadline under `TIMER_ABSTIME` | Standard `libc` `clock_nanosleep` |
 | `getrandom(buf, len, flags)`| `__wrap_getrandom` | Draws bytes from seeded `xoshiro256**` RNG stream | Standard OS `getrandom` |
 | `socket(domain, type, proto)`| `__wrap_socket` | Creates virtual endpoint handle in sim network graph | Standard kernel `socket` |
 | `send(fd, buf, len, flags)` | `__wrap_send` | Enqueues packet event in sim network with latency/loss faults | Standard kernel `send` |

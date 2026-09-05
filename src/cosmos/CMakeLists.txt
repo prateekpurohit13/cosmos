@@ -31,4 +31,8 @@ target_compile_options(cosmos INTERFACE
     -fno-builtin-free
     -fno-builtin-calloc
     -fno-builtin-realloc
+    -fno-builtin-random
+    -fno-builtin-rand
+    -fno-builtin-srand
+    -fno-builtin-srandom
 )

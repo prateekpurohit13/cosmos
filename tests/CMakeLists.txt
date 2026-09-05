@@ -39,6 +39,23 @@ add_test(NAME test_seed_derivation COMMAND test_seed_derivation)
 
 add_executable(test_time test_time.cpp)
 target_link_libraries(test_time PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_time PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+    )
+    target_link_options(test_time PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+    )
+endif()
+
 add_test(NAME test_time COMMAND test_time)
 
 add_executable(test_faults test_faults.cpp)
@@ -78,3 +95,66 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_simulator COMMAND test_simulator)
+
+add_executable(test_wrap_random test_wrap_random.cpp)
+target_link_libraries(test_wrap_random PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped symbols must stay opaque calls; random-family builtins would otherwise fold.
+    target_compile_options(test_wrap_random PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-random"
+        "-fno-builtin-rand"
+        "-fno-builtin-srand"
+        "-fno-builtin-srandom"
+    )
+    target_link_options(test_wrap_random PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=getrandom"
+        "-Wl,--wrap=random"
+        "-Wl,--wrap=rand"
+        "-Wl,--wrap=srandom"
+        "-Wl,--wrap=srand"
+    )
+endif()
+
+add_test(NAME test_wrap_random COMMAND test_wrap_random)
+
+add_executable(test_wrap_storage test_wrap_storage.cpp)
+target_link_libraries(test_wrap_storage PRIVATE cosmos)
+# White-box test: pins the internal storage eligibility policy from wrapper_fault.hpp.
+target_include_directories(test_wrap_storage PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped symbols must stay opaque calls so the linker substitution reaches them.
+    target_compile_options(test_wrap_storage PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-open"
+        "-fno-builtin-read"
+        "-fno-builtin-write"
+        "-fno-builtin-fsync"
+    )
+    target_link_options(test_wrap_storage PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=fsync"
+    )
+endif()
+
+add_test(NAME test_wrap_storage COMMAND test_wrap_storage)

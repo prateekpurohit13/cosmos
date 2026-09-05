@@ -14,6 +14,10 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-fno-builtin-free"
         "-fno-builtin-calloc"
         "-fno-builtin-realloc"
+        "-fno-builtin-random"
+        "-fno-builtin-rand"
+        "-fno-builtin-srand"
+        "-fno-builtin-srandom"
     )
   target_link_options(kv_store_sim PRIVATE
         "-Wl,--gc-sections"
@@ -30,10 +34,15 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=sched_yield"
         "-Wl,--wrap=clock_gettime"
         "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
         "-Wl,--wrap=open"
         "-Wl,--wrap=read"
         "-Wl,--wrap=write"
         "-Wl,--wrap=fsync"
         "-Wl,--wrap=getrandom"
+        "-Wl,--wrap=random"
+        "-Wl,--wrap=rand"
+        "-Wl,--wrap=srandom"
+        "-Wl,--wrap=srand"
     )
 endif()

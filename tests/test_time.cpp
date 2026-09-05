@@ -1,3 +1,4 @@
+#include "cosmos/cosmos.hpp"
 #include "cosmos/time.hpp"
 #include <cassert>
 #include <cstddef>
@@ -202,6 +203,249 @@ void test_run_windows_are_orderable() {
     std::cout << "[PASS] test_run_windows_are_orderable" << std::endl;
 }
 
+void test_virtual_clock_direct_methods() {
+    cosmos::VirtualClock clock;
+    assert(clock.now() == cosmos::Time::zero());
+    assert(clock.now_ns() == 0);
+    assert(clock.realtime_ns() == cosmos::kDefaultRealtimeEpochNs);
+    assert(clock.realtime() == cosmos::Time{cosmos::kDefaultRealtimeEpochNs});
+
+    clock.advance(500_ms);
+    assert(clock.now() == cosmos::Time::zero() + 500_ms);
+    assert(clock.now_ns() == 500'000'000);
+    assert(clock.realtime_ns() == cosmos::kDefaultRealtimeEpochNs + 500'000'000);
+
+    // Negative duration advance is a no-op
+    clock.advance(cosmos::Duration{-100'000'000});
+    assert(clock.now() == cosmos::Time::zero() + 500_ms);
+
+    // advance_to forward moves clock
+    clock.advance_to(cosmos::Time::zero() + 2_s);
+    assert(clock.now() == cosmos::Time::zero() + 2_s);
+
+    // advance_to backward is a no-op
+    clock.advance_to(cosmos::Time::zero() + 1_s);
+    assert(clock.now() == cosmos::Time::zero() + 2_s);
+
+    // Configurable realtime epoch
+    clock.set_realtime_epoch(1000'000'000'000LL);
+    assert(clock.realtime_epoch_ns() == 1000'000'000'000LL);
+    assert(clock.realtime_ns() == 1000'000'000'000LL + 2'000'000'000LL);
+
+    // Direct POSIX conversions
+    struct timespec ts{};
+    assert(clock.clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 2);
+    assert(ts.tv_nsec == 0);
+
+    assert(clock.clock_gettime(CLOCK_REALTIME, &ts) == 0);
+    assert(ts.tv_sec == 1002);
+    assert(ts.tv_nsec == 0);
+
+    errno = 0;
+    assert(clock.clock_gettime(-999, &ts) == -1);
+    assert(errno == EINVAL);
+
+    errno = 0;
+    assert(clock.clock_gettime(CLOCK_MONOTONIC, nullptr) == -1);
+    assert(errno == EFAULT);
+
+    struct timeval tv{};
+    assert(clock.gettimeofday(&tv, nullptr) == 0);
+    assert(tv.tv_sec == 1002);
+    assert(tv.tv_usec == 0);
+
+    errno = 0;
+    assert(clock.gettimeofday(nullptr, nullptr) == -1);
+    assert(errno == EFAULT);
+
+    struct timespec req{1, 500'000'000};
+    struct timespec rem{99, 99};
+    assert(clock.nanosleep(&req, &rem) == 0);
+    assert(clock.now() == cosmos::Time::zero() + 3500_ms);
+    assert(rem.tv_sec == 0 && rem.tv_nsec == 0);
+
+    errno = 0;
+    assert(clock.nanosleep(nullptr, nullptr) == -1);
+    assert(errno == EFAULT);
+
+    struct timespec bad_req{-1, 0};
+    errno = 0;
+    assert(clock.nanosleep(&bad_req, nullptr) == -1);
+    assert(errno == EINVAL);
+
+    struct timespec bad_nsec{1, 1'500'000'000};
+    errno = 0;
+    assert(clock.nanosleep(&bad_nsec, nullptr) == -1);
+    assert(errno == EINVAL);
+
+    std::cout << "[PASS] test_virtual_clock_direct_methods" << std::endl;
+}
+
+void test_virtual_clock_clock_nanosleep() {
+    cosmos::VirtualClock clock;
+
+    // Relative sleep advances by the request (same semantics as nanosleep)
+    struct timespec rel{1, 250'000'000};
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, 0, &rel, nullptr) == 0);
+    assert(clock.now() == Time::zero() + 1250_ms);
+
+    // TIMER_ABSTIME on the monotonic timeline: the deadline is a raw virtual reading
+    struct timespec abs_monotonic{4, 0};
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &abs_monotonic, nullptr) == 0);
+    assert(clock.now() == Time::zero() + 4_s);
+
+    // TIMER_ABSTIME on the realtime timeline: the deadline is anchored to the epoch
+    struct timespec abs_realtime{0, 0};
+    abs_realtime.tv_sec =
+        static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL) + 6;
+    assert(clock.clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_realtime, nullptr) == 0);
+    assert(clock.now() == Time::zero() + 6_s);
+
+    // A deadline at or before now is a no-op
+    assert(clock.clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_realtime, nullptr) == 0);
+    assert(clock.now() == Time::zero() + 6_s);
+
+    struct timespec rem{9, 9};
+    struct timespec past{0, 0};
+    past.tv_sec = static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL) - 100;
+    assert(clock.clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &past, &rem) == 0);
+    assert(clock.now() == Time::zero() + 6_s);
+    assert(rem.tv_sec == 0 && rem.tv_nsec == 0);
+
+    // POSIX return convention: the error number is returned directly, errno untouched
+    errno = 0;
+    struct timespec bad_nsec{1, 1'500'000'000};
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, 0, &bad_nsec, nullptr) == EINVAL);
+    assert(errno == 0);
+
+    struct timespec neg{-1, 0};
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, 0, &neg, nullptr) == EINVAL);
+
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, 0, nullptr, nullptr) == EFAULT);
+
+    assert(clock.clock_nanosleep(-999, 0, &rel, nullptr) == EINVAL);
+    assert(clock.clock_nanosleep(CLOCK_MONOTONIC, 99, &rel, nullptr) == EINVAL);
+
+    assert(clock.now() == Time::zero() + 6_s);
+    std::cout << "[PASS] test_virtual_clock_clock_nanosleep" << std::endl;
+}
+
+void test_wrapped_clock_gettime_and_nanosleep() {
+    assert(!cosmos::Simulator::has_current());
+
+    // Passthrough when no simulator is active
+    struct timespec real_ts{};
+    assert(clock_gettime(CLOCK_MONOTONIC, &real_ts) == 0);
+    assert(real_ts.tv_sec >= 0); // Host uptime is non-negative; do not assume it is large
+
+    struct timeval real_tv{};
+    assert(gettimeofday(&real_tv, nullptr) == 0);
+    assert(real_tv.tv_sec > 0);
+
+    struct timespec zero_req{0, 0};
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &zero_req, nullptr) == 0);
+
+    // Active simulation context
+    cosmos::Simulator sim;
+    cosmos::Simulator::set_current(&sim);
+
+    struct timespec ts{};
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 0);
+    assert(ts.tv_nsec == 0);
+
+#ifdef CLOCK_MONOTONIC_RAW
+    assert(clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0);
+    assert(ts.tv_sec == 0);
+    assert(ts.tv_nsec == 0);
+#endif
+
+#ifdef CLOCK_BOOTTIME
+    assert(clock_gettime(CLOCK_BOOTTIME, &ts) == 0);
+    assert(ts.tv_sec == 0);
+    assert(ts.tv_nsec == 0);
+#endif
+
+    assert(clock_gettime(CLOCK_REALTIME, &ts) == 0);
+    assert(ts.tv_sec == static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL));
+    assert(ts.tv_nsec == 0);
+
+    struct timeval tv{};
+    assert(gettimeofday(&tv, nullptr) == 0);
+    assert(tv.tv_sec == static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL));
+    assert(tv.tv_usec == 0);
+
+    // Advancing simulator time
+    sim.advance_time(1250_ms);
+    assert(sim.now() == cosmos::Time::zero() + 1250_ms);
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 1);
+    assert(ts.tv_nsec == 250'000'000);
+
+    assert(gettimeofday(&tv, nullptr) == 0);
+    assert(tv.tv_sec == static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL + 1));
+    assert(tv.tv_usec == 250'000);
+
+    // nanosleep advances virtual time instantaneously
+    struct timespec sleep_req{2, 500'000'000};
+    struct timespec sleep_rem{1, 1};
+    assert(nanosleep(&sleep_req, &sleep_rem) == 0);
+    assert(sim.now() == cosmos::Time::zero() + 3750_ms);
+    assert(sleep_rem.tv_sec == 0);
+    assert(sleep_rem.tv_nsec == 0);
+
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 3);
+    assert(ts.tv_nsec == 750'000'000);
+
+    // Wrapped clock_nanosleep: relative sleep advances virtual time
+    struct timespec rel_req{0, 750'000'000};
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &rel_req, nullptr) == 0);
+    assert(sim.now() == cosmos::Time::zero() + 4500_ms);
+
+    // Wrapped clock_nanosleep: TIMER_ABSTIME against the anchored realtime clock
+    struct timespec abs_req{0, 0};
+    abs_req.tv_sec = static_cast<time_t>(cosmos::kDefaultRealtimeEpochNs / 1'000'000'000LL) + 6;
+    assert(clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_req, nullptr) == 0);
+    assert(sim.now() == cosmos::Time::zero() + 6_s);
+
+    // POSIX return convention: the error number is returned directly, errno untouched
+    errno = 0;
+    struct timespec wrapped_bad{0, 2'000'000'000};
+    assert(clock_nanosleep(CLOCK_MONOTONIC, 0, &wrapped_bad, nullptr) == EINVAL);
+    assert(errno == 0);
+
+    // Deactivation restores passthrough
+    cosmos::Simulator::set_current(nullptr);
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec >= 0); // Host uptime is non-negative; do not assume it is large
+
+    std::cout << "[PASS] test_wrapped_clock_gettime_and_nanosleep" << std::endl;
+}
+
+void test_simulator_clock_isolation() {
+    cosmos::Simulator sim_a;
+    cosmos::Simulator sim_b;
+
+    sim_a.advance_time(10_s);
+    assert(sim_a.now() == cosmos::Time::zero() + 10_s);
+    assert(sim_b.now() == cosmos::Time::zero());
+
+    cosmos::Simulator::set_current(&sim_a);
+    struct timespec ts{};
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 10);
+
+    cosmos::Simulator::set_current(&sim_b);
+    assert(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
+    assert(ts.tv_sec == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_simulator_clock_isolation" << std::endl;
+}
+
 int main() {
     test_duration_arithmetic();
     test_ordering_and_bounds();
@@ -210,6 +454,10 @@ int main() {
     test_fractional_scaling();
     test_integer_scale_factors();
     test_run_windows_are_orderable();
+    test_virtual_clock_direct_methods();
+    test_virtual_clock_clock_nanosleep();
+    test_wrapped_clock_gettime_and_nanosleep();
+    test_simulator_clock_isolation();
     std::cout << "All time tests passed successfully!" << std::endl;
     return 0;
 }

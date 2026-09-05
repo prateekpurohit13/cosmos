@@ -1,8 +1,17 @@
 #pragma once
 
+#include <cerrno>
 #include <compare>
 #include <concepts>
 #include <cstdint>
+#include <sys/time.h>
+#include <time.h>
+
+// glibc exposes TIMER_ABSTIME only under feature-test macros; define the POSIX value so the
+// header stays self-contained under strict -std builds.
+#ifndef TIMER_ABSTIME
+#define TIMER_ABSTIME 1
+#endif
 
 namespace cosmos {
 
@@ -110,5 +119,203 @@ constexpr Duration operator""_ms(unsigned long long v) { return Duration{to_ns(v
 constexpr Duration operator""_s(unsigned long long v) { return Duration{to_ns(v, 1'000'000'000)}; }
 
 } // namespace literals
+
+// Default realtime epoch: 2026-01-01 00:00:00 UTC = 1767225600 seconds = 1767225600000000000 ns
+inline constexpr int64_t kDefaultRealtimeEpochNs = 1767225600000000000LL;
+
+/**
+ * @brief Deterministic virtual clock owned by a Simulator universe.
+ *
+ * Tracks monotonic virtual time (starting at 0ns) and wall-clock realtime (anchored at a
+ * deterministic base epoch). In simulation testing builds, clock_gettime, gettimeofday, and
+ * the sleep calls read and advance this clock without real-time OS delays.
+ *
+ * Interim contract: until the P1 fiber scheduler exists, sleeps advance the universe clock
+ * by the full request immediately — nothing suspends. Once the scheduler lands
+ * (docs/design.md §3), sleep calls must instead suspend the calling task and register a
+ * wake-up event: virtual time only advances when no task is runnable, and one task's sleep
+ * must not consume time for others.
+ */
+class VirtualClock {
+  public:
+    explicit VirtualClock(Time start_time = Time::zero(),
+                          int64_t realtime_epoch_ns = kDefaultRealtimeEpochNs)
+        : now_(start_time), realtime_epoch_ns_(realtime_epoch_ns) {}
+
+    constexpr Time now() const { return now_; }
+    constexpr int64_t now_ns() const { return now_.ns; }
+
+    constexpr Time realtime() const { return Time{add_sat(realtime_epoch_ns_, now_.ns)}; }
+    constexpr int64_t realtime_ns() const { return add_sat(realtime_epoch_ns_, now_.ns); }
+
+    constexpr int64_t realtime_epoch_ns() const { return realtime_epoch_ns_; }
+    void set_realtime_epoch(int64_t epoch_ns) { realtime_epoch_ns_ = epoch_ns; }
+
+    void advance(Duration d) {
+        if (d.ns <= 0) return;
+        now_ = now_ + d;
+    }
+
+    void advance_to(Time target) {
+        if (target > now_) {
+            now_ = target;
+        }
+    }
+
+    // Test-only repositioning: injector gate tests need to move the clock backward to
+    // re-enter warmup/quiesce windows. Simulation code must use advance()/advance_to().
+    void set(Time t) { now_ = t; }
+
+    int clock_gettime(clockid_t clk_id, struct timespec* tp) const {
+        if (!tp) {
+            errno = EFAULT;
+            return -1;
+        }
+
+        switch (clock_domain(clk_id)) {
+        case ClockDomain::Monotonic:
+            write_timespec(tp, now_ns());
+            return 0;
+        case ClockDomain::Realtime:
+            write_timespec(tp, realtime_ns());
+            return 0;
+        case ClockDomain::Unsupported:
+            break;
+        }
+
+        errno = EINVAL;
+        return -1;
+    }
+
+    int gettimeofday(struct timeval* tv, void* tz) const {
+        (void)tz;
+        if (!tv) {
+            errno = EFAULT;
+            return -1;
+        }
+        int64_t ns = realtime_ns();
+        int64_t us = ns / 1'000LL;
+        tv->tv_sec = static_cast<time_t>(us / 1'000'000LL);
+        tv->tv_usec = static_cast<suseconds_t>(us % 1'000'000LL);
+        if (tv->tv_usec < 0) {
+            tv->tv_sec -= 1;
+            tv->tv_usec += 1'000'000LL;
+        }
+        return 0;
+    }
+
+    // Interim semantics: advances the universe clock by the full request. See the class
+    // comment for the scheduler-era contract.
+    int nanosleep(const struct timespec* req, struct timespec* rem) {
+        if (!req) {
+            errno = EFAULT;
+            return -1;
+        }
+        if (!timespec_valid(*req)) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        advance(Duration{timespec_ns(*req)});
+
+        if (rem) {
+            rem->tv_sec = 0;
+            rem->tv_nsec = 0;
+        }
+        return 0;
+    }
+
+    // Unlike nanosleep, POSIX clock_nanosleep returns the error number directly instead of
+    // -1 with errno. Production interruptions (EINTR plus a remainder) do not exist in the
+    // simulation, so a valid sleep always completes in full and reports success.
+    int clock_nanosleep(clockid_t clk_id, int flags, const struct timespec* req,
+                        struct timespec* rem) {
+        if (!req) {
+            return EFAULT;
+        }
+        if (!timespec_valid(*req)) {
+            return EINVAL;
+        }
+        if (flags != 0 && flags != TIMER_ABSTIME) {
+            return EINVAL;
+        }
+
+        const ClockDomain domain = clock_domain(clk_id);
+        if (domain == ClockDomain::Unsupported) {
+            return EINVAL;
+        }
+
+        if (flags == TIMER_ABSTIME) {
+            // Sleep until the requested clock reads req: a monotonic deadline is a raw
+            // virtual reading, a realtime deadline is mapped through the epoch anchor.
+            // A deadline in the past is a no-op.
+            const int64_t deadline_ns = timespec_ns(*req);
+            const Time target = domain == ClockDomain::Realtime
+                                    ? Time{sub_sat(deadline_ns, realtime_epoch_ns_)}
+                                    : Time{deadline_ns};
+            advance_to(target);
+        } else {
+            advance(Duration{timespec_ns(*req)});
+        }
+
+        if (rem) {
+            rem->tv_sec = 0;
+            rem->tv_nsec = 0;
+        }
+        return 0;
+    }
+
+  private:
+    enum class ClockDomain { Monotonic, Realtime, Unsupported };
+
+    // Classifies the POSIX clock ids the simulation supports. Unsupported ones
+    // (CLOCK_PROCESS_CPUTIME_ID and friends) fail with EINVAL rather than silently
+    // reading a fake timeline.
+    static constexpr ClockDomain clock_domain(clockid_t clk_id) {
+        switch (clk_id) {
+        case CLOCK_MONOTONIC:
+#ifdef CLOCK_MONOTONIC_RAW
+        case CLOCK_MONOTONIC_RAW:
+#endif
+#ifdef CLOCK_BOOTTIME
+        case CLOCK_BOOTTIME:
+#endif
+#ifdef CLOCK_MONOTONIC_COARSE
+        case CLOCK_MONOTONIC_COARSE:
+#endif
+            return ClockDomain::Monotonic;
+
+        case CLOCK_REALTIME:
+#ifdef CLOCK_REALTIME_COARSE
+        case CLOCK_REALTIME_COARSE:
+#endif
+            return ClockDomain::Realtime;
+
+        default:
+            return ClockDomain::Unsupported;
+        }
+    }
+
+    static constexpr bool timespec_valid(const struct timespec& ts) {
+        return ts.tv_sec >= 0 && ts.tv_nsec >= 0 && ts.tv_nsec < 1'000'000'000L;
+    }
+
+    static constexpr int64_t timespec_ns(const struct timespec& ts) {
+        return add_sat(mul_sat(static_cast<int64_t>(ts.tv_sec), 1'000'000'000LL),
+                       static_cast<int64_t>(ts.tv_nsec));
+    }
+
+    static void write_timespec(struct timespec* tp, int64_t ns) {
+        tp->tv_sec = static_cast<time_t>(ns / 1'000'000'000LL);
+        tp->tv_nsec = static_cast<long>(ns % 1'000'000'000LL);
+        if (tp->tv_nsec < 0) {
+            tp->tv_sec -= 1;
+            tp->tv_nsec += 1'000'000'000LL;
+        }
+    }
+
+    Time now_{Time::zero()};
+    int64_t realtime_epoch_ns_{kDefaultRealtimeEpochNs};
+};
 
 } // namespace cosmos
