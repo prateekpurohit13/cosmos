@@ -399,6 +399,7 @@ enum class ConfigError : uint8_t {
     QuorumExceedsNodes,
     LimitsExceedNodes,
     BadWindowOrder,
+    InjectorAlreadyInstalled,
 };
 
 // Carries the offending site so a rejected config says where, not just what.
@@ -616,17 +617,5 @@ inline void FaultConfig::normalize() {
         }
     }
 }
-
-// Superseded by FaultConfig/FaultRule; deleted in P2-S1 once wrap_memory.cpp is rewired.
-struct FaultProfile {
-    double oom_rate = 0.0; // Heap allocation failure probability [0.0, 1.0]
-
-    // Endpoint rates never draw (Rule 3): only intermediate rates consume a decision.
-    bool should_inject_oom(Rng& rng) const {
-        if (oom_rate <= 0.0) return false;
-        if (oom_rate >= 1.0) return true;
-        return rng.uniform() < oom_rate;
-    }
-};
 
 } // namespace cosmos

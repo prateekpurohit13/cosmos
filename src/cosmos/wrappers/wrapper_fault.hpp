@@ -8,6 +8,7 @@
 #include "cosmos/faults.hpp"
 
 #include <cstddef>
+#include <cstdint>
 
 namespace cosmos::wrappers {
 
@@ -29,12 +30,8 @@ struct ReentrancyGuard {
     bool previous_;
 };
 
-// The one fault-decision hook for wrapper translation units. Compiles against the current
-// NoInjector placeholder (folds to None) and forwards to FaultInjector::decide once the
-// Simulator alias carries the real engine, so wrapper files do not change when the wiring
-// lands. Exactly one call per eligible wrapped call, zero calls on passthrough and no-op
-// paths — the gate-before-draw discipline of fault-injection.md Rule 3, enforced at the
-// call site by construction. A null simulator means no universe is running: no decision.
+// Call exactly once per eligible wrapped call and never on a passthrough path: that is Rule 3's
+// gate-before-draw discipline, enforced at the call site rather than by the engine.
 template <typename Sim> FaultKind decide_for(Sim* sim, FaultClass cls, SiteId site) {
     if (sim == nullptr) {
         return FaultKind::None;
@@ -67,6 +64,20 @@ inline constexpr bool storage_read_eligible(int fd, size_t count) {
 
 inline constexpr bool storage_write_eligible(int fd, size_t count) {
     return storage_fd_eligible(fd) && count > 0;
+}
+
+// Eligible because C11 lets malloc(0) return nullptr, so a fire there is still a legal observable.
+inline constexpr bool memory_alloc_eligible(size_t) { return true; }
+
+// A product overflow is a real API failure, not a fault, so it must never reach the injector.
+inline constexpr bool memory_calloc_eligible(size_t nmemb, size_t size) {
+    return nmemb == 0 || size <= SIZE_MAX / nmemb;
+}
+
+// realloc(ptr, 0) is a free, and a block this universe does not own is not its call to fault.
+inline constexpr bool memory_realloc_eligible(const void* ptr, size_t size, bool owned_by_sim) {
+    if (size == 0) return false;
+    return ptr == nullptr || owned_by_sim;
 }
 
 } // namespace cosmos::wrappers

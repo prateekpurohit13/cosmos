@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -214,6 +215,12 @@ class TrackedHeap {
 
     void* allocate(size_t size) {
         constexpr size_t header_size = sizeof(AllocationHeader);
+        // Without this the sum wraps, __real_malloc succeeds with a tiny block, and the header
+        // write runs off the end of it.
+        if (size > SIZE_MAX - header_size) {
+            errno = ENOMEM;
+            return nullptr;
+        }
         size_t total_size = header_size + size;
         void* raw = __real_malloc(total_size);
         if (!raw) {

@@ -1,12 +1,53 @@
 #include "cosmos/cosmos.hpp"
+#include "cosmos/ledger_print.hpp"
+#include "wrapper_fault.hpp"
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
+#include <sstream>
+#include <string>
 #include <vector>
+
+namespace {
+
+void must(bool ok) { assert(ok); }
+
+cosmos::FaultRule oom_rule(double rate) {
+    cosmos::FaultRule rule;
+    rule.rate = rate;
+    must(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+    return rule;
+}
+
+cosmos::FaultConfig oom_config(std::initializer_list<cosmos::SiteId> sites, double rate) {
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    for (cosmos::SiteId site : sites) {
+        must(cfg.activate_site(site));
+        must(cfg.set_rule(site, oom_rule(rate)));
+    }
+    return cfg;
+}
+
+cosmos::Rng memory_stream(uint64_t seed) {
+    return cosmos::Rng(cosmos::fault_class_seed(
+        cosmos::stream_seed(seed, cosmos::StreamDomain::Fault), cosmos::FaultClass::Memory));
+}
+
+static_assert(cosmos::wrappers::memory_alloc_eligible(0));
+static_assert(cosmos::wrappers::memory_calloc_eligible(0, SIZE_MAX));
+static_assert(cosmos::wrappers::memory_calloc_eligible(4, 32));
+static_assert(!cosmos::wrappers::memory_calloc_eligible(SIZE_MAX, 2));
+static_assert(cosmos::wrappers::memory_realloc_eligible(nullptr, 8, false));
+static_assert(!cosmos::wrappers::memory_realloc_eligible(nullptr, 0, false));
+
+} // namespace
 
 void test_passthrough_malloc() {
     assert(!cosmos::Simulator::has_current());
@@ -55,9 +96,7 @@ void test_active_sim_malloc_and_alignment() {
 
 void test_oom_fault_injection() {
     cosmos::Simulator sim;
-    cosmos::FaultProfile fp;
-    fp.oom_rate = 1.0; // 100% OOM injection
-    sim.set_faults(fp);
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 1.0)).has_value());
     cosmos::Simulator::set_current(&sim);
 
     errno = 0;
@@ -66,6 +105,7 @@ void test_oom_fault_injection() {
     assert(errno == ENOMEM);
     assert(sim.heap().stats().oom_fault_count == 1);
     assert(sim.heap().stats().active_allocations == 0);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 1);
 
     cosmos::Simulator::set_current(nullptr);
     std::cout << "[PASS] test_oom_fault_injection" << std::endl;
@@ -173,9 +213,7 @@ void test_calloc_overflow_rejected() {
 
 void test_calloc_oom_fault_injection() {
     cosmos::Simulator sim;
-    cosmos::FaultProfile fp;
-    fp.oom_rate = 1.0; // 100% OOM injection
-    sim.set_faults(fp);
+    must(sim.install_faults(oom_config({cosmos::SiteId::calloc}, 1.0)).has_value());
     cosmos::Simulator::set_current(&sim);
 
     errno = 0;
@@ -272,6 +310,8 @@ void test_realloc_zero_size_frees() {
 
 void test_realloc_oom_leaves_original_intact() {
     cosmos::Simulator sim;
+    // Only realloc is activated, so the setup allocation below is not an eligible call at all.
+    must(sim.install_faults(oom_config({cosmos::SiteId::realloc}, 1.0)).has_value());
     cosmos::Simulator::set_current(&sim);
 
     auto* p = static_cast<unsigned char*>(malloc(32));
@@ -280,9 +320,7 @@ void test_realloc_oom_leaves_original_intact() {
         p[i] = static_cast<unsigned char>(i ^ 0x5A);
     }
 
-    cosmos::FaultProfile fp;
-    fp.oom_rate = 1.0; // arm OOM only for the resize
-    sim.set_faults(fp);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 0);
 
     errno = 0;
     void* q = realloc(p, 4096);
@@ -603,9 +641,7 @@ void test_intermediate_oom_rate_injects_deterministically() {
 
     auto run = [](uint64_t seed) {
         cosmos::Simulator sim(seed);
-        cosmos::FaultProfile fp;
-        fp.oom_rate = 0.5;
-        sim.set_faults(fp);
+        must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 0.5)).has_value());
         cosmos::Simulator::set_current(&sim);
 
         size_t failures = 0;
@@ -629,6 +665,282 @@ void test_intermediate_oom_rate_injects_deterministically() {
     assert(first < kAllocations); // and does not inject everything
 
     std::cout << "[PASS] test_intermediate_oom_rate_injects_deterministically" << std::endl;
+}
+
+void test_rate_zero_never_injects_and_never_draws() {
+    cosmos::Simulator sim(7);
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 0.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    for (int i = 0; i < 50; ++i) {
+        void* p = malloc(32);
+        assert(p != nullptr);
+        free(p);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 50);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
+    assert(sim.heap().stats().oom_fault_count == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_rate_zero_never_injects_and_never_draws" << std::endl;
+}
+
+void test_trigger_fires_on_its_exact_allocation() {
+    constexpr uint64_t kOnCall = 17;
+
+    cosmos::Simulator sim(11);
+    cosmos::FaultConfig cfg = oom_config({cosmos::SiteId::malloc}, 0.0);
+    cosmos::FaultRule rule = oom_rule(0.0);
+    rule.fire_on_eligible_call = kOnCall;
+    must(cfg.set_rule(cosmos::SiteId::malloc, rule));
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    for (uint64_t call = 1; call <= kOnCall + 3; ++call) {
+        void* p = malloc(16);
+        if (call == kOnCall) {
+            assert(p == nullptr);
+            assert(errno == ENOMEM);
+        } else {
+            assert(p != nullptr);
+            free(p);
+        }
+    }
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_trigger_fires_on_its_exact_allocation" << std::endl;
+}
+
+void test_no_simulator_leaves_the_injector_untouched() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 1.0)).has_value());
+
+    assert(!cosmos::Simulator::has_current());
+    void* p = malloc(64);
+    assert(p != nullptr);
+    free(p);
+
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 0);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
+
+    std::cout << "[PASS] test_no_simulator_leaves_the_injector_untouched" << std::endl;
+}
+
+// Rule 7: engine work allocates through the same wrapper, and faulting it corrupts the referee.
+void test_engine_internal_allocation_is_never_faulted() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        void* p = malloc(64);
+        assert(p != nullptr);
+        free(p);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 0);
+
+    void* after = malloc(64);
+    assert(after == nullptr);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_engine_internal_allocation_is_never_faulted" << std::endl;
+}
+
+// Pins that the nullptr is a decided fire, not the heap declining a zero-byte request.
+void test_zero_byte_allocation_is_an_eligible_site() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    errno = 0;
+    void* p = malloc(0);
+    assert(p == nullptr);
+    assert(errno == ENOMEM);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_zero_byte_allocation_is_an_eligible_site" << std::endl;
+}
+
+void test_calloc_overflow_is_not_an_eligible_call() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::calloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    errno = 0;
+    void* p = calloc(SIZE_MAX, 2);
+    assert(p == nullptr);
+    assert(errno == ENOMEM);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::calloc) == 0);
+    assert(sim.heap().stats().oom_fault_count == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_calloc_overflow_is_not_an_eligible_call" << std::endl;
+}
+
+void test_realloc_of_a_foreign_block_is_not_eligible() {
+    cosmos::Simulator owner;
+    cosmos::Simulator::set_current(&owner);
+    void* p = malloc(32);
+    assert(p != nullptr);
+    cosmos::Simulator::set_current(nullptr);
+
+    cosmos::Simulator other(5);
+    must(other.install_faults(oom_config({cosmos::SiteId::realloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&other);
+
+    void* q = realloc(p, 128);
+    assert(q != nullptr);
+    assert(other.injector_or_null()->eligible_calls(cosmos::SiteId::realloc) == 0);
+
+    cosmos::Simulator::set_current(&owner);
+    free(q);
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_realloc_of_a_foreign_block_is_not_eligible" << std::endl;
+}
+
+// The order these three draw in is the order F5's global trace has to replay (doc §11.2).
+// The swarm can activate a site and give it no rule: the call is still eligible and counted, so
+// the coverage checks of §11.4 see it, but nothing can fire.
+void test_activated_site_without_a_rule_is_counted_but_never_fires() {
+    cosmos::Simulator sim;
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    must(cfg.activate_site(cosmos::SiteId::malloc));
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    for (int i = 0; i < 20; ++i) {
+        void* p = malloc(32);
+        assert(p != nullptr);
+        free(p);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 20);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_activated_site_without_a_rule_is_counted_but_never_fires"
+              << std::endl;
+}
+
+// A zero eligible count is what separates the class gate from the no-rule case above, which
+// counts; nothing else can produce it once the site is activated.
+void test_disabled_class_is_not_even_eligible() {
+    cosmos::Simulator sim;
+    cosmos::FaultConfig cfg;
+    must(cfg.activate_site(cosmos::SiteId::malloc));
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    for (int i = 0; i < 20; ++i) {
+        void* p = malloc(32);
+        assert(p != nullptr);
+        free(p);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_disabled_class_is_not_even_eligible" << std::endl;
+}
+
+// The header write would run off the end of the block the wrapped sum allocates; real glibc fails
+// this request, so the simulated heap must fail it too or the sim is easier than reality.
+void test_oversized_allocation_fails_like_the_real_heap() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc, cosmos::SiteId::realloc}, 0.0))
+             .has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    errno = 0;
+    assert(malloc(SIZE_MAX - 4) == nullptr);
+    assert(errno == ENOMEM);
+    assert(sim.heap().stats().active_allocations == 0);
+    assert(sim.heap().stats().oom_fault_count == 0);
+
+    void* p = malloc(32);
+    assert(p != nullptr);
+    errno = 0;
+    assert(realloc(p, SIZE_MAX - 4) == nullptr);
+    assert(errno == ENOMEM);
+    assert(sim.heap().owns(p));
+    assert(sim.heap().stats().active_allocations == 1);
+    free(p);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_oversized_allocation_fails_like_the_real_heap" << std::endl;
+}
+
+void test_interleaved_memory_sites_share_one_substream() {
+    constexpr uint64_t kSeed = 0xBEEF;
+    cosmos::Simulator sim(kSeed);
+    must(sim
+             .install_faults(oom_config(
+                 {cosmos::SiteId::malloc, cosmos::SiteId::calloc, cosmos::SiteId::realloc}, 0.5))
+             .has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    cosmos::Rng reference = memory_stream(kSeed);
+    std::vector<void*> live;
+    for (int round = 0; round < 30; ++round) {
+        const bool expect_malloc = reference.uniform() < 0.5;
+        void* a = malloc(16);
+        assert((a == nullptr) == expect_malloc);
+        if (a) live.push_back(a);
+
+        const bool expect_calloc = reference.uniform() < 0.5;
+        void* b = calloc(2, 8);
+        assert((b == nullptr) == expect_calloc);
+        if (b) live.push_back(b);
+
+        const bool expect_realloc = reference.uniform() < 0.5;
+        void* c = realloc(nullptr, 24);
+        assert((c == nullptr) == expect_realloc);
+        if (c) live.push_back(c);
+    }
+
+    const auto* injector = sim.injector_or_null();
+    const uint64_t fired = injector->injections(cosmos::SiteId::malloc) +
+                           injector->injections(cosmos::SiteId::calloc) +
+                           injector->injections(cosmos::SiteId::realloc);
+    assert(fired > 0);
+    assert(sim.heap().stats().oom_fault_count == fired);
+
+    for (void* p : live) {
+        free(p);
+    }
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_interleaved_memory_sites_share_one_substream" << std::endl;
+}
+
+void test_same_seed_twice_prints_an_identical_ledger() {
+    const auto run = [](uint64_t seed) {
+        cosmos::Simulator sim(seed);
+        must(sim.install_faults(oom_config({cosmos::SiteId::malloc, cosmos::SiteId::calloc}, 0.4))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        std::vector<void*> live;
+        for (int i = 0; i < 40; ++i) {
+            if (void* a = malloc(16)) live.push_back(a);
+            if (void* b = calloc(2, 8)) live.push_back(b);
+        }
+        for (void* p : live) {
+            free(p);
+        }
+        cosmos::Simulator::set_current(nullptr);
+        std::ostringstream out;
+        cosmos::print_ledger(out, *sim.injector_or_null());
+        return out.str();
+    };
+
+    const std::string first = run(0xD15EA5E);
+    assert(first == run(0xD15EA5E));
+    assert(first != run(0xD15EA5F));
+    assert(first.find("FIRED") != std::string::npos);
+
+    std::cout << "[PASS] test_same_seed_twice_prints_an_identical_ledger" << std::endl;
 }
 
 int main() {
@@ -657,6 +969,18 @@ int main() {
     test_passthrough_blocks_survive_after_orphan_release();
     test_orphan_realloc_releases_registry_entry();
     test_intermediate_oom_rate_injects_deterministically();
+    test_rate_zero_never_injects_and_never_draws();
+    test_trigger_fires_on_its_exact_allocation();
+    test_no_simulator_leaves_the_injector_untouched();
+    test_engine_internal_allocation_is_never_faulted();
+    test_zero_byte_allocation_is_an_eligible_site();
+    test_calloc_overflow_is_not_an_eligible_call();
+    test_realloc_of_a_foreign_block_is_not_eligible();
+    test_activated_site_without_a_rule_is_counted_but_never_fires();
+    test_disabled_class_is_not_even_eligible();
+    test_oversized_allocation_fails_like_the_real_heap();
+    test_interleaved_memory_sites_share_one_substream();
+    test_same_seed_twice_prints_an_identical_ledger();
     std::cout << "All malloc wrapper tests passed successfully!" << std::endl;
     return 0;
 }

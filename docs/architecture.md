@@ -102,25 +102,26 @@ When `myapp_test` executes:
 extern "C" {
 
 void* __wrap_malloc(size_t size) {
-    auto& sim = cosmos::Universe::current();
-    if (sim.faults().should_inject_oom(sim.fault_rng())) {
+    auto* sim = cosmos::Simulator::current();
+    if (decide_for(sim, cosmos::FaultClass::Memory, cosmos::SiteId::malloc) ==
+        cosmos::FaultKind::OutOfMemory) {
         errno = ENOMEM;
         return nullptr;
     }
-    return sim.heap().allocate(size);
+    return sim->heap().allocate(size);
 }
 
 int __wrap_clock_gettime(clockid_t clk_id, struct timespec* tp) {
-    auto& sim = cosmos::Universe::current();
-    auto ns = sim.virtual_clock().now_ns();
+    auto* sim = cosmos::Simulator::current();
+    auto ns = sim->clock().now_ns();
     tp->tv_sec  = ns / 1'000'000'000ULL;
     tp->tv_nsec = ns % 1'000'000'000ULL;
     return 0;
 }
 
 ssize_t __wrap_send(int sockfd, const void* buf, size_t len, int flags) {
-    auto& sim = cosmos::Universe::current();
-    return sim.network().enqueue_send(sockfd, buf, len, flags);
+    auto* sim = cosmos::Simulator::current();
+    return sim->network().enqueue_send(sockfd, buf, len, flags);
 }
 
 }

@@ -1,9 +1,11 @@
 #pragma once
 
+#include "cosmos/fault_injector.hpp"
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
 #include "cosmos/time.hpp"
+#include <expected>
 #include <optional>
 #include <utility>
 
@@ -13,22 +15,18 @@ namespace cosmos {
 // reproducible out of the box. ASCII "Cosmos1".
 inline constexpr uint64_t kDefaultUniverseSeed = 0x436F736D6F7331ULL;
 
-// Placeholder injector: the slot exists and stays empty until P1 delivers the real engine.
-struct NoInjector {};
+// An injector carrying its own validating factory governs its construction, and the raw slot
+// setters below are withdrawn for it: emplacing one directly would reopen the wrong-seed and
+// second-install paths install_faults exists to close.
+template <typename I>
+concept HasFactory = requires { I::create; };
 
-// The injector is a template parameter because std::optional instantiates traits on its element,
-// so the slot needs a complete type and the real FaultInjector does not exist until P1. Only the
-// Simulator alias below is wired to the __wrap_* functions: every instantiation gets its own
-// current_sim_, so another one is reachable through direct calls but never through a wrapped
-// syscall.
+// Every instantiation gets its own current_sim_, so only the Simulator alias below is reachable
+// through a wrapped syscall.
 template <typename Injector> class BasicSimulator {
   public:
-    // The seed is the universe seed: fault decisions derive via the Fault stream, user-visible
-    // randomness via the User stream (Rule 1). fault_rng_ derivation is legacy (FaultProfile) and
-    // will be removed when wrap_memory moves to FaultInjector::decide.
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
-        : fault_rng_(fault_class_seed(seed, FaultClass::Memory)),
-          user_rng_(stream_seed(seed, StreamDomain::User)) {}
+        : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)) {}
 
     ~BasicSimulator() {
         if (current_sim_ == this) {
@@ -56,14 +54,23 @@ template <typename Injector> class BasicSimulator {
     Time now() const { return clock_.now(); }
     void advance_time(Duration d) { clock_.advance(d); }
 
-    FaultProfile& faults() { return faults_; }
-    const FaultProfile& faults() const { return faults_; }
+    uint64_t seed() const { return seed_; }
 
-    void set_faults(const FaultProfile& f) { faults_ = f; }
-
-    // The Memory fault sub-stream. Fault decisions that sample (see FaultProfile) draw from it;
-    // endpoint probabilities must not.
-    Rng& fault_rng() { return fault_rng_; }
+    [[nodiscard]] std::expected<void, ConfigProblem> install_faults(FaultConfig cfg,
+                                                                    uint32_t node_count = 1) {
+        // A second install would fork stream positions, counters and the ledger against one run.
+        if (injector_.has_value()) {
+            return std::unexpected(
+                ConfigProblem{ConfigError::InjectorAlreadyInstalled, std::nullopt});
+        }
+        // Seeding from the universe seed instead of the Fault domain would collide five of six
+        // class sub-streams with the domain streams.
+        auto made = Injector::create(std::move(cfg), stream_seed(seed_, StreamDomain::Fault),
+                                     node_count, clock_);
+        if (!made.has_value()) return std::unexpected(made.error());
+        injector_.emplace(std::move(*made));
+        return {};
+    }
 
     // User-visible randomness (getrandom/random values). Never draws for fault decisions (Rule 1).
     Rng& user_rng() { return user_rng_; }
@@ -77,11 +84,17 @@ template <typename Injector> class BasicSimulator {
     Injector* injector_or_null() { return injector_ ? &*injector_ : nullptr; }
     const Injector* injector_or_null() const { return injector_ ? &*injector_ : nullptr; }
 
-    template <typename... Args> Injector& emplace_injector(Args&&... args) {
+    template <typename... Args>
+        requires(!HasFactory<Injector>)
+    Injector& emplace_injector(Args&&... args) {
         return injector_.emplace(std::forward<Args>(args)...);
     }
 
-    void clear_injector() { injector_.reset(); }
+    void clear_injector()
+        requires(!HasFactory<Injector>)
+    {
+        injector_.reset();
+    }
 
   private:
     // thread_local on purpose: a universe belongs to one OS thread. Caveat until the fiber
@@ -90,14 +103,14 @@ template <typename Injector> class BasicSimulator {
     // made there fall through to the real host clock/heap instead of this universe. Keep
     // simulation workloads single-threaded until then, or real and virtual state will mix.
     inline static thread_local BasicSimulator* current_sim_{nullptr};
+    uint64_t seed_;
     TrackedHeap heap_{};
-    FaultProfile faults_{};
-    Rng fault_rng_;
     Rng user_rng_;
     VirtualClock clock_{};
+    // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
 };
 
-using Simulator = BasicSimulator<NoInjector>;
+using Simulator = BasicSimulator<BasicFaultInjector<VirtualClock>>;
 
 } // namespace cosmos

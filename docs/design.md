@@ -111,7 +111,7 @@ The following table lists every standard POSIX function intercepted by `libcosmo
 
 In testing builds (`-DCOSMOS_SIM`), `__wrap_malloc` and `__wrap_free` intercept heap operations:
 
-- **OOM Fault Injection**: Configured via `FaultProfile::oom_rate`. When triggered, `malloc` returns `nullptr` and sets `errno = ENOMEM`.
+- **OOM Fault Injection**: `__wrap_malloc`, `__wrap_calloc` and `__wrap_realloc` each ask the fault injector for one decision per eligible call (`FaultClass::Memory`, `SiteId::malloc` / `calloc` / `realloc`) and translate `OutOfMemory` to `nullptr` plus `errno = ENOMEM`. The decision happens before the heap is touched, so a fired OOM leaves `TrackedHeap` untouched and a failed `realloc` leaves the original block valid. Rates, budgets, windows and occurrence triggers come from the `FaultConfig` installed with `Simulator::install_faults` (`docs/fault-injection.md` §12). Eligibility: a `calloc` size-product overflow is a real API failure answered before the injector, `realloc(ptr, 0)` is a free, and a block this universe does not own is never faulted — none of the three consumes a draw. `malloc(0)` *is* eligible, since returning `nullptr` there is a legal C11 result.
 - **Leak Detection**: When a universe completes, `Simulator` automatically verifies that `active_allocations() == 0`. Unfreed pointers are logged as findings with allocation backtraces and repro seeds.
 
 ---
@@ -145,7 +145,7 @@ public:
 ```
 
 ### Delivery Semantics:
-1. `send()` consults partition maps → `on_send` hook → `FaultProfile` latency/loss draws.
+1. `send()` consults partition maps → `on_send` hook → `Network`-class latency/loss draws.
 2. Surviving packets become delivery events scheduled at `virtual_now + sampled_latency`.
 3. Node crash closes endpoints and cancels pending `recv()` calls.
 
@@ -189,24 +189,33 @@ Simulates page-cache buffering, `fsync` durability, and torn writes upon crash-r
 
 - `write()` buffers dirty bytes in simulated un-synced page cache.
 - `fsync()` commits buffered pages to durable storage.
-- On `sim.crash(node)` followed by `sim.reboot(node)`: un-synced pages are discarded, and the last synced region may experience torn writes based on `FaultProfile::torn_write_rate`.
+- On `sim.crash(node)` followed by `sim.reboot(node)`: un-synced pages are discarded, and the last synced region may experience torn writes drawn from the `Storage` class.
 
 ---
 
 ## 9. Fault Injection Framework
 
+Configuration is `FaultConfig` (`docs/fault-injection.md` §12): per-class enable bits, per-site
+activation, and a per-site `FaultRule` carrying rate, `skip_first`, `max_injections`, a weighted
+outcome table and an optional occurrence trigger. It is installed once per universe with
+`Simulator::install_faults(cfg, node_count)`, which derives the injector's seed from the `Fault`
+stream domain (Rule 1) and binds it to that universe's clock.
+
 ```cpp
-struct FaultProfile {
-    double packet_loss     = 0.0;     // Bernoulli per packet
-    double reorder_rate    = 0.0;     // Jitter probability
-    double oom_rate        = 0.0;     // Heap allocation failure probability
-    double torn_write_rate = 0.0;     // Storage tearing probability on crash
-    LatencyGen latency     = constant(1ms);
-};
+FaultConfig cfg;
+cfg.enable_class(FaultClass::Memory);
+cfg.activate_site(SiteId::malloc);
+
+FaultRule oom;
+oom.rate = 0.001;
+oom.outcomes.add(FaultKind::OutOfMemory, 1.0);
+cfg.set_rule(SiteId::malloc, oom);
+
+sim.install_faults(std::move(cfg));
 ```
 
 Four composable fault mechanisms:
-1. **Declarative Profile**: Rates applied automatically via the `fault` RNG stream.
+1. **Declarative Config**: rates applied automatically via the `fault` RNG stream.
 2. **Imperative Scripting**: `sim.net().partition(...)`, `sim.crash(node)`, `sim.reboot(node)`.
 3. **Scheduled Faults**: `sim.at(10s, [&]{ sim.net().partition(a, b); })`.
 4. **Custom Verdict Hooks**: Programmatic control via `sim.net().on_send`.

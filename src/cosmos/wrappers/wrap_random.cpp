@@ -38,7 +38,7 @@ int __real_rand(void);
 ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
     // Passthrough first, like every other wrapper: outside a universe the host kernel owns all
     // validation, including flag checks and zero-length semantics.
-    if (!cosmos::Simulator::has_current()) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
         return __real_getrandom(buf, buflen, flags);
     }
 
@@ -70,6 +70,8 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
         errno = EFAULT;
         return -1;
     }
+
+    cosmos::wrappers::ReentrancyGuard guard;
 
     auto* sim = cosmos::Simulator::current();
     // Decision first, values second: a failed call must not consume the User stream (Rule 1).

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <type_traits>
+#include <utility>
 
 namespace {
 
@@ -18,6 +19,14 @@ struct StubInjector {
 using StubSim = cosmos::BasicSimulator<StubInjector>;
 
 } // namespace
+
+// This predicate is what withdraws emplace_injector/clear_injector from the real Simulator, so a
+// caller cannot install a wrongly-seeded injector or clear and re-install past install_faults'
+// once-only rule. Calling either on it is a compile error, which no negative static_assert can
+// express: a failed requires-clause on a non-template member is a hard error, not a substitution
+// failure.
+static_assert(cosmos::HasFactory<cosmos::BasicFaultInjector<cosmos::VirtualClock>>);
+static_assert(!cosmos::HasFactory<StubInjector>);
 
 // Two simulators must not share the thread_local current pointer.
 static_assert(!std::is_same_v<cosmos::Simulator, StubSim>);
@@ -160,73 +169,63 @@ void test_destructor_clears_current() {
 // Endpoint probabilities must decide without consuming stream decisions (docs/fault-injection.md
 // §7 Rule 3): a disabled or always-on fault cannot shift the Memory sub-stream. Verified by
 // checking the Rng state is untouched after the calls against a same-seed reference stream.
-void test_oom_decision_endpoint_rates_do_not_draw() {
-    cosmos::FaultProfile disabled;
-    disabled.oom_rate = 0.0;
-    cosmos::FaultProfile always;
-    always.oom_rate = 1.0;
+void test_install_faults_derives_the_fault_stream() {
+    constexpr uint64_t kSeed = 0xC0FFEE;
 
-    cosmos::Rng reference(99);
+    cosmos::Simulator sim(kSeed);
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    assert(cfg.activate_site(cosmos::SiteId::malloc));
+    cosmos::FaultRule rule;
+    rule.rate = 0.5;
+    assert(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+    assert(cfg.set_rule(cosmos::SiteId::malloc, rule));
+    assert(sim.install_faults(std::move(cfg)).has_value());
 
-    cosmos::Rng probe(99);
-    for (int i = 0; i < 8; ++i) {
-        assert(!disabled.should_inject_oom(probe));
+    cosmos::Rng reference(cosmos::fault_class_seed(
+        cosmos::stream_seed(kSeed, cosmos::StreamDomain::Fault), cosmos::FaultClass::Memory));
+
+    for (int i = 0; i < 32; ++i) {
+        const bool expect_fire = reference.uniform() < 0.5;
+        const cosmos::FaultKind kind =
+            sim.injector_or_null()->decide(cosmos::FaultClass::Memory, cosmos::SiteId::malloc);
+        assert((kind == cosmos::FaultKind::OutOfMemory) == expect_fire);
     }
-    assert(probe.next() == reference.next());
 
-    for (int i = 0; i < 8; ++i) {
-        assert(always.should_inject_oom(probe));
-    }
-    assert(probe.next() == reference.next());
-
-    std::cout << "[PASS] test_oom_decision_endpoint_rates_do_not_draw" << std::endl;
+    std::cout << "[PASS] test_install_faults_derives_the_fault_stream" << std::endl;
 }
 
-// Intermediate rates draw one decision per call: identical seeds produce identical patterns.
-void test_oom_decision_is_deterministic_for_fixed_seed() {
-    cosmos::FaultProfile fp;
-    fp.oom_rate = 0.5;
+void test_install_faults_is_once_only() {
+    cosmos::Simulator sim;
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    assert(sim.install_faults(cfg).has_value());
+    assert(sim.has_injector());
 
-    const auto draw_pattern = [fp](uint64_t seed) {
-        cosmos::Rng rng(cosmos::fault_class_seed(seed, cosmos::FaultClass::Memory));
-        std::array<bool, 64> pattern{};
-        for (bool& decision : pattern) {
-            decision = fp.should_inject_oom(rng);
-        }
-        return pattern;
-    };
+    auto again = sim.install_faults(cfg);
+    assert(!again.has_value());
+    assert(again.error().error == cosmos::ConfigError::InjectorAlreadyInstalled);
 
-    assert(draw_pattern(42) == draw_pattern(42));
-
-    std::cout << "[PASS] test_oom_decision_is_deterministic_for_fixed_seed" << std::endl;
+    std::cout << "[PASS] test_install_faults_is_once_only" << std::endl;
 }
 
-// Each Simulator owns its Memory fault sub-stream derived from its seed: same seed => same
-// decisions, different seed => different decisions (a 64-draw collision is vanishingly unlikely).
-void test_simulator_seed_drives_fault_stream() {
-    cosmos::FaultProfile fp;
-    fp.oom_rate = 0.5;
+void test_install_faults_rejects_an_invalid_config() {
+    cosmos::Simulator sim;
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    assert(cfg.activate_site(cosmos::SiteId::malloc));
+    cosmos::FaultRule rule;
+    rule.rate = 1.5;
+    assert(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+    assert(cfg.set_rule(cosmos::SiteId::malloc, rule));
 
-    cosmos::Simulator sim_a(42);
-    sim_a.set_faults(fp);
-    cosmos::Simulator sim_b(42);
-    sim_b.set_faults(fp);
-    cosmos::Simulator sim_c(43);
-    sim_c.set_faults(fp);
+    auto rejected = sim.install_faults(std::move(cfg));
+    assert(!rejected.has_value());
+    assert(rejected.error().error == cosmos::ConfigError::BadRate);
+    assert(rejected.error().site == cosmos::SiteId::malloc);
+    assert(!sim.has_injector());
 
-    std::array<bool, 64> pattern_a{};
-    std::array<bool, 64> pattern_b{};
-    std::array<bool, 64> pattern_c{};
-    for (size_t i = 0; i < pattern_a.size(); ++i) {
-        pattern_a[i] = sim_a.faults().should_inject_oom(sim_a.fault_rng());
-        pattern_b[i] = sim_b.faults().should_inject_oom(sim_b.fault_rng());
-        pattern_c[i] = sim_c.faults().should_inject_oom(sim_c.fault_rng());
-    }
-
-    assert(pattern_a == pattern_b);
-    assert(pattern_a != pattern_c);
-
-    std::cout << "[PASS] test_simulator_seed_drives_fault_stream" << std::endl;
+    std::cout << "[PASS] test_install_faults_rejects_an_invalid_config" << std::endl;
 }
 
 void test_simulator_virtual_clock() {
@@ -253,9 +252,9 @@ int main() {
     test_malloc_passes_through_after_current_is_cleared();
     test_tracked_pointer_freed_with_no_current_simulator();
     test_destructor_clears_current();
-    test_oom_decision_endpoint_rates_do_not_draw();
-    test_oom_decision_is_deterministic_for_fixed_seed();
-    test_simulator_seed_drives_fault_stream();
+    test_install_faults_derives_the_fault_stream();
+    test_install_faults_is_once_only();
+    test_install_faults_rejects_an_invalid_config();
     test_simulator_virtual_clock();
     std::cout << "All simulator tests passed successfully!" << std::endl;
     return 0;

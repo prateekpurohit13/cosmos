@@ -56,6 +56,25 @@ std::string temp_path(const char* tag) {
            std::to_string(counter++);
 }
 
+void must(bool ok) { assert(ok); }
+
+cosmos::FaultConfig storage_config(cosmos::SiteId site, cosmos::FaultKind kind) {
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Storage);
+    must(cfg.activate_site(site));
+    cosmos::FaultRule rule;
+    rule.rate = 1.0;
+    must(rule.outcomes.add(kind, 1.0));
+    must(cfg.set_rule(site, rule));
+    return cfg;
+}
+
+int open_scratch(const std::string& path) {
+    int fd = open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    must(fd >= 3);
+    return fd;
+}
+
 } // namespace
 
 void test_passthrough_no_sim() {
@@ -80,8 +99,8 @@ void test_passthrough_no_sim() {
     std::cout << "[PASS] test_passthrough_no_sim" << std::endl;
 }
 
-// The NoInjector folding hook must leave the happy path untouched: a full file round-trip
-// inside an active Simulator behaves exactly like the host, and successes never clobber errno.
+// With no rule installed the decision folds to None: a full round-trip inside an active Simulator
+// behaves exactly like the host, and successes never clobber errno.
 void test_value_path_under_sim() {
     const std::string path = temp_path("value");
 
@@ -214,6 +233,150 @@ void test_no_alloc_smoke() {
     std::cout << "[PASS] test_no_alloc_smoke" << std::endl;
 }
 
+// Minimum live slice only; the full per-site legality matrix is P3-S2's.
+void test_storage_outcomes_map_to_errno() {
+    const std::string path = temp_path("errno");
+
+    {
+        cosmos::Simulator sim(1);
+        must(sim.install_faults(storage_config(cosmos::SiteId::open, cosmos::FaultKind::OpenEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        errno = 0;
+        assert(open(path.c_str(), O_CREAT | O_RDWR, 0600) == -1);
+        assert(errno == EIO);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::open) == 1);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    int fd = open_scratch(path);
+    assert(::write(fd, "0123456789", 10) == 10);
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+
+    {
+        cosmos::Simulator sim(2);
+        must(sim.install_faults(storage_config(cosmos::SiteId::read, cosmos::FaultKind::ReadEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        char buf[10];
+        errno = 0;
+        assert(::read(fd, buf, sizeof(buf)) == -1);
+        assert(errno == EIO);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    {
+        cosmos::Simulator sim(3);
+        must(sim.install_faults(storage_config(cosmos::SiteId::write, cosmos::FaultKind::NoSpace))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        errno = 0;
+        assert(::write(fd, "xxxx", 4) == -1);
+        assert(errno == ENOSPC);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    {
+        cosmos::Simulator sim(4);
+        must(
+            sim.install_faults(storage_config(cosmos::SiteId::write, cosmos::FaultKind::ShortWrite))
+                .has_value());
+        cosmos::Simulator::set_current(&sim);
+        // ShortWrite is a shaped success: the bytes it reports must actually have been written.
+        assert(::write(fd, "abcdefgh", 8) == 4);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    {
+        cosmos::Simulator sim(5);
+        must(sim.install_faults(storage_config(cosmos::SiteId::fsync, cosmos::FaultKind::FsyncEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        errno = 0;
+        assert(fsync(fd) == -1);
+        assert(errno == EIO);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    close(fd);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_storage_outcomes_map_to_errno" << std::endl;
+}
+
+// Rule 3 through the wrapper: an unactivated site must not move its siblings' class sub-stream.
+void test_unactivated_site_never_moves_the_storage_stream() {
+    constexpr uint64_t kSeed = 0x5709A6E;
+    const std::string path = temp_path("rule3");
+    int fd = open_scratch(path);
+
+    cosmos::Simulator sim(kSeed);
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Storage);
+    must(cfg.activate_site(cosmos::SiteId::write));
+    cosmos::FaultRule rule;
+    rule.rate = 0.5;
+    must(rule.outcomes.add(cosmos::FaultKind::WriteEio, 1.0));
+    must(cfg.set_rule(cosmos::SiteId::write, rule));
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    cosmos::Rng reference(cosmos::fault_class_seed(
+        cosmos::stream_seed(kSeed, cosmos::StreamDomain::Fault), cosmos::FaultClass::Storage));
+
+    char buf[4];
+    uint64_t fired = 0;
+    for (int i = 0; i < 60; ++i) {
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+        assert(::read(fd, buf, sizeof(buf)) >= 0);
+
+        const bool expect_fire = reference.uniform() < 0.5;
+        errno = 0;
+        const ssize_t written = ::write(fd, "abcd", 4);
+        if (expect_fire) {
+            assert(written == -1);
+            assert(errno == EIO);
+            ++fired;
+        } else {
+            assert(written == 4);
+        }
+    }
+    assert(fired > 0 && fired < 60);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::read) == 0);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::write) == fired);
+
+    cosmos::Simulator::set_current(nullptr);
+    close(fd);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_unactivated_site_never_moves_the_storage_stream" << std::endl;
+}
+
+// Rule 7, and the property the merged reentrancy guard buys across wrapper families.
+void test_allocation_inside_wrapper_logic_is_never_faulted() {
+    cosmos::Simulator sim(13);
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    must(cfg.activate_site(cosmos::SiteId::malloc));
+    cosmos::FaultRule rule;
+    rule.rate = 1.0;
+    must(rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0));
+    must(cfg.set_rule(cosmos::SiteId::malloc, rule));
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        void* p = malloc(128);
+        assert(p != nullptr);
+        free(p);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 0);
+
+    assert(malloc(128) == nullptr);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_allocation_inside_wrapper_logic_is_never_faulted" << std::endl;
+}
+
 int main() {
     // Unique 0700 directory: no dependence on a pre-existing path, no cross-user collisions.
     std::string tmpl = "/tmp/cosmos_storage_XXXXXX";
@@ -229,6 +392,9 @@ int main() {
     test_std_stream_fds_pass_through();
     test_open_mode_forwarding();
     test_no_alloc_smoke();
+    test_storage_outcomes_map_to_errno();
+    test_unactivated_site_never_moves_the_storage_stream();
+    test_allocation_inside_wrapper_logic_is_never_faulted();
 
     rmdir(g_temp_dir.c_str()); // best effort; every test unlinks its own files
     std::cout << "All storage wrapper tests passed successfully!" << std::endl;

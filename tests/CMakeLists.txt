@@ -5,6 +5,8 @@ add_compile_options(-UNDEBUG)
 
 add_executable(test_wrap_malloc test_wrap_malloc.cpp)
 target_link_libraries(test_wrap_malloc PRIVATE cosmos)
+# White-box test: pins the internal memory eligibility policy from wrapper_fault.hpp.
+target_include_directories(test_wrap_malloc PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Linker --wrap substitutes malloc/free AFTER optimization, but GCC/Clang
@@ -98,6 +100,8 @@ add_test(NAME test_simulator COMMAND test_simulator)
 
 add_executable(test_wrap_random test_wrap_random.cpp)
 target_link_libraries(test_wrap_random PRIVATE cosmos)
+# White-box test: exercises the shared reentrancy guard from wrapper_fault.hpp.
+target_include_directories(test_wrap_random PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Wrapped symbols must stay opaque calls; random-family builtins would otherwise fold.

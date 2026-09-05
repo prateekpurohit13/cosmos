@@ -167,6 +167,28 @@ void test_every_fault_class_derives_a_distinct_substream() {
     std::cout << "[PASS] test_every_fault_class_derives_a_distinct_substream" << std::endl;
 }
 
+// Skipping the Fault domain puts FaultClass k on StreamDomain k's derivation index, which made
+// Process bit-equal to the User stream the application's own getrandom reads.
+void test_fault_substreams_never_collide_with_domain_streams() {
+    const cosmos::StreamDomain domains[] = {
+        cosmos::StreamDomain::Schedule, cosmos::StreamDomain::Fault, cosmos::StreamDomain::Workload,
+        cosmos::StreamDomain::User, cosmos::StreamDomain::Swarm};
+
+    for (uint64_t universe :
+         {uint64_t{0}, uint64_t{1}, cosmos::universe_seed(4242, 7), UINT64_MAX}) {
+        const uint64_t fault_seed = cosmos::stream_seed(universe, cosmos::StreamDomain::Fault);
+        for (uint8_t raw = 0; raw < static_cast<uint8_t>(cosmos::FaultClass::_Count); ++raw) {
+            const uint64_t sub =
+                cosmos::fault_class_seed(fault_seed, static_cast<cosmos::FaultClass>(raw));
+            for (cosmos::StreamDomain domain : domains) {
+                assert(sub != cosmos::stream_seed(universe, domain));
+            }
+        }
+    }
+
+    std::cout << "[PASS] test_fault_substreams_never_collide_with_domain_streams" << std::endl;
+}
+
 void test_zero_campaign_seed_and_index_are_not_degenerate() {
     uint64_t universe = cosmos::universe_seed(0, 0);
     assert(universe != 0);
@@ -203,6 +225,7 @@ int main() {
     test_stream_domains_are_independent();
     test_fault_class_substreams_are_isolated();
     test_every_fault_class_derives_a_distinct_substream();
+    test_fault_substreams_never_collide_with_domain_streams();
     test_zero_campaign_seed_and_index_are_not_degenerate();
     test_extreme_index_values();
     std::cout << "All seed derivation tests passed successfully!" << std::endl;

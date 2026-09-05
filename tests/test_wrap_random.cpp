@@ -1,4 +1,5 @@
 #include "cosmos/cosmos.hpp"
+#include "wrapper_fault.hpp"
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -12,6 +13,19 @@ namespace {
 
 constexpr uint64_t kSeedA = 0x12345678ABCDEF01ULL;
 constexpr uint64_t kSeedB = 0xFEDCBA9876543210ULL;
+
+void must(bool ok) { assert(ok); }
+
+cosmos::FaultConfig eagain_config(double rate) {
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Random);
+    must(cfg.activate_site(cosmos::SiteId::getrandom));
+    cosmos::FaultRule rule;
+    rule.rate = rate;
+    must(rule.outcomes.add(cosmos::FaultKind::RandomEagain, 1.0));
+    must(cfg.set_rule(cosmos::SiteId::getrandom, rule));
+    return cfg;
+}
 
 void fill_reference(cosmos::Rng& rng, unsigned char* out, size_t len) {
     size_t remaining = len;
@@ -249,7 +263,8 @@ void test_random_range_and_replay() {
     std::cout << "[PASS] test_random_range_and_replay" << std::endl;
 }
 
-void test_user_stream_isolated_from_fault_rng() {
+// Rule 1: the failure decision and the returned bytes come from different streams.
+void test_user_stream_isolated_from_fault_stream() {
     unsigned char baseline[32];
     {
         cosmos::Simulator sim(kSeedA);
@@ -259,17 +274,48 @@ void test_user_stream_isolated_from_fault_rng() {
     }
     {
         cosmos::Simulator sim(kSeedA);
-        // Drain the legacy Memory fault stream heavily; the User stream must not move.
-        for (int i = 0; i < 1000; ++i) {
-            (void)sim.fault_rng().next();
-        }
+        must(sim.install_faults(eagain_config(0.5)).has_value());
         cosmos::Simulator::set_current(&sim);
+        for (int i = 0; i < 1000; ++i) {
+            (void)sim.injector_or_null()->decide(cosmos::FaultClass::Random,
+                                                 cosmos::SiteId::getrandom);
+        }
         unsigned char got[32];
         assert(getrandom(got, sizeof(got), 0) == (ssize_t)sizeof(got));
         cosmos::Simulator::set_current(nullptr);
         assert(memcmp(baseline, got, sizeof(baseline)) == 0);
     }
-    std::cout << "[PASS] test_user_stream_isolated_from_fault_rng" << std::endl;
+    std::cout << "[PASS] test_user_stream_isolated_from_fault_stream" << std::endl;
+}
+
+// A failed getrandom must not consume bytes it never delivered, or the next call skips them.
+void test_eagain_does_not_consume_the_user_stream() {
+    unsigned char baseline[32];
+    {
+        cosmos::Simulator sim(kSeedA);
+        cosmos::Simulator::set_current(&sim);
+        assert(getrandom(baseline, sizeof(baseline), 0) == (ssize_t)sizeof(baseline));
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    cosmos::Simulator sim(kSeedA);
+    must(sim.install_faults(eagain_config(1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    unsigned char buf[32];
+    for (int i = 0; i < 8; ++i) {
+        errno = 0;
+        assert(getrandom(buf, sizeof(buf), 0) == -1);
+        assert(errno == EAGAIN);
+    }
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::getrandom) == 8);
+
+    sim.injector_or_null()->push_quiet();
+    assert(getrandom(buf, sizeof(buf), 0) == (ssize_t)sizeof(buf));
+    assert(memcmp(baseline, buf, sizeof(baseline)) == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_eagain_does_not_consume_the_user_stream" << std::endl;
 }
 
 void test_rand_shares_user_stream_with_random() {
@@ -369,6 +415,30 @@ void test_no_eagain_without_injector() {
     std::cout << "[PASS] test_no_eagain_without_injector" << std::endl;
 }
 
+// Rule 7: engine-internal randomness must not be faulted, and must not spend the site's budget.
+void test_getrandom_inside_wrapper_logic_is_never_faulted() {
+    cosmos::Simulator sim(kSeedA);
+    must(sim.install_faults(eagain_config(1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    unsigned char buf[16];
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        errno = 0;
+        assert(getrandom(buf, sizeof(buf), 0) == (ssize_t)sizeof(buf));
+        assert(errno == 0);
+    }
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::getrandom) == 0);
+
+    errno = 0;
+    assert(getrandom(buf, sizeof(buf), 0) == -1);
+    assert(errno == EAGAIN);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::getrandom) == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_getrandom_inside_wrapper_logic_is_never_faulted" << std::endl;
+}
+
 void test_wrapper_does_not_allocate() {
     cosmos::Simulator sim(kSeedA);
     cosmos::Simulator::set_current(&sim);
@@ -396,9 +466,11 @@ int main() {
     test_getrandom_different_seed_differs();
     test_random_range_and_replay();
     test_rand_shares_user_stream_with_random();
-    test_user_stream_isolated_from_fault_rng();
+    test_user_stream_isolated_from_fault_stream();
+    test_eagain_does_not_consume_the_user_stream();
     test_srandom_srand_are_noops();
     test_no_eagain_without_injector();
+    test_getrandom_inside_wrapper_logic_is_never_faulted();
     test_wrapper_does_not_allocate();
     std::cout << "All random wrapper tests passed successfully!" << std::endl;
     return 0;

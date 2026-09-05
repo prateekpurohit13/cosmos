@@ -789,7 +789,7 @@ enum class ConfigError : uint8_t {
     TriggerLeSkipFirst, TriggerOnEventSite, RuleOnEventSite,
     RuleOnDisabledClass, EpisodeOutsideWindows, BadEpisodeDuration,
     UnknownNode, BadKnobOrder, QuorumExceedsNodes, LimitsExceedNodes,
-    BadWindowOrder,
+    BadWindowOrder, InjectorAlreadyInstalled,
 };
 
 /// Which site the config was wrong about, not just what was wrong with it.
@@ -972,7 +972,7 @@ class QuietGuard {
 2. `FaultConfig` is what gets *printed* in a failure report (`seed=8421, mode=Safety, site=write, rate=0.003`), which makes findings self-describing.
 3. `FaultInjector` holds mutable engine state (RNG position, counters, quiet depth, active episodes) that must never appear in the user's mental model.
 
-A single fused struct forces the decision method to be `const` while it needs to mutate an RNG — the tension visible in the current scaffolded `FaultProfile`.
+A single fused struct forces the decision method to be `const` while it needs to mutate an RNG — the tension that was visible in the scaffolded `FaultProfile`, now deleted (§12.2).
 
 **Why the injector takes clock, event queue, and node registry:** point faults need only config and randomness, but episode faults cannot be enforced without them. Checking `max_crashed_nodes` requires knowing which nodes are *currently* down; scheduling an automatic heal requires the event queue; stamping a ledger entry requires virtual time. Passing them in keeps the rule "every episode schedules its own heal" enforceable by construction rather than by convention.
 
@@ -995,9 +995,9 @@ class Scenario {
 
 `cosmos::run` (the §17 teaser) is pure sugar over the pieces above: `cosmos::run({.seed = S, .oom = {.fail_on_call = K}}, workload, oracle)` builds a `FaultConfig` whose only rule is `SiteId::malloc → { outcomes = {OutOfMemory}, fire_on_eligible_call = K }`, runs warmup → workload → quiesce → oracle in one universe, and prints the ledger on failure. It exists so the smallest useful test is one expression; anything richer drops down to `Scenario` or `Campaign`.
 
-### 12.2 Migration note: `FaultProfile` is superseded
+### 12.2 Migration note: `FaultProfile` is superseded — **done**
 
-The scaffolded `FaultProfile` (`oom_rate` + `should_inject_oom(Rng&)` in `include/cosmos/faults.hpp`) is replaced by `FaultConfig` / `FaultRule` / `FaultInjector`. The split exists precisely because `FaultProfile` fused user-facing config with engine state: the scaffold's intermediate-rate decisions currently draw from the Simulator's Memory sub-stream via `should_inject_oom(Rng& rng)` (endpoint rates consume no draw, §7 Rule 3), and sprint F2 moves that decision into `FaultInjector::decide(FaultClass::Memory, SiteId::malloc)` with full rule/timeline support. `wrap_memory.cpp` is re-pointed at that call site in sprint F2, `FaultProfile` is deleted, and the `FaultProfile` mentions in `docs/design.md` §4/§9 are updated to match. What survives from the current header: `FaultClass` and `fault_class_seed` (§7 Rule 2's per-class sub-stream derivation), which the new design keeps unchanged.
+The scaffolded `FaultProfile` (`oom_rate` + `should_inject_oom(Rng&)`) has been deleted. `__wrap_malloc`, `__wrap_calloc` and `__wrap_realloc` now call `FaultInjector::decide(FaultClass::Memory, SiteId::{malloc,calloc,realloc})`, and a universe installs its config with `Simulator::install_faults(cfg, node_count)`, which derives the injector's seed as `fault_class_seed(stream_seed(universe_seed, StreamDomain::Fault), cls)` (Rule 1) and binds it to that universe's clock. `FaultClass` and `fault_class_seed` survived unchanged, as this note originally promised.
 
 ### 12.3 What Phase 1 ships, and how it differs from the reference above
 

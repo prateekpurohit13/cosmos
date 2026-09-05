@@ -125,15 +125,18 @@ Determinism comes from controlling six key subsystems via standard function wrap
 
 Four composable mechanisms (details in `docs/design.md` §9):
 
-1. **Declarative profile**: rates applied by the `fault` RNG stream:
+1. **Declarative config**: rates applied by the `fault` RNG stream:
    ```cpp
-   FaultProfile f;
-   f.packet_loss    = 0.01;                  // Bernoulli per packet
-   f.latency        = gen::lognormal{1ms, 100ms};
-   f.reorder_rate   = 0.05;
-   f.oom_rate       = 0.001;                 // malloc OOM fault injection rate
-   f.crash_interval = gen::exponential{30s};  // random node crashes
-   sim.set_faults(f);
+   FaultConfig cfg;
+   cfg.enable_class(FaultClass::Memory);
+   cfg.activate_site(SiteId::malloc);
+
+   FaultRule oom;
+   oom.rate = 0.001;                          // malloc OOM fault injection rate
+   oom.outcomes.add(FaultKind::OutOfMemory, 1.0);
+   cfg.set_rule(SiteId::malloc, oom);
+
+   sim.install_faults(std::move(cfg));
    ```
 2. **Imperative / Scripted**: from workload or scheduled actions:
    ```cpp
