@@ -187,6 +187,49 @@ endif()
 
 add_test(NAME test_scenario COMMAND test_scenario)
 
+add_executable(test_scheduler test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped pthread/time symbols must stay opaque calls so --wrap reaches them.
+    target_compile_options(test_scheduler PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_scheduler PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=pthread_create"
+        "-Wl,--wrap=pthread_join"
+        "-Wl,--wrap=pthread_detach"
+        "-Wl,--wrap=pthread_self"
+        "-Wl,--wrap=pthread_equal"
+        "-Wl,--wrap=pthread_exit"
+        "-Wl,--wrap=pthread_mutex_init"
+        "-Wl,--wrap=pthread_mutex_destroy"
+        "-Wl,--wrap=pthread_mutex_lock"
+        "-Wl,--wrap=pthread_mutex_unlock"
+        "-Wl,--wrap=pthread_mutex_trylock"
+        "-Wl,--wrap=pthread_cond_init"
+        "-Wl,--wrap=pthread_cond_destroy"
+        "-Wl,--wrap=pthread_cond_wait"
+        "-Wl,--wrap=pthread_cond_signal"
+        "-Wl,--wrap=pthread_cond_broadcast"
+        "-Wl,--wrap=sched_yield"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+    )
+endif()
+
+add_test(NAME test_scheduler COMMAND test_scheduler)
+
 # Second link of the same source. operator new reaches the wrappers only when libstdc++ is linked
 # statically, and that is the only configuration in which the harness's own bookkeeping is visible
 # to the universe it reports on -- so test_counters_are_snapshotted_at_quiesce can only guard that

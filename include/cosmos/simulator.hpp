@@ -4,6 +4,7 @@
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
+#include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
 #include <expected>
 #include <optional>
@@ -26,7 +27,8 @@ concept HasFactory = requires { I::create; };
 template <typename Injector> class BasicSimulator {
   public:
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
-        : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)) {}
+        : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)),
+          scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_) {}
 
     ~BasicSimulator() {
         if (current_sim_ == this) {
@@ -47,6 +49,9 @@ template <typename Injector> class BasicSimulator {
 
     TrackedHeap& heap() { return heap_; }
     const TrackedHeap& heap() const { return heap_; }
+
+    Scheduler& scheduler() { return scheduler_; }
+    const Scheduler& scheduler() const { return scheduler_; }
 
     VirtualClock& clock() { return clock_; }
     const VirtualClock& clock() const { return clock_; }
@@ -97,16 +102,18 @@ template <typename Injector> class BasicSimulator {
     }
 
   private:
-    // thread_local on purpose: a universe belongs to one OS thread. Caveat until the fiber
-    // scheduler lands and pthread_create is genuinely wrapped: threads spawned through the
-    // current passthrough get their own empty slot on their own OS thread, so wrapped calls
-    // made there fall through to the real host clock/heap instead of this universe. Keep
-    // simulation workloads single-threaded until then, or real and virtual state will mix.
+    // thread_local on purpose: a universe belongs to one OS thread. Fibers of
+    // one universe share this slot; wrapped calls on any fiber reach the same
+    // universe. A second OS thread gets its own empty slot and falls through
+    // to the host until fibers span threads (out of scope for v1).
     inline static thread_local BasicSimulator* current_sim_{nullptr};
     uint64_t seed_;
     TrackedHeap heap_{};
     Rng user_rng_;
     VirtualClock clock_{};
+    // After clock_: borrows it for timer wakeups. Before injector_: both borrow
+    // the clock and destruction is reverse order.
+    Scheduler scheduler_;
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
 };
