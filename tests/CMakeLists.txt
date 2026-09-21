@@ -189,6 +189,8 @@ add_test(NAME test_scenario COMMAND test_scenario)
 
 add_executable(test_scheduler test_scheduler.cpp)
 target_link_libraries(test_scheduler PRIVATE cosmos)
+# White-box test: pins the engine-context passthrough contract from wrapper_fault.hpp.
+target_include_directories(test_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
 
 if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # Wrapped pthread/time symbols must stay opaque calls so --wrap reaches them.

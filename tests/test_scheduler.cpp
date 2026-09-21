@@ -1,6 +1,7 @@
 #include "cosmos/cosmos.hpp"
 #include "cosmos/scenario.hpp"
 #include "cosmos/task.hpp"
+#include "wrapper_fault.hpp"
 
 #include <cassert>
 #include <cerrno>
@@ -436,6 +437,40 @@ void test_scenario_quiesce_reports_deadlock() {
     std::cout << "[PASS] test_scenario_quiesce_reports_deadlock" << std::endl;
 }
 
+// ---- 7. engine work never enters the scheduler ----
+
+// Direct calls, not pthread_self(): glibc declares pthread_self __attribute__((__const__)),
+// so the compiler is free to fold several calls into one and reuse the first result — fatal
+// here, where consecutive calls must observe different routing decisions.
+extern "C" pthread_t __wrap_pthread_self(void);
+
+void test_engine_internal_calls_passthrough() {
+    // Regression: std::mutex::lock() is header inline, so the allocation registry's mutex
+    // reaches __wrap_pthread_mutex_lock from inside __wrap_malloc itself (in_wrapper_logic
+    // set) whenever the pthread family is wrapped. Engine sync must use the real OS
+    // primitives: routing it into the scheduler would yield a fiber mid-wrapper —
+    // mutex_unlock always reschedules — while every other fiber still sees
+    // in_wrapper_logic and silently bypasses allocation tracking. pthread_self() is the
+    // discriminator: the main fiber's id is 0, a real OS thread's is never 0.
+    cosmos::Simulator sim(9101);
+    cosmos::Simulator::set_current(&sim);
+    must(__wrap_pthread_self() == 0);
+    pthread_mutex_t host_mu = PTHREAD_MUTEX_INITIALIZER;
+    {
+        cosmos::wrappers::ReentrancyGuard engine_context;
+        must(pthread_mutex_lock(&host_mu) == 0);
+        must(pthread_mutex_unlock(&host_mu) == 0);
+        must(__wrap_pthread_self() != 0);
+    }
+    must(__wrap_pthread_self() == 0);
+    // The scheduler never learned about the engine's mutex: an app-level lock of the same
+    // object starts from a clean sim-mutex state.
+    must(pthread_mutex_lock(&host_mu) == 0);
+    must(pthread_mutex_unlock(&host_mu) == 0);
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_engine_internal_calls_passthrough" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -454,6 +489,7 @@ int main() {
     test_abs_sleep_in_past_is_noop();
     test_deadlock_reported_by_drain();
     test_scenario_quiesce_reports_deadlock();
+    test_engine_internal_calls_passthrough();
     std::cout << "All scheduler tests passed successfully!" << std::endl;
     return 0;
 }
