@@ -164,6 +164,32 @@ endif()
 
 add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
 
+add_executable(test_wrap_net test_wrap_net.cpp)
+target_link_libraries(test_wrap_net PRIVATE cosmos)
+# White-box test: invokes the __wrap_* socket symbols directly, so the socket wrap flags exist
+# only to resolve every __real_* reference in the pulled-in wrap_net.o (subset linking, see
+# docs/linker-interposition.md). The memory family is wrapped because the test touches
+# Simulator, whose Scheduler (task.cpp.o) allocates via __real_malloc/__real_free.
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(test_wrap_net PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=socket"
+        "-Wl,--wrap=bind"
+        "-Wl,--wrap=listen"
+        "-Wl,--wrap=accept"
+        "-Wl,--wrap=connect"
+        "-Wl,--wrap=send"
+        "-Wl,--wrap=recv"
+        "-Wl,--wrap=close"
+    )
+endif()
+
+add_test(NAME test_wrap_net COMMAND test_wrap_net)
+
 add_executable(test_scenario test_scenario.cpp)
 target_link_libraries(test_scenario PRIVATE cosmos)
 
