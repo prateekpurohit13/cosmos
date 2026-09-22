@@ -103,7 +103,6 @@ void test_oom_fault_injection() {
     void* ptr = malloc(128);
     assert(ptr == nullptr);
     assert(errno == ENOMEM);
-    assert(sim.heap().stats().oom_fault_count == 1);
     assert(sim.heap().stats().active_allocations == 0);
     assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 1);
 
@@ -183,7 +182,6 @@ void test_calloc_zero_init_and_tracking() {
 
     assert(sim.heap().stats().active_allocations == ptrs.size());
     assert(sim.heap().stats().total_allocation_count == ptrs.size());
-    assert(sim.heap().stats().oom_fault_count == 0);
 
     for (void* p : ptrs) {
         free(p);
@@ -203,8 +201,6 @@ void test_calloc_overflow_rejected() {
     void* ptr = calloc(SIZE_MAX / 2, 3);
     assert(ptr == nullptr);
     assert(errno == ENOMEM);
-    // Overflow is a legitimate API failure, not an injected fault.
-    assert(sim.heap().stats().oom_fault_count == 0);
     assert(sim.heap().stats().total_allocation_count == 0);
 
     cosmos::Simulator::set_current(nullptr);
@@ -220,7 +216,7 @@ void test_calloc_oom_fault_injection() {
     void* ptr = calloc(4, 32);
     assert(ptr == nullptr);
     assert(errno == ENOMEM);
-    assert(sim.heap().stats().oom_fault_count == 1);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::calloc) == 1);
     assert(sim.heap().stats().active_allocations == 0);
 
     cosmos::Simulator::set_current(nullptr);
@@ -326,7 +322,7 @@ void test_realloc_oom_leaves_original_intact() {
     void* q = realloc(p, 4096);
     assert(q == nullptr);
     assert(errno == ENOMEM);
-    assert(sim.heap().stats().oom_fault_count == 1);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::realloc) == 1);
     assert(sim.heap().owns(p)); // original block still valid and tracked
     for (int i = 0; i < 32; ++i) {
         assert(p[i] == static_cast<unsigned char>(i ^ 0x5A));
@@ -679,7 +675,6 @@ void test_rate_zero_never_injects_and_never_draws() {
     }
     assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::malloc) == 50);
     assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
-    assert(sim.heap().stats().oom_fault_count == 0);
 
     cosmos::Simulator::set_current(nullptr);
     std::cout << "[PASS] test_rate_zero_never_injects_and_never_draws" << std::endl;
@@ -775,7 +770,6 @@ void test_calloc_overflow_is_not_an_eligible_call() {
     assert(p == nullptr);
     assert(errno == ENOMEM);
     assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::calloc) == 0);
-    assert(sim.heap().stats().oom_fault_count == 0);
 
     cosmos::Simulator::set_current(nullptr);
     std::cout << "[PASS] test_calloc_overflow_is_not_an_eligible_call" << std::endl;
@@ -858,7 +852,7 @@ void test_oversized_allocation_fails_like_the_real_heap() {
     assert(malloc(SIZE_MAX - 4) == nullptr);
     assert(errno == ENOMEM);
     assert(sim.heap().stats().active_allocations == 0);
-    assert(sim.heap().stats().oom_fault_count == 0);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
 
     void* p = malloc(32);
     assert(p != nullptr);
@@ -867,6 +861,7 @@ void test_oversized_allocation_fails_like_the_real_heap() {
     assert(errno == ENOMEM);
     assert(sim.heap().owns(p));
     assert(sim.heap().stats().active_allocations == 1);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::realloc) == 0);
     free(p);
 
     cosmos::Simulator::set_current(nullptr);
@@ -906,7 +901,6 @@ void test_interleaved_memory_sites_share_one_substream() {
                            injector->injections(cosmos::SiteId::calloc) +
                            injector->injections(cosmos::SiteId::realloc);
     assert(fired > 0);
-    assert(sim.heap().stats().oom_fault_count == fired);
 
     for (void* p : live) {
         free(p);

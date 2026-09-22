@@ -66,7 +66,6 @@ void* __wrap_malloc(size_t size) {
     // Decided before the heap is touched, so a fired OOM leaves TrackedHeap exactly as it was.
     if (cosmos::wrappers::memory_alloc_eligible(size) && decided_oom(sim, cosmos::SiteId::malloc)) {
         errno = ENOMEM;
-        sim->heap().record_oom();
         return nullptr;
     }
 
@@ -111,7 +110,6 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
 
     if (decided_oom(sim, cosmos::SiteId::calloc)) {
         errno = ENOMEM;
-        sim->heap().record_oom();
         return nullptr;
     }
 
@@ -150,7 +148,6 @@ void* __wrap_realloc(void* ptr, size_t size) {
         if (cosmos::wrappers::memory_realloc_eligible(ptr, size, /*owned_by_sim=*/false) &&
             decided_oom(sim, cosmos::SiteId::realloc)) {
             errno = ENOMEM;
-            sim->heap().record_oom();
             return nullptr;
         }
         return sim->heap().allocate(size);
@@ -162,7 +159,6 @@ void* __wrap_realloc(void* ptr, size_t size) {
             if (cosmos::wrappers::memory_realloc_eligible(ptr, size, sim->heap().owns(ptr)) &&
                 decided_oom(sim, cosmos::SiteId::realloc)) {
                 errno = ENOMEM;
-                sim->heap().record_oom();
                 return nullptr;
             }
         }

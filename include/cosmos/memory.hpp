@@ -175,6 +175,7 @@ struct HeapStats {
     size_t total_allocated_bytes = 0;
     size_t active_allocations = 0;
     size_t total_allocation_count = 0;
+    // Never written: an injected OOM is recorded as the injector's per-site injections().
     size_t oom_fault_count = 0;
 };
 
@@ -311,8 +312,6 @@ class TrackedHeap {
         deallocate(user_ptr);
         return new_ptr;
     }
-
-    void record_oom() { stats_.oom_fault_count++; }
 
     const HeapStats& stats() const { return stats_; }
     size_t active_count() const { return stats_.active_allocations; }

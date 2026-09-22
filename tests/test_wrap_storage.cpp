@@ -268,7 +268,7 @@ void test_fortified_read_alias_reaches_the_same_site() {
     std::cout << "[PASS] test_fortified_read_alias_reaches_the_same_site" << std::endl;
 }
 
-// Minimum live slice only; the full per-site legality matrix is P3-S2's.
+// Subset of test_storage_outcome_matrix: kept as a smoke path, not as errno coverage.
 void test_storage_outcomes_map_to_errno() {
     const std::string path = temp_path("errno");
 
@@ -374,9 +374,15 @@ void test_unactivated_site_never_moves_the_storage_stream() {
         } else {
             assert(written == 4);
         }
+        assert(fsync(fd) == 0);
+        const int other = ::open(path.c_str(), O_RDWR);
+        assert(other >= 0);
+        assert(::close(other) == 0);
     }
     assert(fired > 0 && fired < 60);
     assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::read) == 0);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::fsync) == 0);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::open) == 0);
     assert(sim.injector_or_null()->injections(cosmos::SiteId::write) == fired);
 
     cosmos::Simulator::set_current(nullptr);
@@ -412,6 +418,125 @@ void test_allocation_inside_wrapper_logic_is_never_faulted() {
     std::cout << "[PASS] test_allocation_inside_wrapper_logic_is_never_faulted" << std::endl;
 }
 
+struct MatrixCase {
+    cosmos::SiteId site;
+    cosmos::FaultKind kind;
+    size_t count;
+    ssize_t result;
+    int error;
+};
+
+// Rule 15 at the wire: the errno an injected outcome produces must be one the man page lists.
+bool listed_errno(cosmos::SiteId site, int error) {
+    switch (site) {
+    case cosmos::SiteId::open:
+    case cosmos::SiteId::write:
+    case cosmos::SiteId::fsync:
+        return error == EIO || error == ENOSPC;
+    case cosmos::SiteId::read:
+        return error == EIO;
+    default:
+        return false;
+    }
+}
+
+void test_storage_outcome_matrix() {
+    static const MatrixCase cases[] = {
+        {cosmos::SiteId::open, cosmos::FaultKind::OpenEio, 0, -1, EIO},
+        {cosmos::SiteId::open, cosmos::FaultKind::NoSpace, 0, -1, ENOSPC},
+        {cosmos::SiteId::read, cosmos::FaultKind::ReadEio, 4, -1, EIO},
+        {cosmos::SiteId::write, cosmos::FaultKind::WriteEio, 4, -1, EIO},
+        {cosmos::SiteId::write, cosmos::FaultKind::NoSpace, 4, -1, ENOSPC},
+        {cosmos::SiteId::write, cosmos::FaultKind::ShortWrite, 8, 4, 0},
+        {cosmos::SiteId::write, cosmos::FaultKind::ShortWrite, 5, 2, 0},
+        {cosmos::SiteId::write, cosmos::FaultKind::ShortWrite, 1, 1, 0},
+        {cosmos::SiteId::fsync, cosmos::FaultKind::FsyncEio, 0, -1, EIO},
+        {cosmos::SiteId::fsync, cosmos::FaultKind::NoSpace, 0, -1, ENOSPC},
+    };
+
+    uint64_t seed = 0x51EED;
+    for (const MatrixCase& c : cases) {
+        const std::string path = temp_path("matrix");
+        const int fd = open_scratch(path);
+        const char source[] = "abcdefgh";
+        if (c.site == cosmos::SiteId::read) {
+            assert(::write(fd, source, sizeof(source) - 1) == 8);
+        }
+        assert(lseek(fd, 0, SEEK_SET) == 0);
+
+        {
+            cosmos::Simulator sim(seed++);
+            must(sim.install_faults(storage_config(c.site, c.kind)).has_value());
+            cosmos::Simulator::set_current(&sim);
+            errno = 0;
+            ssize_t result = 0;
+            if (c.site == cosmos::SiteId::open) {
+                result = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+            } else if (c.site == cosmos::SiteId::read) {
+                char buf[8] = {};
+                result = ::read(fd, buf, c.count);
+            } else if (c.site == cosmos::SiteId::write) {
+                result = ::write(fd, source, c.count);
+            } else {
+                result = fsync(fd);
+            }
+            const int error = errno;
+            assert(result == c.result);
+            assert(error == c.error);
+            assert(c.error == 0 || listed_errno(c.site, error));
+            assert(sim.injector_or_null()->eligible_calls(c.site) == 1);
+            assert(sim.injector_or_null()->injections(c.site) == 1);
+            cosmos::Simulator::set_current(nullptr);
+        }
+
+        if (c.site == cosmos::SiteId::write && c.result > 0) {
+            assert(lseek(fd, 0, SEEK_SET) == 0);
+            char back[8] = {};
+            assert(::read(fd, back, sizeof(back)) == c.result);
+            assert(memcmp(back, source, static_cast<size_t>(c.result)) == 0);
+            assert(::read(fd, back, sizeof(back)) == 0);
+        }
+
+        close(fd);
+        unlink(path.c_str());
+    }
+    std::cout << "[PASS] test_storage_outcome_matrix" << std::endl;
+}
+
+// A storage class that is off must not reach the injector at all, not merely decline to fire.
+void test_disabled_storage_class_stays_passthrough() {
+    const std::string path = temp_path("disabled");
+    int fd = open_scratch(path);
+
+    cosmos::Simulator sim(3);
+    cosmos::FaultConfig cfg;
+    cfg.enable_class(cosmos::FaultClass::Memory);
+    must(sim.install_faults(std::move(cfg)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    const char msg[] = "intact";
+    assert(::write(fd, msg, sizeof(msg) - 1) == 6);
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char buf[8] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 6);
+    assert(memcmp(buf, msg, 6) == 0);
+    assert(fsync(fd) == 0);
+    const int second = ::open(path.c_str(), O_RDWR);
+    assert(second >= 3);
+    assert(::close(second) == 0);
+
+    for (cosmos::SiteId site : {cosmos::SiteId::open, cosmos::SiteId::read, cosmos::SiteId::write,
+                                cosmos::SiteId::fsync}) {
+        assert(sim.injector_or_null()->eligible_calls(site) == 0);
+        assert(sim.injector_or_null()->injections(site) == 0);
+    }
+
+    cosmos::Simulator::set_current(nullptr);
+    close(fd);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_disabled_storage_class_stays_passthrough" << std::endl;
+}
+
 int main() {
     // Unique 0700 directory: no dependence on a pre-existing path, no cross-user collisions.
     std::string tmpl = "/tmp/cosmos_storage_XXXXXX";
@@ -430,6 +555,8 @@ int main() {
     test_storage_outcomes_map_to_errno();
     test_fortified_read_alias_reaches_the_same_site();
     test_unactivated_site_never_moves_the_storage_stream();
+    test_storage_outcome_matrix();
+    test_disabled_storage_class_stays_passthrough();
     test_allocation_inside_wrapper_logic_is_never_faulted();
 
     rmdir(g_temp_dir.c_str()); // best effort; every test unlinks its own files
