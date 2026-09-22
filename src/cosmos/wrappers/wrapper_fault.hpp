@@ -7,6 +7,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 namespace cosmos::wrappers {
 
@@ -50,6 +52,23 @@ inline constexpr bool storage_read_eligible(int fd, size_t count) {
 
 inline constexpr bool storage_write_eligible(int fd, size_t count) {
     return storage_fd_eligible(fd) && count > 0;
+}
+
+// A non-IPv4 address is answered by the transport before the injector, like a calloc overflow:
+// the observable is a real API failure rather than a fault (Rule 15).
+inline constexpr bool network_addr_eligible(const struct sockaddr* addr, socklen_t addrlen) {
+    return addr != nullptr && addrlen >= sizeof(struct sockaddr_in) && addr->sa_family == AF_INET;
+}
+
+// An accept with nothing queued has no abort observable; it blocks or reports EAGAIN instead.
+inline constexpr bool network_accept_eligible(bool pending) { return pending; }
+
+inline constexpr bool network_send_eligible(bool connected, size_t len) {
+    return connected && len > 0;
+}
+
+inline constexpr bool network_recv_eligible(bool connected, size_t len) {
+    return connected && len > 0;
 }
 
 // Eligible because C11 lets malloc(0) return nullptr, so a fire there is still a legal observable.

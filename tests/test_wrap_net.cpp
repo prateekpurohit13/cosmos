@@ -1,109 +1,185 @@
-#include "cosmos/cosmos.hpp"
+#include "net_test_support.hpp"
 
-#include <cassert>
-#include <csignal>
+#include <cstdio>
+#include <fcntl.h>
 #include <iostream>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <poll.h>
+#include <string>
 
-// Fail-fast contract of the socket stubs (src/cosmos/wrappers/wrap_net.cpp): with a universe
-// current they abort rather than touch real kernel sockets from a deterministic
-// single-threaded world; without one they pass through so host code keeps its sockets. The
-// __wrap_* symbols are invoked directly (the __read_chk precedent), so nothing depends on
-// which call sites the compiler emits; the link flags in CMake exist to resolve every
-// __real_* reference in the pulled-in wrap_net.o.
-
-extern "C" {
-int __wrap_socket(int domain, int type, int protocol);
-int __wrap_bind(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
-int __wrap_listen(int sockfd, int backlog);
-int __wrap_accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen);
-int __wrap_connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
-ssize_t __wrap_send(int sockfd, const void* buf, size_t len, int flags);
-ssize_t __wrap_recv(int sockfd, void* buf, size_t len, int flags);
-int __wrap_close(int fd);
-}
-
-namespace {
-
-void must(bool ok) { assert(ok); }
+extern "C" int __wrap___poll_chk(struct pollfd* fds, nfds_t nfds, int timeout, size_t fdslen);
 
 void test_passthrough_without_universe() {
     must(!cosmos::Simulator::has_current());
-    // A plain call site routes here through --wrap=socket; the direct call below pins the
-    // same path.
-    const int plain_fd = socket(AF_INET, SOCK_STREAM, 0);
-    must(plain_fd >= 0);
-    must(__wrap_close(plain_fd) == 0);
+    const int plain = socket(AF_INET, SOCK_STREAM, 0);
+    must(plain >= 0);
+    must(close(plain) == 0);
 
-    const int fd = __wrap_socket(AF_INET, SOCK_STREAM, 0);
-    must(fd >= 0);
-    must(__wrap_close(fd) == 0);
+    int sv[2] = {-1, -1};
+    must(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    must(send(sv[0], "abc", 3, 0) == 3);
+    char buf[4] = {};
+    must(recv(sv[1], buf, sizeof(buf), 0) == 3);
+    must(std::memcmp(buf, "abc", 3) == 0);
+    must(close(sv[0]) == 0);
+    must(close(sv[1]) == 0);
     std::cout << "[PASS] test_passthrough_without_universe" << std::endl;
 }
 
-// close() must stay host-side even under a universe: descriptors are shared with the
-// implemented storage surface, and their kind cannot be told apart.
-void test_close_stays_host_side_under_universe() {
-    must(!cosmos::Simulator::has_current());
-    const int fd = __wrap_socket(AF_INET, SOCK_STREAM, 0);
-    must(fd >= 0);
-    cosmos::Simulator sim(1);
+std::string loopback_transcript(uint64_t seed) {
+    cosmos::Simulator sim(seed);
+    must(sim.install_faults(network_config(cosmos::SiteId::send, cosmos::FaultKind::PacketCorrupt))
+             .has_value());
     cosmos::Simulator::set_current(&sim);
-    must(__wrap_close(fd) == 0);
+
+    Cluster pair = open_pair();
+    char payload[64];
+    for (size_t i = 0; i < sizeof(payload); ++i)
+        payload[i] = static_cast<char>('A' + (i % 26));
+    must(send(pair.client, payload, sizeof(payload), 0) == static_cast<ssize_t>(sizeof(payload)));
+
+    struct pollfd pfd{pair.server, POLLIN, 0};
+    must(poll(&pfd, 1, 0) == 1);
+    must((pfd.revents & POLLIN) != 0);
+
+    char got[64] = {};
+    must(recv(pair.server, got, sizeof(got), 0) == static_cast<ssize_t>(sizeof(got)));
+    drop_pair(pair);
+
+    std::string out(got, sizeof(got));
+    out += "|";
+    out += std::to_string(sim.now().ns);
     cosmos::Simulator::set_current(nullptr);
-    std::cout << "[PASS] test_close_stays_host_side_under_universe" << std::endl;
+    return out;
 }
 
-// The arguments never matter: each wrapper aborts before touching them.
-void call_socket() { (void)__wrap_socket(AF_INET, SOCK_STREAM, 0); }
-void call_bind() { (void)__wrap_bind(-1, nullptr, 0); }
-void call_listen() { (void)__wrap_listen(-1, 1); }
-void call_accept() { (void)__wrap_accept(-1, nullptr, nullptr); }
-void call_connect() { (void)__wrap_connect(-1, nullptr, 0); }
-void call_send() { (void)__wrap_send(-1, nullptr, 0, 0); }
-void call_recv() { (void)__wrap_recv(-1, nullptr, 0, 0); }
+void test_loopback_is_byte_perfect_and_deterministic() {
+    cosmos::Simulator sim(11);
+    cosmos::Simulator::set_current(&sim);
+    Cluster pair = open_pair();
 
-// The abort is the contract, so each case runs in a forked child and the parent observes
-// SIGABRT. No asserts in the child: a failed assert there also raises SIGABRT and would be
-// indistinguishable from the wrapper firing.
-bool dies_with_sigabrt(void (*call)(void)) {
-    const pid_t pid = fork();
-    must(pid >= 0);
-    if (pid == 0) {
-        cosmos::Simulator sim(1);
-        cosmos::Simulator::set_current(&sim);
-        call();
-        _exit(0); // Unreachable when the wrapper aborts as it must.
-    }
-    int status = 0;
-    must(waitpid(pid, &status, 0) == pid);
-    return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    const char payload[] = "the quick brown fox";
+    must(send(pair.client, payload, sizeof(payload) - 1, 0) ==
+         static_cast<ssize_t>(sizeof(payload) - 1));
+    char got[32] = {};
+    must(recv(pair.server, got, sizeof(got), 0) == static_cast<ssize_t>(sizeof(payload) - 1));
+    must(std::memcmp(got, payload, sizeof(payload) - 1) == 0);
+
+    int sv[2] = {-1, -1};
+    must(socketpair(AF_INET, SOCK_STREAM, 0, sv) == 0);
+    must(sv[0] >= cosmos::kVirtualFdBase && sv[1] >= cosmos::kVirtualFdBase);
+    must(send(sv[1], "pair", 4, 0) == 4);
+    char back[8] = {};
+    must(recv(sv[0], back, sizeof(back), 0) == 4);
+    must(std::memcmp(back, "pair", 4) == 0);
+    must(close(sv[0]) == 0);
+    must(close(sv[1]) == 0);
+
+    drop_pair(pair);
+    cosmos::Simulator::set_current(nullptr);
+
+    must(loopback_transcript(4242) == loopback_transcript(4242));
+    std::cout << "[PASS] test_loopback_is_byte_perfect_and_deterministic" << std::endl;
 }
 
-void test_socket_calls_abort_under_universe() {
-    struct Case {
-        const char* name;
-        void (*call)(void);
-    };
-    const Case cases[] = {
-        {"socket", call_socket}, {"bind", call_bind},       {"listen", call_listen},
-        {"accept", call_accept}, {"connect", call_connect}, {"send", call_send},
-        {"recv", call_recv},
-    };
-    for (const Case& c : cases) {
-        must(dies_with_sigabrt(c.call));
-        std::cout << "[PASS] abort under universe: " << c.name << std::endl;
-    }
+void test_poll_readiness_and_chk_alias() {
+    cosmos::Simulator sim(91);
+    cosmos::Simulator::set_current(&sim);
+    Cluster pair = open_pair();
+
+    struct pollfd out{pair.client, POLLOUT, 0};
+    must(poll(&out, 1, 0) == 1);
+    must((out.revents & POLLOUT) != 0);
+
+    struct pollfd in{pair.server, POLLIN, 0};
+    must(poll(&in, 1, 0) == 0);
+
+    must(send(pair.client, "ping", 4, 0) == 4);
+    in.revents = 0;
+    must(poll(&in, 1, 0) == 1);
+    must((in.revents & POLLIN) != 0);
+
+    in.revents = 0;
+    must(__wrap___poll_chk(&in, 1, 0, sizeof(in)) == 1);
+    must((in.revents & POLLIN) != 0);
+
+    struct pollfd empty{pair.client, POLLIN, 0};
+    const cosmos::Time before = sim.now();
+    must(poll(&empty, 1, 10) == 0);
+    must(sim.now() >= before + cosmos::Duration{10'000'000});
+
+    drop_pair(pair);
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_poll_readiness_and_chk_alias" << std::endl;
 }
 
-} // namespace
+void test_nonblocking_paths_and_fcntl() {
+    cosmos::Simulator sim(71);
+    cosmos::Simulator::set_current(&sim);
+
+    uint16_t port = 0;
+    const int listener_fd = bind_listener(&port, /*nonblocking=*/true);
+    Address peer;
+    socklen_t len = peer.size();
+    errno = 0;
+    must(accept(listener_fd, peer.as_mutable_sockaddr(), &len) == -1);
+    must(errno == EAGAIN);
+
+    // The ordinary way an application turns a socket non-blocking, which the transport must honour.
+    const int plain = socket(AF_INET, SOCK_STREAM, 0);
+    must(fcntl(plain, F_GETFL) == O_RDWR);
+    must(fcntl(plain, F_SETFL, O_NONBLOCK) == 0);
+    must((fcntl(plain, F_GETFL) & O_NONBLOCK) != 0);
+
+    Cluster pair = open_pair();
+    errno = 0;
+    char buf[4] = {};
+    must(recv(pair.server, buf, sizeof(buf), MSG_DONTWAIT) == -1);
+    must(errno == EAGAIN);
+
+    close(plain);
+    drop_pair(pair);
+    close(listener_fd);
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_nonblocking_paths_and_fcntl" << std::endl;
+}
+
+void test_status_errors_and_close_semantics() {
+    cosmos::Simulator sim(81);
+    cosmos::Simulator::set_current(&sim);
+    Cluster pair = open_pair();
+
+    errno = 0;
+    must(send(pair.listener, "x", 1, 0) == -1);
+    must(errno == ENOTCONN);
+    char probe[4] = {};
+    errno = 0;
+    must(recv(pair.listener, probe, sizeof(probe), MSG_DONTWAIT) == -1);
+    must(errno == ENOTCONN);
+    errno = 0;
+    must(send(5000, "x", 1, 0) == -1);
+    must(errno == EBADF);
+
+    must(close(pair.server) == 0);
+    pair.server = -1;
+    errno = 0;
+    char buf[4] = {};
+    must(recv(pair.client, buf, sizeof(buf), MSG_DONTWAIT) == 0);
+
+    must(shutdown(pair.client, SHUT_WR) == 0);
+    must(close(pair.client) == 0);
+    pair.client = -1;
+    must(close(pair.listener) == 0);
+    pair.listener = -1;
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_status_errors_and_close_semantics" << std::endl;
+}
 
 int main() {
     test_passthrough_without_universe();
-    test_close_stays_host_side_under_universe();
-    test_socket_calls_abort_under_universe();
-    std::cout << "All network wrapper tests passed successfully!" << std::endl;
+    test_loopback_is_byte_perfect_and_deterministic();
+    test_poll_readiness_and_chk_alias();
+    test_nonblocking_paths_and_fcntl();
+    test_status_errors_and_close_semantics();
+    std::cout << "All network transport tests passed successfully!" << std::endl;
     return 0;
 }

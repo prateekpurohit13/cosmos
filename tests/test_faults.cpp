@@ -535,6 +535,33 @@ bool legal_per_man_page(SiteId site, FaultKind kind) {
     return false;
 }
 
+// A magnitude-carrying kind may not fire into the past, which is what a negative amount would mean;
+// zero stays legal because it means "no magnitude" and is recorded as a fire all the same.
+void test_a_negative_magnitude_is_rejected() {
+    struct Case {
+        SiteId site;
+        FaultClass cls;
+    };
+    const Case cases[] = {
+        {SiteId::write, FaultClass::Storage},
+        {SiteId::send, FaultClass::Network},
+        {SiteId::clock_gettime, FaultClass::Clock},
+    };
+    for (const Case& c : cases) {
+        FaultConfig cfg = valid_config();
+        cfg.enable_class(c.cls);
+        must(cfg.activate_site(c.site));
+        FaultRule rule;
+        rule.amount = cosmos::Duration{-1};
+        must(cfg.set_rule(c.site, rule));
+        const auto checked = cfg.validate(kNodes);
+        must(!checked.has_value());
+        assert(checked.error().error == ConfigError::BadAmount);
+        assert(checked.error().site == c.site);
+    }
+    std::cout << "[PASS] test_a_negative_magnitude_is_rejected" << std::endl;
+}
+
 void test_legality_table_matches_the_documented_menus() {
     for (SiteId site : cosmos::kAllSites) {
         assert(!cosmos::is_legal_outcome(site, FaultKind::None));
@@ -564,6 +591,7 @@ int main() {
     test_outcome_table_reports_overflow();
     test_widest_site_menu_fits_in_a_table();
     test_knobs_must_be_ordered();
+    test_a_negative_magnitude_is_rejected();
     test_legality_table_matches_the_documented_menus();
     std::cout << "All fault config tests passed successfully!" << std::endl;
     return 0;

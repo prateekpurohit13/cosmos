@@ -164,31 +164,57 @@ endif()
 
 add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
 
-add_executable(test_wrap_net test_wrap_net.cpp)
-target_link_libraries(test_wrap_net PRIVATE cosmos)
-# White-box test: invokes the __wrap_* socket symbols directly, so the socket wrap flags exist
-# only to resolve every __real_* reference in the pulled-in wrap_net.o (subset linking, see
-# docs/linker-interposition.md). The memory family is wrapped because the test touches
-# Simulator, whose Scheduler (task.cpp.o) allocates via __real_malloc/__real_free.
-if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_link_options(test_wrap_net PRIVATE
-        "-Wl,--gc-sections"
-        "-Wl,--wrap=malloc"
-        "-Wl,--wrap=free"
-        "-Wl,--wrap=calloc"
-        "-Wl,--wrap=realloc"
-        "-Wl,--wrap=socket"
-        "-Wl,--wrap=bind"
-        "-Wl,--wrap=listen"
-        "-Wl,--wrap=accept"
-        "-Wl,--wrap=connect"
-        "-Wl,--wrap=send"
-        "-Wl,--wrap=recv"
-        "-Wl,--wrap=close"
-    )
-endif()
+# The two network suites share one wrap list: the transport is only reachable through the wrapped
+# API, and every __real_* reference in the pulled-in objects must resolve. The memory family is
+# wrapped because the suites touch Simulator, whose Scheduler (task.cpp.o) allocates with
+# __real_malloc/__real_free; the pthread/time family because blocking recv/accept must suspend the
+# calling fiber through the scheduler rather than the host.
+set(cosmos_net_wraps
+    "-Wl,--gc-sections"
+    "-Wl,--wrap=malloc"
+    "-Wl,--wrap=free"
+    "-Wl,--wrap=calloc"
+    "-Wl,--wrap=realloc"
+    "-Wl,--wrap=socket"
+    "-Wl,--wrap=socketpair"
+    "-Wl,--wrap=bind"
+    "-Wl,--wrap=listen"
+    "-Wl,--wrap=accept"
+    "-Wl,--wrap=connect"
+    "-Wl,--wrap=send"
+    "-Wl,--wrap=recv"
+    "-Wl,--wrap=__recv_chk"
+    "-Wl,--wrap=shutdown"
+    "-Wl,--wrap=close"
+    "-Wl,--wrap=poll"
+    "-Wl,--wrap=__poll_chk"
+    "-Wl,--wrap=fcntl"
+    "-Wl,--wrap=getsockname"
+    "-Wl,--wrap=getpeername"
+    "-Wl,--wrap=setsockopt"
+    "-Wl,--wrap=getsockopt"
+    "-Wl,--wrap=pthread_create"
+    "-Wl,--wrap=pthread_join"
+    "-Wl,--wrap=pthread_self"
+    "-Wl,--wrap=pthread_equal"
+    "-Wl,--wrap=pthread_exit"
+    "-Wl,--wrap=sched_yield"
+    "-Wl,--wrap=clock_gettime"
+    "-Wl,--wrap=nanosleep"
+    "-Wl,--wrap=clock_nanosleep"
+)
 
-add_test(NAME test_wrap_net COMMAND test_wrap_net)
+foreach(suite wrap_net wrap_net_faults)
+    set(target test_${suite})
+    add_executable(${target} test_${suite}.cpp)
+    target_link_libraries(${target} PRIVATE cosmos)
+    # White-box tests: both pin the internal network eligibility policy from wrapper_fault.hpp.
+    target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_link_options(${target} PRIVATE ${cosmos_net_wraps})
+    endif()
+    add_test(NAME ${target} COMMAND ${target})
+endforeach()
 
 add_executable(test_scenario test_scenario.cpp)
 target_link_libraries(test_scenario PRIVATE cosmos)
