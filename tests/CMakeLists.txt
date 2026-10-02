@@ -155,6 +155,8 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=calloc"
         "-Wl,--wrap=realloc"
         "-Wl,--wrap=open"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
@@ -163,6 +165,34 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_wrap_storage COMMAND test_wrap_storage)
+
+add_executable(test_wrap_clock test_wrap_clock.cpp)
+target_link_libraries(test_wrap_clock PRIVATE cosmos)
+# White-box test: pins the internal clock eligibility policy from wrapper_fault.hpp.
+target_include_directories(test_wrap_clock PRIVATE ${CMAKE_SOURCE_DIR}/src/cosmos/wrappers)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Wrapped symbols must stay opaque calls so the linker substitution reaches them.
+    target_compile_options(test_wrap_clock PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_wrap_clock PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
+        "-Wl,--wrap=nanosleep"
+        "-Wl,--wrap=clock_nanosleep"
+    )
+endif()
+
+add_test(NAME test_wrap_clock COMMAND test_wrap_clock)
 
 # The two network suites share one wrap list: the transport is only reachable through the wrapped
 # API, and every __real_* reference in the pulled-in objects must resolve. The memory family is

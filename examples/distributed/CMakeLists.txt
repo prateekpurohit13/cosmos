@@ -42,6 +42,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=pthread_cond_broadcast"
         "-Wl,--wrap=sched_yield"
         "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=gettimeofday"
         "-Wl,--wrap=nanosleep"
         "-Wl,--wrap=clock_nanosleep"
         "-Wl,--wrap=socket"

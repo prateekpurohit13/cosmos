@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -45,6 +46,11 @@ static_assert(!cosmos::wrappers::storage_write_eligible(1, 4096)); // std stream
 static_assert(!cosmos::wrappers::storage_read_eligible(3, 0));
 static_assert(cosmos::wrappers::storage_read_eligible(3, 128));
 static_assert(!cosmos::wrappers::storage_read_eligible(2, 128)); // std stream fd
+
+// Called directly, the way the __read_chk test does: the alias must reach the open site whether
+// or not this translation unit was fortified.
+extern "C" int __wrap___open_2(const char* pathname, int flags);
+extern "C" int __wrap___open64_2(const char* pathname, int flags);
 
 namespace {
 
@@ -266,6 +272,111 @@ void test_fortified_read_alias_reaches_the_same_site() {
     close(fd);
     unlink(path.c_str());
     std::cout << "[PASS] test_fortified_read_alias_reaches_the_same_site" << std::endl;
+}
+
+// glibc substitutes __open_2/__open64_2 for a two-argument open() under _FORTIFY_SOURCE, and
+// --wrap=open does not see those symbols. Both must reach the same site, so a fortified build
+// cannot silently skip it.
+void test_fortified_open_aliases_reach_the_same_site() {
+    const std::string path = temp_path("open2");
+    {
+        cosmos::Simulator sim(11);
+        must(sim.install_faults(storage_config(cosmos::SiteId::open, cosmos::FaultKind::OpenEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+
+        errno = 0;
+        assert(__wrap___open_2(path.c_str(), O_RDWR) == -1);
+        assert(errno == EIO);
+        errno = 0;
+        assert(__wrap___open64_2(path.c_str(), O_RDWR) == -1);
+        assert(errno == EIO);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::open) == 2);
+        assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::open) == 2);
+
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    // No universe: the alias reaches the host. Creation is done with the ordinary open, because
+    // the fortified two-argument form cannot carry a mode.
+    int fd = open(path.c_str(), O_CREAT | O_RDWR, 0600);
+    assert(fd >= 3);
+    assert(close(fd) == 0);
+    fd = __wrap___open_2(path.c_str(), O_RDWR);
+    assert(fd >= 3);
+    assert(close(fd) == 0);
+    unlink(path.c_str());
+
+    std::cout << "[PASS] test_fortified_open_aliases_reach_the_same_site" << std::endl;
+}
+
+// The decision precedes the real call, so a faulted call must leave the filesystem as it found it:
+// nothing written, nothing created.
+void test_faulted_calls_leave_no_side_effects() {
+    const std::string path = temp_path("sideeffect");
+
+    {
+        cosmos::Simulator sim(17);
+        must(sim.install_faults(storage_config(cosmos::SiteId::open, cosmos::FaultKind::OpenEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        assert(open(path.c_str(), O_CREAT | O_RDWR, 0600) == -1);
+        cosmos::Simulator::set_current(nullptr);
+    }
+    assert(access(path.c_str(), F_OK) != 0); // the faulted open created nothing
+
+    int fd = open_scratch(path);
+    assert(::write(fd, "original-content", 16) == 16);
+
+    {
+        cosmos::Simulator sim(18);
+        must(sim.install_faults(storage_config(cosmos::SiteId::write, cosmos::FaultKind::WriteEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        assert(::write(fd, "clobbered", 9) == -1);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::write) == 1);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    char buf[32] = {};
+    assert(::read(fd, buf, sizeof(buf)) == 16);
+    assert(memcmp(buf, "original-content", 16) == 0); // the faulted write never reached the file
+
+    close(fd);
+    unlink(path.c_str());
+    std::cout << "[PASS] test_faulted_calls_leave_no_side_effects" << std::endl;
+}
+
+// Fds the storage surface does not own must not spend Storage draws: an invalid number and a
+// cosmos virtual socket fd (which the file API cannot fault at all).
+void test_ineligible_fds_never_move_the_storage_stream() {
+    int sockets[2] = {0, 0};
+    {
+        cosmos::Simulator sim(19);
+        must(sim.install_faults(storage_config(cosmos::SiteId::write, cosmos::FaultKind::WriteEio))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+
+        assert(sim.net().pair(AF_INET, SOCK_STREAM, 0, sockets) == 0);
+        assert(sockets[0] >= cosmos::kVirtualFdBase);
+
+        // Both calls reach the host and fail there. What this test owns is that the storage
+        // surface left them alone: routing a socket fd to the transport is a separate gap,
+        // recorded in the plan rather than papered over with a fault.
+        const ssize_t on_a_socket = ::write(sockets[0], "x", 1);
+        const ssize_t on_a_bad_fd = ::write(-1, "x", 1);
+        (void)on_a_socket;
+        (void)on_a_bad_fd;
+
+        auto* injector = sim.injector_or_null();
+        assert(injector->eligible_calls(cosmos::SiteId::write) == 0);
+        assert(injector->injections(cosmos::SiteId::write) == 0);
+
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    std::cout << "[PASS] test_ineligible_fds_never_move_the_storage_stream" << std::endl;
 }
 
 // Subset of test_storage_outcome_matrix: kept as a smoke path, not as errno coverage.
@@ -554,6 +665,9 @@ int main() {
     test_no_alloc_smoke();
     test_storage_outcomes_map_to_errno();
     test_fortified_read_alias_reaches_the_same_site();
+    test_fortified_open_aliases_reach_the_same_site();
+    test_faulted_calls_leave_no_side_effects();
+    test_ineligible_fds_never_move_the_storage_stream();
     test_unactivated_site_never_moves_the_storage_stream();
     test_storage_outcome_matrix();
     test_disabled_storage_class_stays_passthrough();

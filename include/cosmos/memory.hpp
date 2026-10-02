@@ -225,6 +225,8 @@ class TrackedHeap {
         size_t total_size = header_size + size;
         void* raw = __real_malloc(total_size);
         if (!raw) {
+            // A genuine host failure, not an injected one: malloc's contract still owes ENOMEM.
+            errno = ENOMEM;
             return nullptr;
         }
 

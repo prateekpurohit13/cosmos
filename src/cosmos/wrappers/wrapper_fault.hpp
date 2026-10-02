@@ -4,11 +4,14 @@
 // an unused wrapper without dragging in the others (docs/design.md §2).
 
 #include "cosmos/faults.hpp"
+// For kVirtualFdBase: the storage surface must not treat the socket layer's fds as files.
+#include "cosmos/net.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <time.h>
 
 namespace cosmos::wrappers {
 
@@ -41,10 +44,35 @@ template <typename Sim> FaultKind decide_for(Sim* sim, FaultClass cls, SiteId si
     return FaultKind::None;
 }
 
+// What a wrapper must translate: the fault that fired, plus the strength only some faults have
+// (a packet delay, a clock step, an interrupted sleep's elapsed part).
+struct Decision {
+    FaultKind kind = FaultKind::None;
+    Duration amount{};
+};
+
+// Callers hold the wrapper's ReentrancyGuard: this reads engine state (Rule 7).
+template <typename Sim> Decision decide_with_amount(Sim* sim, FaultClass cls, SiteId site) {
+    Decision fault;
+    fault.kind = decide_for(sim, cls, site);
+    if (fault.kind == FaultKind::None) {
+        return fault;
+    }
+    if (const FaultRule* rule = sim->injector_or_null()->config().rule_for(site)) {
+        fault.amount = rule->amount;
+    }
+    return fault;
+}
+
 // A call is eligible only where a decision could produce a legal, observable outcome (Rule 15).
 // Standard streams are excluded so logging cannot consume Storage draws or fail with injected
 // errors; an empty transfer has nothing to observe. 1-byte writes stay eligible.
-inline constexpr bool storage_fd_eligible(int fd) { return fd > 2; }
+// A cosmos virtual fd (the simulated socket layer) is not a file descriptor the storage surface
+// owns: reading or writing one through the storage wrappers would spend Storage draws on a fault
+// the file API cannot honour, and then reach the host with a number the kernel never issued.
+inline constexpr bool storage_fd_eligible(int fd) {
+    return fd > 2 && fd < static_cast<int>(cosmos::kVirtualFdBase);
+}
 
 inline constexpr bool storage_read_eligible(int fd, size_t count) {
     return storage_fd_eligible(fd) && count > 0;
@@ -69,6 +97,22 @@ inline constexpr bool network_send_eligible(bool connected, size_t len) {
 
 inline constexpr bool network_recv_eligible(bool connected, size_t len) {
     return connected && len > 0;
+}
+
+// Nanoseconds in a timespec, or -1 if it is not a legal POSIX request (negative seconds, or a
+// nanosecond field outside [0, 1e9)). Taken by value so it stays usable in constant expressions
+// under sanitizers, which do not keep globals constant-initialized. Saturates like every other
+// time conversion here.
+inline constexpr int64_t clock_timespec_ns(struct timespec ts) {
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1'000'000'000L) return -1;
+    return add_sat(mul_sat(static_cast<int64_t>(ts.tv_sec), 1'000'000'000LL),
+                   static_cast<int64_t>(ts.tv_nsec));
+}
+
+// A sleep that is missing, malformed, or zero-length has nothing to interrupt, so it is answered
+// by the scheduler's own validation and must not spend a Clock draw (Rules 3 and 15).
+inline constexpr bool clock_sleep_eligible(const struct timespec* req) {
+    return req != nullptr && clock_timespec_ns(*req) > 0;
 }
 
 // Eligible because C11 lets malloc(0) return nullptr, so a fire there is still a legal observable.

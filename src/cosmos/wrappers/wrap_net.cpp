@@ -23,14 +23,10 @@ namespace {
 cosmos::Net* current_net() { return &cosmos::Simulator::current()->net(); }
 
 cosmos::InjectedFault decide(cosmos::Simulator* sim, cosmos::SiteId site) {
-    cosmos::InjectedFault fault;
     cosmos::wrappers::ReentrancyGuard guard;
-    fault.kind = cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Network, site);
-    if (fault.kind == cosmos::FaultKind::None) return fault;
-    if (const cosmos::FaultRule* rule = sim->injector_or_null()->config().rule_for(site)) {
-        fault.amount = rule->amount;
-    }
-    return fault;
+    const cosmos::wrappers::Decision decision =
+        cosmos::wrappers::decide_with_amount(sim, cosmos::FaultClass::Network, site);
+    return cosmos::InjectedFault{decision.kind, decision.amount};
 }
 
 } // namespace

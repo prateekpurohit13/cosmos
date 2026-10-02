@@ -380,9 +380,10 @@ struct FaultRule {
     OutcomeTable outcomes{};
     // Wrapper sites only; 1-based count of eligible calls (§10.1).
     std::optional<uint64_t> fire_on_eligible_call{};
-    // Magnitude for kinds that carry one: PacketDelay's added latency, ClockStep's step. Zero means
-    // "no magnitude": the fire is still counted and recorded, it just changes nothing measurable.
-    // Negative is rejected by validate() -- ClockStep may only move time forward (Rule 15).
+    // Magnitude for kinds that carry one: PacketDelay's added latency, ClockStep's step forward,
+    // SleepInterrupted's elapsed part. Zero means "no magnitude": the fire is still counted and
+    // recorded. Negative is rejected by validate() -- a clock may only move time forward and a
+    // sleep cannot have elapsed a negative amount (Rule 15).
     Duration amount{};
 };
 

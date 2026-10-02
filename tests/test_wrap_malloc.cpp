@@ -16,6 +16,19 @@
 
 namespace {
 
+// AddressSanitizer's allocator aborts on any request above 1 TiB instead of returning null, so the
+// genuine-host-failure case can only be exercised on the unsanitized legs.
+#if defined(__SANITIZE_ADDRESS__)
+#define COSMOS_TEST_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define COSMOS_TEST_ASAN 1
+#endif
+#endif
+#ifndef COSMOS_TEST_ASAN
+#define COSMOS_TEST_ASAN 0
+#endif
+
 void must(bool ok) { assert(ok); }
 
 cosmos::FaultRule oom_rule(double rate) {
@@ -840,6 +853,83 @@ void test_disabled_class_is_not_even_eligible() {
     std::cout << "[PASS] test_disabled_class_is_not_even_eligible" << std::endl;
 }
 
+// An engine call that frees an application block must still reach that block's heap: the guard
+// suppresses the decision, never the ownership routing (Rule 7).
+void test_free_under_the_guard_routes_to_the_heap() {
+    cosmos::Simulator sim(29);
+    must(sim.install_faults(oom_config({cosmos::SiteId::malloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    void* p = nullptr;
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        p = malloc(64); // the guard's own allocation: untracked, unfaulted
+    }
+    assert(p != nullptr);
+    free(p); // a host block, released through the registry's passthrough path
+
+    // A tracked block taken straight from the heap, so the rate-1.0 rule above cannot hide it.
+    p = sim.heap().allocate(64);
+    assert(p != nullptr);
+    assert(sim.heap().owns(p));
+    assert(sim.heap().stats().active_allocations == 1);
+
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        free(p);
+    }
+    assert(!sim.heap().owns(p));
+    assert(sim.heap().stats().active_allocations == 0);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_free_under_the_guard_routes_to_the_heap" << std::endl;
+}
+
+// Same for realloc: the block stays tracked and moves through its own heap, and the rate-1.0 rule
+// proves the guarded call took no decision.
+void test_realloc_under_the_guard_routes_to_the_heap() {
+    cosmos::Simulator sim(31);
+    must(sim.install_faults(oom_config({cosmos::SiteId::realloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    void* p = malloc(64);
+    assert(p != nullptr);
+    memset(p, 0xAB, 64);
+
+    void* moved = nullptr;
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        moved = realloc(p, 256);
+    }
+    assert(moved != nullptr);
+    assert(sim.heap().owns(moved));
+    assert(!sim.heap().owns(p));
+    assert(sim.heap().stats().active_allocations == 1);
+    assert(static_cast<unsigned char*>(moved)[63] == 0xAB); // the payload survived the move
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::realloc) == 0);
+    assert(sim.injector_or_null()->eligible_calls(cosmos::SiteId::realloc) == 0);
+
+    free(moved);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_realloc_under_the_guard_routes_to_the_heap" << std::endl;
+}
+
+// calloc(0, 0) is a legal call that may fail, so the site is eligible and a fire is observable.
+void test_calloc_zero_zero_can_fire() {
+    cosmos::Simulator sim;
+    must(sim.install_faults(oom_config({cosmos::SiteId::calloc}, 1.0)).has_value());
+    cosmos::Simulator::set_current(&sim);
+
+    errno = 0;
+    assert(calloc(0, 0) == nullptr);
+    assert(errno == ENOMEM);
+    assert(sim.injector_or_null()->injections(cosmos::SiteId::calloc) == 1);
+
+    cosmos::Simulator::set_current(nullptr);
+    std::cout << "[PASS] test_calloc_zero_zero_can_fire" << std::endl;
+}
+
 // The header write would run off the end of the block the wrapped sum allocates; real glibc fails
 // this request, so the simulated heap must fail it too or the sim is easier than reality.
 void test_oversized_allocation_fails_like_the_real_heap() {
@@ -853,6 +943,16 @@ void test_oversized_allocation_fails_like_the_real_heap() {
     assert(errno == ENOMEM);
     assert(sim.heap().stats().active_allocations == 0);
     assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
+
+    // Same contract from the other direction: a size the host allocator itself refuses. This one
+    // gets past the header-size guard and fails inside __real_malloc, so it proves the wrapper
+    // propagates ENOMEM for a failure the simulation did not invent.
+    if constexpr (!COSMOS_TEST_ASAN) {
+        errno = 0;
+        assert(malloc(SIZE_MAX / 2) == nullptr);
+        assert(errno == ENOMEM);
+        assert(sim.injector_or_null()->injections(cosmos::SiteId::malloc) == 0);
+    }
 
     void* p = malloc(32);
     assert(p != nullptr);
@@ -973,6 +1073,9 @@ int main() {
     test_activated_site_without_a_rule_is_counted_but_never_fires();
     test_disabled_class_is_not_even_eligible();
     test_oversized_allocation_fails_like_the_real_heap();
+    test_free_under_the_guard_routes_to_the_heap();
+    test_realloc_under_the_guard_routes_to_the_heap();
+    test_calloc_zero_zero_can_fire();
     test_interleaved_memory_sites_share_one_substream();
     test_same_seed_twice_prints_an_identical_ledger();
     std::cout << "All malloc wrapper tests passed successfully!" << std::endl;

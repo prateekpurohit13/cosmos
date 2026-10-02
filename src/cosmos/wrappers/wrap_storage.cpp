@@ -16,6 +16,8 @@
 extern "C" {
 
 int __real_open(const char* pathname, int flags, ...);
+int __real___open_2(const char* pathname, int flags);
+int __real___open64_2(const char* pathname, int flags);
 ssize_t __real_read(int fd, void* buf, size_t count);
 ssize_t __real___read_chk(int fd, void* buf, size_t count, size_t buflen);
 ssize_t __real_write(int fd, const void* buf, size_t count);
@@ -53,6 +55,49 @@ int __wrap_open(const char* pathname, int flags, ...) {
         break; // None, or an unknown kind: the real call goes through unchanged.
     }
     return __real_open(pathname, flags, mode);
+}
+
+// glibc substitutes __open_2/__open64_2 for open() when the call has no mode argument and
+// _FORTIFY_SOURCE is on; --wrap=open does not see those symbols, so without this a fortified
+// build bypasses the site silently (the same hole __read_chk and __recv_chk were).
+int __wrap___open_2(const char* pathname, int flags) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real___open_2(pathname, flags);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+
+    auto* sim = cosmos::Simulator::current();
+    switch (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::open)) {
+    case cosmos::FaultKind::OpenEio:
+        errno = EIO;
+        return -1;
+    case cosmos::FaultKind::NoSpace:
+        errno = ENOSPC;
+        return -1;
+    default:
+        break;
+    }
+    return __real___open_2(pathname, flags);
+}
+
+int __wrap___open64_2(const char* pathname, int flags) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real___open64_2(pathname, flags);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+
+    auto* sim = cosmos::Simulator::current();
+    switch (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::open)) {
+    case cosmos::FaultKind::OpenEio:
+        errno = EIO;
+        return -1;
+    case cosmos::FaultKind::NoSpace:
+        errno = ENOSPC;
+        return -1;
+    default:
+        break;
+    }
+    return __real___open64_2(pathname, flags);
 }
 
 ssize_t __wrap_read(int fd, void* buf, size_t count) {
