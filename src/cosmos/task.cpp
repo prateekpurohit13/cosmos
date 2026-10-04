@@ -564,11 +564,11 @@ int Scheduler::sleep_clock(clockid_t clk, int flags, const struct timespec* req,
         return EINVAL;
     }
     if (flags == TIMER_ABSTIME) {
+        // clock_nanosleep(2): the remainder is unused for an absolute sleep, so leave it untouched.
         const int64_t deadline_ns = timespec_ns(*req);
         const Time target =
             realtime ? Time{sub_sat(deadline_ns, clock_.realtime_epoch_ns())} : Time{deadline_ns};
         if (target <= clock_.now()) {
-            write_zero(rem);
             return 0;
         }
         Task* self = current_;
@@ -591,7 +591,6 @@ int Scheduler::sleep_clock(clockid_t clk, int flags, const struct timespec* req,
                 self->state = Task::State::Running;
             }
         }
-        write_zero(rem);
         return 0;
     }
     const int64_t ns = timespec_ns(*req);

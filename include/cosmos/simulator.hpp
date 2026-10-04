@@ -3,6 +3,7 @@
 #include "cosmos/fault_injector.hpp"
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
+#include "cosmos/net.hpp"
 #include "cosmos/random.hpp"
 #include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
@@ -28,7 +29,7 @@ template <typename Injector> class BasicSimulator {
   public:
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
         : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)),
-          scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_) {}
+          scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_), net_(scheduler_, clock_) {}
 
     ~BasicSimulator() {
         if (current_sim_ == this) {
@@ -52,6 +53,9 @@ template <typename Injector> class BasicSimulator {
 
     Scheduler& scheduler() { return scheduler_; }
     const Scheduler& scheduler() const { return scheduler_; }
+
+    Net& net() { return net_; }
+    const Net& net() const { return net_; }
 
     VirtualClock& clock() { return clock_; }
     const VirtualClock& clock() const { return clock_; }
@@ -114,6 +118,8 @@ template <typename Injector> class BasicSimulator {
     // After clock_: borrows it for timer wakeups. Before injector_: both borrow
     // the clock and destruction is reverse order.
     Scheduler scheduler_;
+    // After scheduler_ and clock_, both of which it borrows.
+    Net net_;
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
 };
