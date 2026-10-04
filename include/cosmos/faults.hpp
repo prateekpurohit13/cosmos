@@ -382,8 +382,10 @@ struct FaultRule {
     std::optional<uint64_t> fire_on_eligible_call{};
     // Magnitude for kinds that carry one: PacketDelay's added latency, ClockStep's step forward,
     // SleepInterrupted's elapsed part. Zero means "no magnitude": the fire is still counted and
-    // recorded. Negative is rejected by validate() -- a clock may only move time forward and a
-    // sleep cannot have elapsed a negative amount (Rule 15).
+    // recorded. Negative is rejected by validate() for every site, even ones that ignore the
+    // amount (fail fast on a sign error rather than silently accepting a past-directed magnitude).
+    // A clock may only move time forward and a sleep cannot have elapsed a negative amount
+    // (Rule 15).
     Duration amount{};
 };
 

@@ -75,9 +75,8 @@ int __wrap_nanosleep(const struct timespec* req, struct timespec* rem) {
     if (!cosmos::Simulator::has_current()) {
         return __real_nanosleep(req, rem);
     }
+    // Sampled before the guard: creating the guard sets the flag.
     const bool engine_call = cosmos::wrappers::in_wrapper_logic;
-    cosmos::wrappers::ReentrancyGuard guard;
-
     cosmos::Simulator* sim = cosmos::Simulator::current();
     // A missing, malformed, or zero-length request has nothing to interrupt, so it is answered by
     // the scheduler's own validation and never spends a Clock draw (Rules 3 and 15).
@@ -86,8 +85,14 @@ int __wrap_nanosleep(const struct timespec* req, struct timespec* rem) {
     }
     const int64_t requested_ns = cosmos::wrappers::clock_timespec_ns(*req);
 
-    const cosmos::wrappers::Decision fault = cosmos::wrappers::decide_with_amount(
-        sim, cosmos::FaultClass::Clock, cosmos::SiteId::nanosleep);
+    // Scoped to the decision only: the sleeps below suspend this fiber and run siblings
+    // on the same OS thread, which must not observe in_wrapper_logic (fibers share it).
+    cosmos::wrappers::Decision fault;
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        fault = cosmos::wrappers::decide_with_amount(sim, cosmos::FaultClass::Clock,
+                                                     cosmos::SiteId::nanosleep);
+    }
     if (fault.kind != cosmos::FaultKind::SleepInterrupted || fault.amount.ns >= requested_ns) {
         // Nothing to interrupt, or the elapsed part covers the whole request: sleep normally. The
         // fire is still counted, just as ShortSend falls back to a full write on one byte.
@@ -109,8 +114,6 @@ int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec*
         return __real_clock_nanosleep(clock_id, flags, req, rem);
     }
     const bool engine_call = cosmos::wrappers::in_wrapper_logic;
-    cosmos::wrappers::ReentrancyGuard guard;
-
     cosmos::Simulator* sim = cosmos::Simulator::current();
     // Same site as nanosleep: the same operation, differing only in how the caller names the time
     // and where the error goes. The wrapper owns that difference (docs/design.md §8.2).
@@ -123,6 +126,8 @@ int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec*
     if (flags == TIMER_ABSTIME) {
         // An absolute request names a deadline, not a length, so only the time left until it can be
         // interrupted. Both readings come from the caller's clock, so no epoch maths is needed.
+        // Invalid clocks are real API errors, never draws (validates before decide, like
+        // clock_gettime).
         struct timespec clock_now{};
         if (sim->clock().clock_gettime(clock_id, &clock_now) != 0) {
             return sim->scheduler().sleep_clock(clock_id, flags, req, rem); // real error, no draw
@@ -131,10 +136,22 @@ int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec*
         if (sleep_ns <= 0) {
             return sim->scheduler().sleep_clock(clock_id, flags, req, rem); // deadline already past
         }
+    } else {
+        // Relative sleeps name no clock reading, but a bad clock_id is still a real API
+        // error: validate before spending a Clock draw, mirroring the absolute path.
+        struct timespec probe{};
+        if (sim->clock().clock_gettime(clock_id, &probe) != 0) {
+            return sim->scheduler().sleep_clock(clock_id, flags, req, rem); // real error, no draw
+        }
     }
 
-    const cosmos::wrappers::Decision fault = cosmos::wrappers::decide_with_amount(
-        sim, cosmos::FaultClass::Clock, cosmos::SiteId::nanosleep);
+    // Scoped to the decision only (see nanosleep): sleeps below yield the fiber.
+    cosmos::wrappers::Decision fault;
+    {
+        cosmos::wrappers::ReentrancyGuard guard;
+        fault = cosmos::wrappers::decide_with_amount(sim, cosmos::FaultClass::Clock,
+                                                     cosmos::SiteId::nanosleep);
+    }
     if (fault.kind != cosmos::FaultKind::SleepInterrupted || fault.amount.ns >= sleep_ns) {
         return sim->scheduler().sleep_clock(clock_id, flags, req, rem);
     }
