@@ -8,6 +8,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <iostream>
+#include <pthread.h>
+#include <sched.h>
 #include <time.h>
 
 using cosmos::Duration;
@@ -83,6 +85,18 @@ struct ClockUniverse {
 
     Simulator sim;
 };
+
+struct SleepingSibling {
+    bool entered = false;
+};
+
+void* sleep_for_a_second(void* arg) {
+    auto* sibling = static_cast<SleepingSibling*>(arg);
+    sibling->entered = true;
+    struct timespec rem{};
+    must(nanosleep(&kOneSecond, &rem) == 0);
+    return nullptr;
+}
 
 } // namespace
 
@@ -495,6 +509,39 @@ void test_clock_calls_inside_wrapper_logic_are_virtual_and_unfaulted() {
               << std::endl;
 }
 
+// Rule 7 is about engine work, not about whoever happens to be sleeping: a fiber suspended in a
+// wrapped sleep must not leave in_wrapper_logic set for its siblings sharing the OS thread, or
+// their calls would silently skip the injector.
+void test_sleep_does_not_leak_wrapper_logic_to_siblings() {
+    ClockUniverse universe(clock_config(SiteId::clock_gettime, FaultKind::ClockStep, 1.0, 5_ms),
+                           /*seed=*/7);
+
+    SleepingSibling sibling;
+    pthread_t sleeper = 0;
+    must(pthread_create(&sleeper, nullptr, sleep_for_a_second, &sibling) == 0);
+
+    // The sleeping fiber runs until its nanosleep suspends it, so once `entered` is visible the
+    // sleep is in progress and control is back here.
+    for (int i = 0; i < 16 && !sibling.entered; ++i) {
+        sched_yield();
+    }
+    must(sibling.entered);
+    assert(!cosmos::wrappers::in_wrapper_logic);
+
+    // A wrapped call now is an application call and must take its decision. Under a guard held
+    // across the sleep it would have been answered as engine work, spending no draw.
+    assert(reading(CLOCK_MONOTONIC) == 5'000'000LL);
+    auto* injector = universe.sim.injector_or_null();
+    assert(injector->eligible_calls(SiteId::clock_gettime) == 1);
+    assert(injector->injections(SiteId::clock_gettime) == 1);
+
+    void* retval = nullptr;
+    must(pthread_join(sleeper, &retval) == 0);
+    assert(universe.sim.clock().now_ns() == 1'000'000'000LL);
+
+    std::cout << "[PASS] test_sleep_does_not_leak_wrapper_logic_to_siblings" << std::endl;
+}
+
 int main() {
     test_passthrough_without_a_simulator();
     test_no_injector_is_passthrough_under_sim();
@@ -518,6 +565,7 @@ int main() {
     test_past_deadline_is_never_eligible();
     test_both_sleep_apis_share_one_site();
     test_clock_calls_inside_wrapper_logic_are_virtual_and_unfaulted();
+    test_sleep_does_not_leak_wrapper_logic_to_siblings();
 
     std::cout << "All clock wrapper tests passed successfully!" << std::endl;
     return 0;

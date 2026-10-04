@@ -426,6 +426,69 @@ void test_unactivated_network_site_never_moves_the_stream() {
     std::cout << "[PASS] test_unactivated_network_site_never_moves_the_stream" << std::endl;
 }
 
+// The finite-timeout poll path wakes at the earlier of the deadline and the next delayed
+// delivery, so a PacketDelay neither burns the whole timeout nor parks forever on an infinite one.
+void test_poll_wakes_at_the_delayed_delivery() {
+    {
+        cosmos::Simulator sim(71);
+        must(sim.install_faults(network_config(cosmos::SiteId::send, cosmos::FaultKind::PacketDelay,
+                                               cosmos::Duration{5'000'000}))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        Cluster pair = open_pair();
+        must(send(pair.client, "late", 4, 0) == 4);
+
+        struct pollfd pfd{pair.server, POLLIN, 0};
+        must(poll(&pfd, 1, 10) == 1);
+        must((pfd.revents & POLLIN) != 0);
+        must(sim.now().ns == 5'000'000); // delivery, not the 10ms deadline
+
+        drop_pair(pair);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    {
+        // A delay beyond the timeout must not push the wait past the deadline.
+        cosmos::Simulator sim(72);
+        must(sim.install_faults(network_config(cosmos::SiteId::send, cosmos::FaultKind::PacketDelay,
+                                               cosmos::Duration{5'000'000}))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        Cluster pair = open_pair();
+        must(send(pair.client, "late", 4, 0) == 4);
+
+        struct pollfd pfd{pair.server, POLLIN, 0};
+        must(poll(&pfd, 1, 2) == 0);
+        must((pfd.revents & POLLIN) == 0);
+        must(sim.now().ns == 2'000'000);
+
+        drop_pair(pair);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    {
+        // An infinite wait must land on the delivery instead of parking on a packet that has no
+        // broadcast left to wake it.
+        cosmos::Simulator sim(73);
+        must(sim.install_faults(network_config(cosmos::SiteId::send, cosmos::FaultKind::PacketDelay,
+                                               cosmos::Duration{5'000'000}))
+                 .has_value());
+        cosmos::Simulator::set_current(&sim);
+        Cluster pair = open_pair();
+        must(send(pair.client, "late", 4, 0) == 4);
+
+        struct pollfd pfd{pair.server, POLLIN, 0};
+        must(poll(&pfd, 1, -1) == 1);
+        must((pfd.revents & POLLIN) != 0);
+        must(sim.now().ns == 5'000'000);
+
+        drop_pair(pair);
+        cosmos::Simulator::set_current(nullptr);
+    }
+
+    std::cout << "[PASS] test_poll_wakes_at_the_delayed_delivery" << std::endl;
+}
+
 int main() {
     test_fault_free_connect_is_refused_without_a_listener();
     test_connect_outcomes();
@@ -437,6 +500,7 @@ int main() {
     test_partial_drain_wakes_a_blocked_sender();
     test_fortified_recv_alias_reaches_the_same_site();
     test_unactivated_network_site_never_moves_the_stream();
+    test_poll_wakes_at_the_delayed_delivery();
     std::cout << "All network fault tests passed successfully!" << std::endl;
     return 0;
 }
