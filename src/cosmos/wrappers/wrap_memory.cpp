@@ -21,7 +21,7 @@ void free_orphaned_block(void* ptr) {
 }
 
 // Never faulted: the block never belonged to the currently active universe.
-void* reallocate_orphaned_block(void* ptr, size_t new_size) {
+void* reallocate_orphaned_block(void* ptr, size_t new_size, bool engine_call) {
     auto* header = cosmos::header_for(ptr);
     if (header->magic != cosmos::COSMOS_CANARY_MAGIC) {
         errno = ENOMEM;
@@ -29,7 +29,11 @@ void* reallocate_orphaned_block(void* ptr, size_t new_size) {
     }
 
     const size_t old_size = header->requested_size;
-    void* new_ptr = cosmos::Simulator::has_current()
+    // Engine work must not pollute the sim heap (mirrors malloc/calloc passthrough):
+    // a tracked orphan reallocated by the engine becomes an untracked host block.
+    // engine_call is sampled before the wrapper's guard (which is held here), so it
+    // must be passed in rather than re-reading in_wrapper_logic.
+    void* new_ptr = (cosmos::Simulator::has_current() && !engine_call)
                         ? cosmos::Simulator::current()->heap().allocate(new_size)
                         : __real_malloc(new_size);
     if (!new_ptr) {
@@ -167,7 +171,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
     }
 
     if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
-        return reallocate_orphaned_block(ptr, size);
+        return reallocate_orphaned_block(ptr, size, engine_call);
     }
 
     return __real_realloc(ptr, size);
