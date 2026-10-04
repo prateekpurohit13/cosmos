@@ -155,6 +155,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=calloc"
         "-Wl,--wrap=realloc"
         "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
         "-Wl,--wrap=__open64_2"
         "-Wl,--wrap=read"
@@ -230,6 +231,7 @@ set(cosmos_net_wraps
     "-Wl,--wrap=pthread_exit"
     "-Wl,--wrap=sched_yield"
     "-Wl,--wrap=clock_gettime"
+    "-Wl,--wrap=gettimeofday"
     "-Wl,--wrap=nanosleep"
     "-Wl,--wrap=clock_nanosleep"
 )

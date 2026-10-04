@@ -102,6 +102,7 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=clock_nanosleep"
         # Storage (SiteId::open / read / write / fsync), with the fortified read alias
         "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
         "-Wl,--wrap=__open64_2"
         "-Wl,--wrap=read"
