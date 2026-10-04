@@ -70,9 +70,8 @@ template <typename Sim> Decision decide_with_amount(Sim* sim, FaultClass cls, Si
 // A cosmos virtual fd (the simulated socket layer) is not a file descriptor the storage surface
 // owns: reading or writing one through the storage wrappers would spend Storage draws on a fault
 // the file API cannot honour, and then reach the host with a number the kernel never issued.
-inline constexpr bool storage_fd_eligible(int fd) {
-    return fd > 2 && fd < static_cast<int>(cosmos::kVirtualFdBase);
-}
+// Only the virtual window is excluded: host workloads with >1000 open files must still draw.
+inline constexpr bool storage_fd_eligible(int fd) { return fd > 2 && !cosmos::is_virtual_fd(fd); }
 
 inline constexpr bool storage_read_eligible(int fd, size_t count) {
     return storage_fd_eligible(fd) && count > 0;
