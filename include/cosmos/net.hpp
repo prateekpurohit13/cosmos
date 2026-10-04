@@ -5,8 +5,9 @@
 // runs on one OS thread. This is the minimal slice: topology faults (latency shaping, partitions,
 // packet shaping beyond the call-level kinds) are P6's.
 //
-// Flags: MSG_DONTWAIT and MSG_PEEK are honoured on recv; MSG_WAITALL is ignored (a short read is
-// returned instead of waiting for the full length), as are the out-of-band flags.
+// Flags: MSG_DONTWAIT and MSG_PEEK are honoured on recv, MSG_DONTWAIT on send;
+// MSG_WAITALL is ignored (a short read is returned instead of waiting for the full
+// length), as are the out-of-band flags.
 
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
@@ -44,6 +45,12 @@ struct EndpointState {
     bool peer_closed = false;
     bool nonblocking = false;
 };
+
+// True for any fd number the virtual layer owns, whether currently open or not.
+// Used by wrappers to distinguish virtual fds from host fds without a Simulator.
+inline constexpr bool is_virtual_fd(int fd) {
+    return fd >= kVirtualFdBase && fd < kVirtualFdBase + static_cast<int>(kMaxEndpoints);
+}
 
 class Net {
   public:
@@ -84,6 +91,9 @@ class Net {
         bool nonblocking = false;
         bool peer_closed = false;
         uint16_t port = 0;
+        // Peer's address as of connect/pair, so getpeername still works after the peer
+        // closes and its slot is recycled for an unrelated connection.
+        uint16_t peer_port = 0;
         int peer = -1;
         size_t rx_bytes = 0;
         std::vector<Packet, RawRealAllocator<Packet>> rx{};
@@ -92,6 +102,14 @@ class Net {
 
     Endpoint* get(int fd);
     const Endpoint* get(int fd) const;
+    // Peer endpoint only when the slot still holds the same connection: used and linked
+    // back. A stale index (peer closed and slot recycled) returns nullptr so callers
+    // never touch an unrelated connection's bytes.
+    Endpoint* peer_of(Endpoint& ep);
+    const Endpoint* peer_of(const Endpoint& ep) const;
+    bool is_known(int fd) const { return get(fd) != nullptr; }
+    uint16_t alloc_port();
+    Endpoint* find_port_owner(uint16_t port);
     int create_endpoint();
     Endpoint* find_listener(uint16_t port);
     void release(Endpoint& ep);
