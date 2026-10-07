@@ -290,6 +290,29 @@ endif()
 
 add_test(NAME test_scenario COMMAND test_scenario)
 
+add_executable(test_assert test_assert.cpp)
+target_link_libraries(test_assert PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # Same link shape as test_scenario: assertions allocate through the harness's own bookkeeping.
+    target_compile_options(test_assert PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_assert COMMAND test_assert)
+
 add_executable(test_scheduler test_scheduler.cpp)
 target_link_libraries(test_scheduler PRIVATE cosmos)
 # White-box test: pins the engine-context passthrough contract from wrapper_fault.hpp.

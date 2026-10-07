@@ -93,7 +93,7 @@ class Scenario {
             return;
         }
         ran_ = true;
-        CurrentGuard guard(*sim_);
+        CurrentGuard guard(*this);
         workload();
     }
 
@@ -116,7 +116,7 @@ class Scenario {
             auto* early_injector = sim_->injector_or_null();
             if (early_injector != nullptr) early_injector->push_quiet();
             {
-                CurrentGuard guard(*sim_);
+                CurrentGuard guard(*this);
                 sim_->scheduler().run_until_quiescence();
             }
             return;
@@ -125,7 +125,7 @@ class Scenario {
         if (injector != nullptr) injector->push_quiet();
         bool saw_deadlock = false;
         {
-            CurrentGuard guard(*sim_);
+            CurrentGuard guard(*this);
             sim_->scheduler().run_until_quiescence();
             saw_deadlock = sim_->scheduler().deadlocked();
             // Snapshot under guard but drain itself uses __real_malloc only, so
@@ -158,7 +158,7 @@ class Scenario {
         bool ok = false;
         Time at{};
         {
-            CurrentGuard guard(*sim_);
+            CurrentGuard guard(*this);
             ok = static_cast<bool>(oracle());
             at = sim_->now();
         }
@@ -187,6 +187,27 @@ class Scenario {
         report_.coverage.push_back(CoverageNote{std::move(id), hit});
     }
 
+    // The scenario a wrapped assertion on this thread reports to; null when no universe is active.
+    static Scenario* current() { return current_; }
+
+    // Mid-run invariant violations land here: unlike check(), this needs no preceding quiesce, so
+    // an `always` inside the workload is recorded the moment it fails.
+    void record_violation(std::string id, std::string detail = "") {
+        report_.checks.push_back(CheckResult{std::move(id), std::move(detail), false, sim_->now()});
+        report_.no_check_failed = false;
+    }
+
+    // Coalesced by id: a workload may call this in a loop, and only the OR across calls matters.
+    void record_sometimes(std::string id, bool hit) {
+        for (CoverageNote& note : report_.coverage) {
+            if (note.id == id) {
+                note.hit = note.hit || hit;
+                return;
+            }
+        }
+        report_.coverage.push_back(CoverageNote{std::move(id), hit});
+    }
+
     bool passed() const { return report_.passed(); }
 
     const ScenarioReport& report() const { return report_; }
@@ -194,19 +215,25 @@ class Scenario {
     const Simulator& simulator() const { return *sim_; }
 
   private:
-    // Restores the previous universe rather than clearing it, so a nested or sequential scenario
-    // cannot strand an outer one.
+    // Restores both previous bindings rather than clearing them, so a nested or sequential
+    // scenario cannot strand an outer one.
     struct CurrentGuard {
-        explicit CurrentGuard(Simulator& sim) : previous_(Simulator::current()) {
-            Simulator::set_current(&sim);
+        explicit CurrentGuard(Scenario& scenario)
+            : previous_universe_(Simulator::current()), previous_scenario_(Scenario::current()) {
+            Simulator::set_current(scenario.sim_.get());
+            Scenario::current_ = &scenario;
         }
-        ~CurrentGuard() { Simulator::set_current(previous_); }
+        ~CurrentGuard() {
+            Simulator::set_current(previous_universe_);
+            Scenario::current_ = previous_scenario_;
+        }
 
         CurrentGuard(const CurrentGuard&) = delete;
         CurrentGuard& operator=(const CurrentGuard&) = delete;
 
       private:
-        Simulator* previous_;
+        Simulator* previous_universe_;
+        Scenario* previous_scenario_;
     };
 
     Scenario(uint64_t seed, std::unique_ptr<Simulator> sim) : sim_(std::move(sim)) {
@@ -222,6 +249,8 @@ class Scenario {
     ScenarioReport report_{};
     bool ran_ = false;
     bool quiesced_ = false;
+    // thread_local on purpose, like the universe slot: a scenario belongs to the thread driving it.
+    inline static thread_local Scenario* current_{nullptr};
 };
 
 // §17.4's shape. The ledger is dumped only on failure, because that is the one time a human reads
