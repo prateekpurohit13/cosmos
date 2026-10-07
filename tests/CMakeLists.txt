@@ -393,6 +393,31 @@ else()
     message(STATUS "test_scenario_static skipped: no static libstdc++ for this toolchain")
 endif()
 
+# Second link of the assertion suite, for the same reason: operator new reaches the wrappers only
+# here, so test_passing_check_does_not_allocate can only actually measure anything in this link.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_assert_static test_assert.cpp)
+    target_link_libraries(test_assert_static PRIVATE cosmos)
+    target_compile_options(test_assert_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_assert_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+    add_test(NAME test_assert_static COMMAND test_assert_static)
+else()
+    message(STATUS "test_assert_static skipped: no static libstdc++ for this toolchain")
+endif()
+
 # The P2-S3 end-to-end fixture: a plain C application that knows nothing about libcosmos, driven by
 # the Scenario harness. Compiled twice from one source -- the fix is the -D, so the two targets
 # differ only by the nullptr check -- and both run under ctest.

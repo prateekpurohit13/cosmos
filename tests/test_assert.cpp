@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -13,12 +14,13 @@ constexpr uint64_t kSeed = 4242;
 
 void must(bool ok) { assert(ok); }
 
-cosmos::Scenario make(uint64_t seed = kSeed) {
-    cosmos::FaultPlan plan;
+cosmos::Scenario make_with_plan(cosmos::FaultPlan plan, uint64_t seed = kSeed) {
     auto scenario = cosmos::Scenario::create(seed, std::move(plan));
     must(scenario.has_value());
     return std::move(*scenario);
 }
+
+cosmos::Scenario make(uint64_t seed = kSeed) { return make_with_plan(cosmos::FaultPlan{}, seed); }
 
 const cosmos::CheckResult* find_check(const cosmos::ScenarioReport& report, const std::string& id) {
     for (const cosmos::CheckResult& result : report.checks) {
@@ -185,6 +187,80 @@ void test_violation_is_printed_by_report() {
     std::cout << "[PASS] test_violation_is_printed_by_report" << std::endl;
 }
 
+// F1: a violation with no universe bound has nowhere to record itself, so it must reach the
+// out-of-scope channel -- counting it is what stops a release build from passing by ignoring it,
+// and not aborting is what stops a build with no simulation running from dying.
+void test_out_of_scope_assertions_are_counted_not_dropped() {
+    const uint64_t count_before = cosmos::detail::out_of_scope_assertions().count;
+    const bool first_ever = count_before == 0;
+
+    cosmos::always(false, "outside-universe", "no scenario is bound");
+    cosmos::sometimes(true, "outside-universe-path");
+    cosmos::always(true, "outside-universe");
+
+    const cosmos::detail::OutOfScopeAssertions& state = cosmos::detail::out_of_scope_assertions();
+    must(state.count == count_before + 2);
+    if (first_ever) {
+        must(state.first_id == "outside-universe");
+        must(state.first_detail == "no scenario is bound");
+    }
+
+    std::cout << "[PASS] test_out_of_scope_assertions_are_counted_not_dropped" << std::endl;
+}
+
+// F2: a passing check must not allocate. Short ids stay inside std::string's SSO, so any heap
+// traffic here is the harness's own -- which the -static-libstdc++ twin is the only link that can
+// see. The workload's own mallocs also keep this TU's link honest: without a wrapped-symbol
+// reference, libcosmos is scanned before libstdc++.a asks for __wrap_free and the link fails.
+void test_passing_check_does_not_allocate() {
+    cosmos::FaultPlan plan;
+    plan.enable_class(cosmos::FaultClass::Memory);
+    must(plan.activate_site(cosmos::SiteId::malloc));
+
+    constexpr int kAllocations = 8;
+    cosmos::Scenario scenario = make_with_plan(std::move(plan));
+    scenario.run([] {
+        for (int i = 0; i < kAllocations; ++i) {
+            void* block = malloc(32);
+            COSMOS_CHECK(block != nullptr, "alloc-ok");
+            free(block);
+        }
+    });
+    scenario.quiesce();
+
+    // Exactly the workload's own allocations: a harness allocation would make this larger.
+    must(scenario.report().eligible_calls[cosmos::site_slot(cosmos::SiteId::malloc)] ==
+         static_cast<uint64_t>(kAllocations));
+
+    std::cout << "[PASS] test_passing_check_does_not_allocate" << std::endl;
+}
+
+// F3: two live scenarios nested on one thread must each receive their own assertions, and popping
+// the inner binding must restore the outer one rather than clearing it.
+void test_nested_scenarios_route_and_restore() {
+    cosmos::Scenario outer = make(kSeed);
+    cosmos::Scenario inner = make(kSeed + 1);
+
+    outer.run([&] {
+        cosmos::always(false, "outer-violation");
+        inner.run([] { cosmos::always(false, "inner-violation"); });
+        cosmos::always(false, "outer-after-inner");
+    });
+    outer.quiesce();
+    inner.quiesce();
+
+    const cosmos::ScenarioReport& outer_report = outer.report();
+    const cosmos::ScenarioReport& inner_report = inner.report();
+    must(find_check(outer_report, "outer-violation") != nullptr);
+    must(find_check(outer_report, "outer-after-inner") != nullptr);
+    must(find_check(outer_report, "inner-violation") == nullptr);
+    must(find_check(inner_report, "inner-violation") != nullptr);
+    must(find_check(inner_report, "outer-violation") == nullptr);
+    must(find_check(inner_report, "outer-after-inner") == nullptr);
+
+    std::cout << "[PASS] test_nested_scenarios_route_and_restore" << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -197,6 +273,9 @@ int main() {
     test_assertions_do_not_leak_across_universes();
     test_always_inside_oracle_is_recorded();
     test_violation_is_printed_by_report();
+    test_out_of_scope_assertions_are_counted_not_dropped();
+    test_passing_check_does_not_allocate();
+    test_nested_scenarios_route_and_restore();
     std::cout << "All assertion tests passed successfully!" << std::endl;
     return 0;
 }
