@@ -479,3 +479,31 @@ if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     )
     add_test(NAME test_broken_app_static COMMAND test_broken_app_static)
 endif()
+
+# The campaign runner drives the same deliberately-broken application across many seeds, so it needs
+# the same fixture source and the same wrapped allocator channel.
+add_executable(test_campaign
+    test_campaign.cpp
+    ${CMAKE_SOURCE_DIR}/examples/single_node/broken_cache.c
+)
+target_link_libraries(test_campaign PRIVATE cosmos)
+target_include_directories(test_campaign PRIVATE ${CMAKE_SOURCE_DIR}/examples/single_node)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_campaign PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_campaign PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_campaign COMMAND test_campaign)

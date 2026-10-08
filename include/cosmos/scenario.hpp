@@ -81,6 +81,16 @@ class Scenario {
         return Scenario(seed, std::move(sim));
     }
 
+    // A scenario over a universe the caller owns and outlives: the campaign runner builds one
+    // Simulator per universe and must not hand its ownership to the harness.
+    [[nodiscard]] static std::expected<Scenario, ConfigProblem> on(Simulator& sim, FaultPlan plan,
+                                                                   uint32_t node_count = 1) {
+        if (auto installed = sim.install_faults(std::move(plan), node_count); !installed) {
+            return std::unexpected(installed.error());
+        }
+        return Scenario(sim);
+    }
+
     template <Workload F> void run(F&& workload) {
         // Not merely out of order: the permanent quiet window would make this a fault-free dry run
         // wearing the shape of a chaos phase.
@@ -220,7 +230,7 @@ class Scenario {
     struct CurrentGuard {
         explicit CurrentGuard(Scenario& scenario)
             : previous_universe_(Simulator::current()), previous_scenario_(Scenario::current()) {
-            Simulator::set_current(scenario.sim_.get());
+            Simulator::set_current(scenario.sim_);
             Scenario::current_ = &scenario;
         }
         ~CurrentGuard() {
@@ -236,16 +246,21 @@ class Scenario {
         Scenario* previous_scenario_;
     };
 
-    Scenario(uint64_t seed, std::unique_ptr<Simulator> sim) : sim_(std::move(sim)) {
+    Scenario(uint64_t seed, std::unique_ptr<Simulator> sim)
+        : owned_(std::move(sim)), sim_(owned_.get()) {
         report_.seed = seed;
     }
+
+    explicit Scenario(Simulator& sim) : sim_(&sim) { report_.seed = sim.seed(); }
 
     void record_lifecycle(std::string detail) {
         report_.checks.push_back(CheckResult{kLifecycleId, std::move(detail), false, sim_->now()});
         report_.no_check_failed = false;
     }
 
-    std::unique_ptr<Simulator> sim_;
+    // Empty when the universe is the caller's (Scenario::on); sim_ is non-owning either way.
+    std::unique_ptr<Simulator> owned_;
+    Simulator* sim_ = nullptr;
     ScenarioReport report_{};
     bool ran_ = false;
     bool quiesced_ = false;
