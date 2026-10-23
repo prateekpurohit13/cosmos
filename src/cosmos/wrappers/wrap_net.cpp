@@ -197,41 +197,55 @@ int __wrap_close(int fd) {
     if (cosmos::Simulator::has_current() && current_net()->state(fd).known) {
         return current_net()->close(fd);
     }
+    const int rc = __real_close(fd);
     // The durability model outlives the descriptor: a stale entry would misroute a later fd.
+    // EBADF means there is no fd 0 left either, so ownership is released for both outcomes;
+    // EINTR is left alone because the descriptor state is unspecified.
     if (cosmos::Simulator::has_current()) {
-        cosmos::Simulator::current()->storage().forget_fd(fd);
+        auto* sim = cosmos::Simulator::current();
+        const bool descriptor_gone = rc == 0 || (rc < 0 && errno == EBADF);
+        if (fd == STDIN_FILENO && descriptor_gone) sim->release_stdin();
+        if (descriptor_gone) sim->storage().forget_fd(fd);
     }
-    return __real_close(fd);
+    return rc;
 }
 
 int __wrap_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
     if (!cosmos::Simulator::has_current()) return __real_poll(fds, nfds, timeout);
     // Host-only poll keeps host semantics (pipes/FIFOs would busy-loop as "always
     // ready" under the virtual poll). Mixed or virtual polls go to the transport.
+    auto* sim = cosmos::Simulator::current();
     bool any_virtual = false;
     for (nfds_t i = 0; fds != nullptr && i < nfds; ++i) {
-        if (fds[i].fd >= 0 &&
-            (current_net()->state(fds[i].fd).known || cosmos::is_virtual_fd(fds[i].fd))) {
+        // A harness-owned fd 0 is a buffer, not a descriptor: the transport reports it always
+        // readable, and consulting the host poll here would park the only simulated OS thread.
+        if (cosmos::wrappers::owns_stdin(sim, fds[i].fd) ||
+            (fds[i].fd >= 0 &&
+             (sim->net().state(fds[i].fd).known || cosmos::is_virtual_fd(fds[i].fd)))) {
             any_virtual = true;
             break;
         }
     }
     if (!any_virtual) return __real_poll(fds, nfds, timeout);
-    return current_net()->poll(fds, nfds, timeout);
+    return sim->net().poll(fds, nfds, timeout);
 }
 
 int __wrap___poll_chk(struct pollfd* fds, nfds_t nfds, int timeout, size_t fdslen) {
     if (!cosmos::Simulator::has_current()) return __real___poll_chk(fds, nfds, timeout, fdslen);
+    auto* sim = cosmos::Simulator::current();
     bool any_virtual = false;
     for (nfds_t i = 0; fds != nullptr && i < nfds; ++i) {
-        if (fds[i].fd >= 0 &&
-            (current_net()->state(fds[i].fd).known || cosmos::is_virtual_fd(fds[i].fd))) {
+        // A harness-owned fd 0 is a buffer, not a descriptor: the transport reports it always
+        // readable, and consulting the host poll here would park the only simulated OS thread.
+        if (cosmos::wrappers::owns_stdin(sim, fds[i].fd) ||
+            (fds[i].fd >= 0 &&
+             (sim->net().state(fds[i].fd).known || cosmos::is_virtual_fd(fds[i].fd)))) {
             any_virtual = true;
             break;
         }
     }
     if (!any_virtual) return __real___poll_chk(fds, nfds, timeout, fdslen);
-    return current_net()->poll(fds, nfds, timeout);
+    return sim->net().poll(fds, nfds, timeout);
 }
 
 int __wrap_fcntl(int fd, int cmd, ...) {

@@ -9,9 +9,19 @@
 #include "cosmos/storage.hpp"
 #include "cosmos/task.hpp"
 #include "cosmos/time.hpp"
+#include <algorithm>
+#include <cassert>
+#include <cerrno>
+#include <cstring>
 #include <expected>
+#include <limits>
 #include <optional>
+#include <string_view>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace cosmos {
 
@@ -32,6 +42,7 @@ template <typename Injector> class BasicSimulator {
     explicit BasicSimulator(uint64_t seed = kDefaultUniverseSeed)
         : seed_(seed), user_rng_(stream_seed(seed, StreamDomain::User)),
           swarm_rng_(stream_seed(seed, StreamDomain::Swarm)),
+          workload_rng_(stream_seed(seed, StreamDomain::Workload)),
           scheduler_(stream_seed(seed, StreamDomain::Schedule), clock_), net_(scheduler_, clock_) {}
 
     ~BasicSimulator() {
@@ -95,6 +106,72 @@ template <typename Injector> class BasicSimulator {
     Time now() const { return clock_.now(); }
     void advance_time(Duration d) { clock_.advance(d); }
 
+    // Deterministic stdin for a workload that reads fd 0. The buffer is copied into storage that
+    // bypasses the tracked heap, so configuring it while a universe is current cannot perturb the
+    // allocation counters a fault test is trying to pin. Empty means EOF, never the host's stdin.
+    void set_stdin(std::string_view bytes) {
+        stdin_.assign(bytes.begin(), bytes.end());
+        stdin_offset_ = 0;
+        stdin_owned_ = true;
+        struct stat st{};
+        stdin_identity_ = {};
+        if (::fstat(STDIN_FILENO, &st) == 0) {
+            stdin_identity_ =
+                StdinIdentity{true, st.st_dev, st.st_ino, static_cast<mode_t>(st.st_mode & S_IFMT)};
+        }
+    }
+
+    void clear_stdin() {
+        stdin_.clear();
+        stdin_offset_ = 0;
+        stdin_owned_ = false;
+        stdin_identity_ = {};
+    }
+
+    std::size_t stdin_remaining() const {
+        assert(stdin_offset_ <= stdin_.size());
+        return stdin_.size() - stdin_offset_;
+    }
+
+    // True while fd 0 belongs to the universe. The default is the host descriptor, so an
+    // application that never installs a workload stream keeps its normal stdin. set_stdin() arms
+    // ownership; close(0) and a successful open() that returns 0 release it. clear_stdin()
+    // uninstalls the buffer and returns fd 0 to the host. dup2() redirection is not modelled.
+    bool stdin_owned() const { return stdin_owned_; }
+    void release_stdin() {
+        stdin_owned_ = false;
+        stdin_identity_ = {};
+    }
+
+    // Guard against descriptor replacement we do not wrap (openat, creat, dup2, pipe, ...).
+    // If fd 0 no longer names the descriptor that set_stdin() captured, reads must go to the host.
+    // An absent descriptor never matches, including the case where set_stdin() could not capture an
+    // identity because fd 0 was already closed: the read then reaches the host and reports EBADF,
+    // which is what POSIX requires of a read on a closed descriptor.
+    bool stdin_descriptor_matches() const {
+        struct stat st{};
+        if (::fstat(STDIN_FILENO, &st) != 0 || !stdin_identity_.valid) return false;
+        return st.st_dev == stdin_identity_.dev && st.st_ino == stdin_identity_.ino &&
+               (st.st_mode & S_IFMT) == stdin_identity_.mode;
+    }
+
+    // Engine entry point used by __wrap_read for fd 0: POSIX-style partial reads, then EOF.
+    ssize_t read_stdin(void* buffer, std::size_t count) {
+        if (count == 0) return 0;
+        if (buffer == nullptr) {
+            errno = EFAULT;
+            return -1;
+        }
+        const std::size_t remaining = stdin_remaining();
+        if (remaining == 0) return 0;
+        constexpr std::size_t kMaxRead =
+            static_cast<std::size_t>(std::numeric_limits<ssize_t>::max());
+        const std::size_t chunk = std::min({count, remaining, kMaxRead});
+        std::memcpy(buffer, stdin_.data() + stdin_offset_, chunk);
+        stdin_offset_ += chunk;
+        return static_cast<ssize_t>(chunk);
+    }
+
     // Node the running fiber belongs to; 0 for the main fiber and engine callbacks.
     NodeId current_node() const { return scheduler_.current_node(); }
 
@@ -152,6 +229,12 @@ template <typename Injector> class BasicSimulator {
     // Universe config sampling (Rule 1: the Fault domain is untouched by it).
     Rng& swarm_rng() { return swarm_rng_; }
     const Rng& swarm_rng() const { return swarm_rng_; }
+
+    // Input generation (docs/design.md §11). A workload draws every generated value from here, so
+    // changing fault, schedule, or swarm decisions, or application getrandom calls, cannot shift
+    // the data stream.
+    Rng& workload_rng() { return workload_rng_; }
+    const Rng& workload_rng() const { return workload_rng_; }
 
     bool has_injector() const { return injector_.has_value(); }
 
@@ -226,6 +309,7 @@ template <typename Injector> class BasicSimulator {
     TrackedHeap heap_{};
     Rng user_rng_;
     Rng swarm_rng_;
+    Rng workload_rng_;
     VirtualClock clock_{};
     // After clock_: borrows it for timer wakeups. Before injector_: both borrow
     // the clock and destruction is reverse order.
@@ -235,6 +319,18 @@ template <typename Injector> class BasicSimulator {
     // Declared before the injector so they outlive it; neither borrows it.
     NodeRegistry nodes_{};
     StorageModel storage_{};
+    // RawRealAllocator: configuring stdin is harness work, not an application allocation.
+    struct StdinIdentity {
+        bool valid = false;
+        dev_t dev = 0;
+        ino_t ino = 0;
+        mode_t mode = 0;
+    };
+
+    std::vector<char, RawRealAllocator<char>> stdin_{};
+    std::size_t stdin_offset_{0};
+    bool stdin_owned_{false};
+    StdinIdentity stdin_identity_{};
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
     TraceOptions default_trace_options_{};

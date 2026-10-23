@@ -121,6 +121,14 @@ void track_open_for_node(cosmos::Simulator* sim, int fd, const char* path, int f
     sim->storage().track_open(fd, path, (flags & O_TRUNC) != 0);
 }
 
+// A successful open can land on fd 0 after the application closed stdin. The descriptor is then
+// the application's file, not the harness stream, so stdin ownership must be released first.
+void note_open_result(cosmos::Simulator* sim, int fd, const char* path, int flags) {
+    if (fd < 0) return;
+    if (fd == STDIN_FILENO) sim->release_stdin();
+    if (cosmos::wrappers::storage_fd_eligible(fd)) track_open_for_node(sim, fd, path, flags);
+}
+
 } // namespace
 
 extern "C" {
@@ -176,9 +184,7 @@ int __wrap_open(const char* pathname, int flags, ...) {
     }
     // Only a successful open registers: a faulted open returned above and creates nothing.
     const int fd = __real_open(pathname, flags, mode);
-    if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        track_open_for_node(sim, fd, pathname, flags);
-    }
+    note_open_result(sim, fd, pathname, flags);
     return fd;
 }
 
@@ -217,9 +223,7 @@ int __wrap_open64(const char* pathname, int flags, ...) {
         break; // None, or an unknown kind: the real call goes through unchanged.
     }
     const int fd = __real_open64(pathname, flags, mode);
-    if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        track_open_for_node(sim, fd, pathname, flags);
-    }
+    note_open_result(sim, fd, pathname, flags);
     return fd;
 }
 
@@ -241,9 +245,7 @@ int __wrap___open_2(const char* pathname, int flags) {
         break;
     }
     const int fd = __real___open_2(pathname, flags);
-    if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        track_open_for_node(sim, fd, pathname, flags);
-    }
+    note_open_result(sim, fd, pathname, flags);
     return fd;
 }
 
@@ -265,9 +267,7 @@ int __wrap___open64_2(const char* pathname, int flags) {
         break;
     }
     const int fd = __real___open64_2(pathname, flags);
-    if (fd >= 0 && cosmos::wrappers::storage_fd_eligible(fd)) {
-        track_open_for_node(sim, fd, pathname, flags);
-    }
+    note_open_result(sim, fd, pathname, flags);
     return fd;
 }
 
@@ -277,11 +277,17 @@ ssize_t __wrap_read(int fd, void* buf, size_t count) {
     }
     cosmos::wrappers::ReentrancyGuard guard;
 
+    auto* sim = cosmos::Simulator::current();
+    // When the universe has installed a stdin buffer, fd 0 is the harness stream and never the
+    // host's stdin. Without set_stdin the host descriptor is used as-is.
+    if (cosmos::wrappers::owns_stdin(sim, fd)) {
+        return sim->read_stdin(buf, count);
+    }
+
     if (!cosmos::wrappers::storage_read_eligible(fd, count)) {
         return __real_read(fd, buf, count);
     }
 
-    auto* sim = cosmos::Simulator::current();
     // Defense in depth: a virtual socket fd must never spend a Storage draw, even if the
     // static range check ever drifts. The transport has no read/write path, so it reaches
     // the host (EBADF on a kernel-unknown number) unfaulted.
@@ -301,16 +307,21 @@ ssize_t __wrap_read(int fd, void* buf, size_t count) {
 // glibc substitutes __read_chk for read() when the destination size is known; --wrap=read does not
 // see that symbol, so without this the site is silently skipped in such builds.
 ssize_t __wrap___read_chk(int fd, void* buf, size_t count, size_t buflen) {
+    if (count > buflen) __chk_fail(); // what __read_chk itself does before reading
     if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
         return __real___read_chk(fd, buf, count, buflen);
     }
     cosmos::wrappers::ReentrancyGuard guard;
 
+    auto* sim = cosmos::Simulator::current();
+    if (cosmos::wrappers::owns_stdin(sim, fd)) {
+        return sim->read_stdin(buf, count);
+    }
+
     if (!cosmos::wrappers::storage_read_eligible(fd, count)) {
         return __real___read_chk(fd, buf, count, buflen);
     }
 
-    auto* sim = cosmos::Simulator::current();
     if (sim->net().state(fd).known) {
         return __real___read_chk(fd, buf, count, buflen);
     }

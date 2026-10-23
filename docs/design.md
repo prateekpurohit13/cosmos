@@ -164,7 +164,7 @@ public:
 };
 ```
 
-RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`. Splitmix64 stream derivation ensures independent exploration dimensions across seeds.
+RNG stream domains: `Schedule=1`, `Fault=2`, `Workload=3`, `User=4`, `Swarm=5`. Splitmix64 stream derivation ensures independent exploration dimensions across seeds; workload generation reads only the `Workload` stream, so fault/schedule/swarm draws cannot shift its values.
 
 ---
 
@@ -305,17 +305,98 @@ flowchart TD
 
 ## 11. Data Generators (`gen.hpp`)
 
-Property-testing-style generators drawing from the `workload` RNG stream:
+Property-testing-style generators drawing from the `workload` RNG stream. The stream is owned by
+the universe (`Simulator::workload_rng()`), so generated values are a pure function of the seed and
+are isolated from fault, schedule, and application `getrandom` draws:
 
 ```cpp
 namespace cosmos::gen {
-    uint64_t range(Rng&, uint64_t lo, uint64_t hi);
+    template<std::integral T> T range(Rng&, T lo, T hi);   // inclusive, signed or unsigned
+    uint64_t range(Rng&, uint64_t lo, uint64_t hi);         // mixed-width arguments
+    std::size_t index(Rng&, std::size_t n);                 // [0, n)
     bool     coin(Rng&, double p);
+    template<std::ranges::random_access_range R>
+    std::ranges::range_value_t<R> one_of(Rng&, const R&);   // array, vector, span
     template<typename T> T one_of(Rng&, std::initializer_list<T>);
-    std::string string(Rng&, size_t len);
+    void     fill_string(Rng&, std::span<char>, std::string_view alphabet = kDefaultAlphabet);
+    inline constexpr std::string_view kDefaultAlphabet;
+    std::string string(Rng&, std::size_t len, std::string_view alphabet = kDefaultAlphabet);
+    // string(Rng&, len, char) is deleted: a scalar is not an alphabet.
+    std::string string(Rng&, std::size_t min_len, std::size_t max_len,
+                       std::string_view alphabet = kDefaultAlphabet);
+    void     bytes(Rng&, std::span<std::byte>);
     Duration exponential(Rng&, Duration mean);
+    template<std::ranges::random_access_range R> void shuffle(Rng&, R&);
+    template<typename T> T weighted_one_of(Rng&, std::initializer_list<std::pair<T, double>>);
 }
 ```
+
+`fill_string` and `bytes` write into caller-owned storage and never allocate. An empty alphabet is
+total in release: it fills NUL bytes and consumes no draws. `bytes` copies in host byte order, so
+one seed is byte-identical per architecture but not across endianness. Use the fill forms when a
+test pins an exact eligible-call index at `SiteId::malloc`: an owning `gen::string` spends wrapped
+allocations of its own. `exponential` uses `libm`, so one binary reproduces exactly; cross-libm
+bit-identity is not promised, and a draw beyond `int64` nanoseconds saturates to `Duration::max()`.
+
+### 11.1 Workload delivery adapters
+
+The generators only produce values. The application interface is application-specific, so the
+harness defines the operation shape and the adapter that delivers it:
+
+```cpp
+struct Put { std::string key, value; };
+struct Get { std::string key; };
+using Op = std::variant<Put, Get>;
+
+Op next_op(cosmos::Rng&);                 // gen::* fills the fields
+void apply(App&, const Op&);              // direct API, or serialize onto a transport
+```
+
+Three delivery paths are supported today:
+
+- **Direct API (recommended):** the app is linked into the simulation binary (`COSMOS_*_NO_MAIN`)
+  and `apply` calls its public functions. This is the shape `tests/test_broken_app.cpp` uses.
+- **REST/HTTP over virtual sockets:** the app's server runs as a fiber in the same universe; the
+  workload driver runs on the main fiber (or a fiber of its own). `include/cosmos/http.hpp`
+  supplies a minimal HTTP/1.1 client (`http::get`, `http::put`, `http::post`, `http::exchange`)
+  over the wrapped `send`/`recv`. It sends one request per connection and therefore requires
+  `Connection: close` (caller-supplied keep-alive is rejected). It supports Content-Length-framed
+  responses and EOF-framed responses, rejects transfer codings it cannot decode (including
+  chunked), rejects ambiguous framing such as duplicate `Content-Length`, and bounds head/body
+  accumulation.
+  `http::exchange` allocates through the wrapped heap in static-libstdc++ builds, so it shifts
+  `SiteId::malloc` eligible-call indices just like `gen::string`; use a direct-API adapter when a
+  test pins an exact malloc index. Under Memory fault injection those owning allocations can also
+  throw `std::bad_alloc`, so use the fill forms and direct-API adapter for OOM tests.
+  `tests/test_workload.cpp` runs a generated REST workload against an in-process KV server and
+  covers the client's rejection paths.
+- **stdin:** `Simulator::set_stdin(std::string_view)` installs a deterministic byte buffer;
+  subsequent `read(0, ...)` calls serve it with POSIX partial-read semantics and EOF. A buffer
+  installed with `set_stdin("")` means EOF; `clear_stdin()` uninstalls the buffer and returns fd 0
+  to the host, so an application that never opts in keeps its normal stdin. A successful
+  `close(0)`, or an `open()`/`open64()`/`__open_2`/`__open64_2` that returns fd 0, releases
+  harness ownership (a close that reports `EBADF` also releases it, because no fd 0 remains).
+  The descriptor identity (`fstat(0)`'s `dev`/`ino` and file type) is captured by `set_stdin()`
+  and re-checked on every harness read: an `openat`/`creat`/`dup2`/`fclose` replacement of fd 0 is
+  detected and reads fall through to the host, even though `stdin_owned()` remains true. If fd 0
+  is closed when `set_stdin()` is called, the harness cannot serve it and reads return the host's
+  `EBADF`. `poll`/`__poll_chk` route a harness-owned fd 0 to the transport, which reports it always
+  readable (the buffer is data or EOF) rather than consulting the host descriptor; a readiness wait
+  on the simulated stdin can therefore never park the universe's only OS thread. `select` and
+  `epoll_wait` are not wrapped and keep observing the host descriptor. `readv`,
+  `pread`, and `lseek(0, ...)` are not intercepted; a seek acts on the host descriptor while reads
+  serve the harness buffer. fd 0 is process-global, while ownership is per universe, so closing it
+  in one universe does not clear another universe's flag. The minimum wraps are `read`,
+  `__read_chk`, `close`, and the `open`/`open64`/`__open_2`/`__open64_2` family; without them the
+  application sees its normal stdin. `fread`/`std::cin` and other paths that use libc internals
+  outside `--wrap=read` are not intercepted, so prefer a passed fd/buffer or a direct parser entry
+  point for those.
+
+An application that is a separate process is outside the interposition boundary: `--wrap` only
+rewrites references in the simulation binary. A REST/websocket server must therefore be built as a
+library and linked in, with its socket calls interposed. A prebuilt shared library that calls
+`send` internally bypasses the wrappers for the same reason shared `libstdc++` bypasses the malloc
+wrapper.
 
 ---
 

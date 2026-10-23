@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 namespace cosmos::wrappers {
 
@@ -79,6 +80,15 @@ inline constexpr bool storage_read_eligible(int fd, size_t count) {
 
 inline constexpr bool storage_write_eligible(int fd, size_t count) {
     return storage_fd_eligible(fd) && count > 0;
+}
+
+// A harness-owned fd 0 (BasicSimulator::set_stdin) is the simulated stdin stream: reads must come
+// from the universe buffer, and readiness must never consult the host descriptor. The identity
+// check makes an unwrapped open/openat/dup2 replacement of fd 0 fall back to the host, so this is
+// the one definition of "fd 0 belongs to the workload" for the read and poll wrappers alike.
+template <typename Sim> bool owns_stdin(const Sim* sim, int fd) {
+    return fd == STDIN_FILENO && sim != nullptr && sim->stdin_owned() &&
+           sim->stdin_descriptor_matches();
 }
 
 // A non-IPv4 address is answered by the transport before the injector, like a calloc overflow:

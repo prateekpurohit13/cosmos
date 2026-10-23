@@ -809,3 +809,68 @@ foreach(variant buggy fixed)
     endif()
     add_test(NAME ${target} COMMAND ${target})
 endforeach()
+
+# Workload generation: pure value generators plus the two transport paths implemented so far.
+add_executable(test_gen test_gen.cpp)
+target_link_libraries(test_gen PRIVATE cosmos)
+add_test(NAME test_gen COMMAND test_gen)
+
+# stdin and REST share one harness: stdin needs the read wrapper; REST needs the virtual socket
+# and scheduler wrappers. Generated strings route through the wrapped allocator only in the
+# static-libstdc++ builds, where operator new is interposed. Without linker interposition the
+# test would bind real loopback sockets and real threads while claiming to exercise the virtual
+# transport, so the target is only built where the wraps exist.
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_workload test_workload.cpp)
+    target_link_libraries(test_workload PRIVATE cosmos)
+    target_compile_options(test_workload PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+        "-fno-builtin-open"
+        "-fno-builtin-read"
+        "-fno-builtin-send"
+        "-fno-builtin-recv"
+    )
+    target_link_options(test_workload PRIVATE
+        ${cosmos_net_wraps}
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
+    )
+    add_test(NAME test_workload COMMAND test_workload)
+
+    # The RawRealAllocator stdin bypass only has an observable effect when operator new reaches the
+    # wrapped malloc. Pin it in the static-libstdc++ configuration, like the other *_static twins.
+    if (COSMOS_HAVE_STATIC_LIBSTDCXX)
+        add_executable(test_workload_static test_workload.cpp)
+        target_link_libraries(test_workload_static PRIVATE cosmos)
+        target_compile_options(test_workload_static PRIVATE
+            "-fno-builtin-malloc"
+            "-fno-builtin-free"
+            "-fno-builtin-calloc"
+            "-fno-builtin-realloc"
+            "-fno-builtin-open"
+            "-fno-builtin-read"
+            "-fno-builtin-send"
+            "-fno-builtin-recv"
+        )
+        target_link_options(test_workload_static PRIVATE
+            "-static-libstdc++"
+            ${cosmos_net_wraps}
+            "-Wl,--wrap=open"
+            "-Wl,--wrap=open64"
+            "-Wl,--wrap=__open_2"
+            "-Wl,--wrap=__open64_2"
+            "-Wl,--wrap=read"
+            "-Wl,--wrap=__read_chk"
+        )
+        add_test(NAME test_workload_static COMMAND test_workload_static)
+    else()
+        message(STATUS "test_workload_static skipped: no static libstdc++ for this toolchain")
+    endif()
+endif()
