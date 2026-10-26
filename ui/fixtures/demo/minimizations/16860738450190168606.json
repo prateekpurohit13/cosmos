@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "seed": "16860738450190168606",
+  "seed_hex": "0xe9fd6049d65af21e",
+  "finding_id": "odd-index-fails",
+  "program": "cosmos_ui_export",
+  "refused": false,
+  "reason": "",
+  "candidates": [{"seq": 1, "eligible_index": 1, "at_ns": 0, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 5, "eligible_index": 3, "at_ns": 200000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 10, "eligible_index": 5, "at_ns": 400000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 13, "eligible_index": 7, "at_ns": 650000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 16, "eligible_index": 8, "at_ns": 750000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 17, "eligible_index": 9, "at_ns": 900000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 18, "eligible_index": 9, "at_ns": 900000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 19, "eligible_index": 10, "at_ns": 1050000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 20, "eligible_index": 10, "at_ns": 1050000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 21, "eligible_index": 11, "at_ns": 1200000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 22, "eligible_index": 11, "at_ns": 1200000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}],
+  "kept": [{"seq": 21, "eligible_index": 11, "at_ns": 1200000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}],
+  "only_faults": [21],
+  "repro": "cosmos_ui_export --seed 16860738450190168606 --only-faults=21",
+  "passes": 2,
+  "replays": 13,
+  "crashed_trials": 0
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "seed": "17027085370592858547",
+  "seed_hex": "0xec4c5bee627011b3",
+  "finding_id": "odd-index-fails",
+  "program": "cosmos_ui_export",
+  "refused": false,
+  "reason": "",
+  "candidates": [{"seq": 4, "eligible_index": 2, "at_ns": 100000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 9, "eligible_index": 5, "at_ns": 450000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 12, "eligible_index": 6, "at_ns": 550000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 14, "eligible_index": 7, "at_ns": 700000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 18, "eligible_index": 9, "at_ns": 950000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 20, "eligible_index": 10, "at_ns": 1100000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}, {"seq": 21, "eligible_index": 11, "at_ns": 1250000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}, {"seq": 22, "eligible_index": 11, "at_ns": 1250000, "site": "clock_gettime", "fault_class": "Clock", "outcome": "ClockStep", "amount_ns": 50000, "drew": true, "status": "FIRED"}],
+  "kept": [{"seq": 21, "eligible_index": 11, "at_ns": 1250000, "site": "malloc", "fault_class": "Memory", "outcome": "OutOfMemory", "amount_ns": 0, "drew": true, "status": "FIRED"}],
+  "only_faults": [21],
+  "repro": "cosmos_ui_export --seed 17027085370592858547 --only-faults=21",
+  "passes": 2,
+  "replays": 10,
+  "crashed_trials": 0
+}
