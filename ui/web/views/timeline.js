@@ -7,6 +7,7 @@ import {
   copyButton,
   detailsBlock,
   emptyState,
+  findingLink,
   kvList,
   notice,
   pageHeader,
@@ -18,6 +19,19 @@ import {
 } from "../lib/components.js";
 import { button, el, link } from "../lib/dom.js";
 import { formatAt, formatCount, formatNs, shortId } from "../lib/format.js";
+import {
+  DEFAULT_PLAYBACK_SPEED,
+  PLAYBACK_SPEEDS,
+  failureRelationLabel,
+  groupFailuresByIndex,
+  isInjected,
+  isSuppressedOrSkipped,
+  lastIndexAtOrBefore,
+  nextIndex,
+  parseVirtualTimeNs,
+  playbackIntervalMs,
+  resolveFailedChecks,
+} from "../lib/playback.js";
 import { createTimeline } from "../lib/timeline.js";
 import {
   entryClass,
@@ -26,6 +40,7 @@ import {
   entrySite,
   entryStatus,
   findLedgerMatch,
+  finiteTimeNs,
   laneOrder,
   parseSearch,
   selectedSeqFromQuery,
@@ -131,6 +146,7 @@ function traceTable(entries, indexes, bounds, selected, onSelect) {
               ]
                 .filter(Boolean)
                 .join(" "),
+              dataset: { index: String(index) },
               tabindex: "0",
               title: matched ? "Open this event in the inspector" : "This event is dimmed by the search",
               onClick: () => onSelect(entry, index),
@@ -166,7 +182,7 @@ function traceTable(entries, indexes, bounds, selected, onSelect) {
   );
 }
 
-function laneLegend(entries) {
+function laneLegend(entries, failures = [], markerCount = 0) {
   const counts = traceCounts(entries);
   const lanes = laneOrder(counts);
   return el(
@@ -180,17 +196,31 @@ function laneLegend(entries) {
         el("span", { class: "faint" }, formatCount(counts.classes.get(lane) ?? 0)),
       ),
     ),
+    failures.length > 0
+      ? el(
+          "span",
+          { class: "timeline-legend__item" },
+          badge(
+            `${formatCount(failures.length)} failed check${failures.length === 1 ? "" : "s"}`,
+            "bad",
+          ),
+          el(
+            "span",
+            { class: "faint" },
+            markerCount > 0 ? "dashed red marker" : "no marker position",
+          ),
+        )
+      : null,
   );
 }
 
-function inspectorBody(entry, index, entries, universe, onSelect, onPrevious, onNext) {
+function inspectorBody(entry, index, entries, ledger, failuresAt, onSelect, onPrevious, onNext) {
   if (!entry) {
     return emptyState({
       title: "Select an event",
       body: "Click a marker on the timeline, use the arrow keys, or select a row in the trace table to inspect the frozen decision fields.",
     });
   }
-  const ledger = findLedgerMatch(universe?.ledger, entry);
   const fields = [
     ["Event sequence", el("span", { class: "mono" }, formatCount(entry.seq))],
     ["Virtual time", el("span", { class: "mono" }, formatAt(entry.at_ns))],
@@ -229,6 +259,21 @@ function inspectorBody(entry, index, entries, universe, onSelect, onPrevious, on
       ),
     ),
     kvList(fields, { className: "kv--nowrap" }),
+    failuresAt.length > 0
+      ? notice(
+          "bad",
+          failuresAt.length === 1
+            ? `Failed check: ${failuresAt[0].id}`
+            : `${formatCount(failuresAt.length)} failed checks at this event`,
+          failuresAt
+            .map(
+              (failure) =>
+                `${failure.id} at ${formatAt(failure.atNs)} (${failureRelationLabel(failure)})`,
+            )
+            .join(". ") +
+            ". The canonical trace records no check event; this marker is the closest recorded decision, not proof that the event caused the failure.",
+        )
+      : null,
     ledger
       ? detailsBlock(
           "Matching ledger row",
@@ -269,6 +314,8 @@ function inspectorBody(entry, index, entries, universe, onSelect, onPrevious, on
       copyButton(
         () => {
           const params = new URLSearchParams(window.location.search);
+          params.delete("check");
+          params.delete("at");
           params.set("event", String(entry.seq));
           return `${window.location.origin}${window.location.pathname}?${params.toString()}`;
         },
@@ -278,8 +325,92 @@ function inspectorBody(entry, index, entries, universe, onSelect, onPrevious, on
   );
 }
 
+function eventHref(seq) {
+  const search = new URLSearchParams(window.location.search);
+  search.delete("check");
+  search.delete("at");
+  search.set("event", String(seq));
+  return `${window.location.pathname}?${search.toString()}`;
+}
+
+function failedChecksBody(failures, entries, campaignId, findingIds, onJump) {
+  if (failures.length === 0) {
+    return emptyState({
+      title: "No failed checks",
+      body: "This universe report has no failed check to mark on the timeline.",
+    });
+  }
+  return el(
+    "div",
+    { class: "table-wrap" },
+    el(
+      "table",
+      { class: "data data--failures" },
+      el("caption", { class: "sr-only" }, "Failed checks and their nearest recorded events"),
+      el(
+        "thead",
+        {},
+        el(
+          "tr",
+          {},
+          el("th", { scope: "col" }, "Check"),
+          el("th", { scope: "col", class: "num" }, "Virtual time"),
+          el("th", { scope: "col", class: "num" }, "Nearest event"),
+          el("th", { scope: "col" }, "Relation"),
+          el("th", { scope: "col" }, "Detail"),
+        ),
+      ),
+      el(
+        "tbody",
+        {},
+        ...failures.map((failure) => {
+          const entry = failure.index >= 0 ? entries[failure.index] : null;
+          return el(
+            "tr",
+            {},
+            el(
+              "td",
+              {},
+              findingIds.has(failure.id)
+                ? findingLink(campaignId, failure.id)
+                : el("span", { class: "mono" }, failure.id),
+            ),
+            el("td", { class: "num" }, formatAt(failure.atNs)),
+            el(
+              "td",
+              { class: "num" },
+              entry
+                ? link(eventHref(entry.seq), `#${formatCount(entry.seq)}`, {
+                    class: "mono",
+                    title: `Open event #${formatCount(entry.seq)} at ${formatAt(entry.at_ns)}`,
+                    onClick: (event) => {
+                      if (
+                        event.button !== 0 ||
+                        event.metaKey ||
+                        event.ctrlKey ||
+                        event.shiftKey ||
+                        event.altKey
+                      ) {
+                        return;
+                      }
+                      event.preventDefault();
+                      onJump(entry, failure.index);
+                    },
+                  })
+                : el("span", { class: "faint" }, "—"),
+            ),
+            el("td", { class: "text-soft" }, failureRelationLabel(failure)),
+            el("td", { class: "text-soft" }, failure.detail || "—"),
+          );
+        }),
+      ),
+    ),
+  );
+}
+
 export async function timelineView({ campaignId, seed, signal }) {
   const params = new URLSearchParams(window.location.search);
+  const viewPath = window.location.pathname;
   const initialQuery = params.get("q") ?? "";
   const initialSeq = selectedSeqFromQuery(params);
 
@@ -309,6 +440,17 @@ export async function timelineView({ campaignId, seed, signal }) {
   );
   const counts = traceCounts(entries);
   const lanes = laneOrder(counts);
+  const failures = resolveFailedChecks(universe, entries);
+  const failureGroups = groupFailuresByIndex(failures);
+  const failureByIndex = new Map(failureGroups.map((group) => [group.index, group]));
+  const failureIndexes = new Set(
+    failures.map((failure) => failure.index).filter((index) => index >= 0),
+  );
+  const findingIds = new Set(
+    (Array.isArray(campaign.findings) ? campaign.findings : [])
+      .filter((finding) => finding && typeof finding === "object")
+      .map((finding) => String(finding.id)),
+  );
   const status = universe.status ?? "unknown";
   const seedValue = universe.seed ?? seed;
   const invocation = reproInvocation(manifest, seedValue);
@@ -332,21 +474,144 @@ export async function timelineView({ campaignId, seed, signal }) {
 
   const notices = [];
   const eventParam = params.get("event");
-  if (eventParam !== null) {
-    if (initialSeq === null) {
+  const checkParam = params.get("check");
+  const atParam = params.get("at");
+  const atTarget = atParam === null ? null : parseVirtualTimeNs(atParam);
+  const checks = Array.isArray(universe.checks) ? universe.checks : [];
+  let initialSelection = null;
+
+  const resolveTarget = (targetNs, source) => {
+    const resolved = lastIndexAtOrBefore(entries, targetNs);
+    if (resolved.index < 0) return null;
+    return {
+      index: resolved.index,
+      seq: Number(entries[resolved.index]?.seq),
+      atOrBefore: resolved.atOrBefore,
+      targetNs,
+      source,
+    };
+  };
+
+  if (initialSeq !== null) {
+    const index = entries.findIndex((entry) => Number(entry.seq) === initialSeq);
+    if (index >= 0) {
+      initialSelection = { index, seq: initialSeq, atOrBefore: true, source: "event" };
+    } else {
       notices.push(
         notice(
           "warn",
           "Unknown event in link",
-          `The event parameter ${JSON.stringify(eventParam)} is not a decimal sequence number; no event was selected.`,
+          `Event #${formatCount(initialSeq)} is not present in this trace; the event parameter was ignored.`,
         ),
       );
-    } else if (!entries.some((entry) => Number(entry.seq) === initialSeq)) {
+    }
+  } else if (eventParam !== null) {
+    notices.push(
+      notice(
+        "warn",
+        "Unknown event in link",
+        `The event parameter ${JSON.stringify(eventParam)} is not a decimal sequence number; it was ignored.`,
+      ),
+    );
+  }
+
+  if (!initialSelection && checkParam) {
+    const check = checks.find((item) => String(item?.id) === checkParam);
+    const checkAt = check ? finiteTimeNs(check.at_ns) : null;
+    if (!check) {
       notices.push(
         notice(
           "warn",
-          "Unknown event in link",
-          `Event #${formatCount(initialSeq)} is not present in this trace; no event was selected.`,
+          "Check not found in link",
+          `This universe has no check with id ${JSON.stringify(checkParam)}. The check parameter was ignored.`,
+        ),
+      );
+    } else if (checkAt === null) {
+      notices.push(
+        notice(
+          "warn",
+          "Check has no virtual time",
+          `Check ${JSON.stringify(checkParam)} has no usable at_ns, so the timeline cannot resolve an event for it.`,
+        ),
+      );
+    } else {
+      initialSelection = resolveTarget(checkAt, "check");
+      if (!initialSelection) {
+        notices.push(
+          notice(
+            "warn",
+            "No event for failed check",
+            `Check ${JSON.stringify(checkParam)} has no recorded event to jump to.`,
+          ),
+        );
+      }
+    }
+  }
+
+  if (!initialSelection && atParam !== null) {
+    if (atTarget === null) {
+      notices.push(
+        notice(
+          "warn",
+          "Invalid virtual time in link",
+          `The at parameter ${JSON.stringify(atParam)} is not a virtual time such as 0, 2500000, 2.5ms or 1s.`,
+        ),
+      );
+    } else {
+      initialSelection = resolveTarget(atTarget, "at");
+      if (!initialSelection) {
+        notices.push(
+          notice(
+            "warn",
+            "No event to jump to",
+            "This universe has no recorded event for the requested virtual time.",
+          ),
+        );
+      }
+    }
+  }
+
+  if (initialSelection && initialSelection.source === "check") {
+    const failed = failures.find((failure) => failure.id === String(checkParam));
+    const checkLabel = failed ? "failed check" : "check";
+    if (counts.maxAt !== null && initialSelection.targetNs > counts.maxAt) {
+      notices.push(
+        notice(
+          "info",
+          "Target after the last recorded event",
+          `The ${checkLabel} is at ${formatAt(initialSelection.targetNs)}, but the trace ends at ` +
+            `${formatAt(counts.maxAt)}. Event #${formatCount(initialSelection.seq)} is the last ` +
+            `recorded decision, not the target point.`,
+        ),
+      );
+    } else if (!initialSelection.atOrBefore) {
+      notices.push(
+        notice(
+          "warn",
+          "Jump target precedes the trace",
+          `The ${checkLabel} is at ${formatAt(initialSelection.targetNs)}, before the first recorded ` +
+            `decision. Event #${formatCount(initialSelection.seq)} is the closest available evidence.`,
+        ),
+      );
+    }
+  } else if (initialSelection && initialSelection.source === "at") {
+    if (counts.maxAt !== null && initialSelection.targetNs > counts.maxAt) {
+      notices.push(
+        notice(
+          "info",
+          "Target after the last recorded event",
+          `The target is ${formatAt(initialSelection.targetNs)}, but the trace ends at ` +
+            `${formatAt(counts.maxAt)}. Event #${formatCount(initialSelection.seq)} is the last ` +
+            `recorded decision, not the target point.`,
+        ),
+      );
+    } else if (!initialSelection.atOrBefore) {
+      notices.push(
+        notice(
+          "warn",
+          "Jump target precedes the trace",
+          `No recorded event is at or before ${formatAt(initialSelection.targetNs)}; ` +
+            `event #${formatCount(initialSelection.seq)} is the first recorded decision.`,
         ),
       );
     }
@@ -503,13 +768,27 @@ export async function timelineView({ campaignId, seed, signal }) {
   });
 
   let selected = null;
+  let selectedIdx = -1;
+  const ledgerCache = new Map();
   let tokens = parseSearch(initialQuery);
   let matchFlags = entries.map((entry) => entryMatches(entry, tokens));
   let matchCount = tokens.length === 0 ? entries.length : matchFlags.filter(Boolean).length;
   let page = 1;
   let searchTimer = 0;
   let urlTimer = 0;
+  let playTimer = 0;
+  let canvasTimer = 0;
+  let pendingCanvasSeq = null;
+  let lastCanvasPaint = 0;
   let controller = null;
+  let playing = false;
+  let speed = DEFAULT_PLAYBACK_SPEED;
+  const injectedIndexes = [];
+  const suppressedIndexes = [];
+  entries.forEach((entry, index) => {
+    if (isInjected(entry)) injectedIndexes.push(index);
+    if (isSuppressedOrSkipped(entry)) suppressedIndexes.push(index);
+  });
 
   const searchInput = el("input", {
     id: "timeline-search",
@@ -568,6 +847,121 @@ export async function timelineView({ campaignId, seed, signal }) {
     ),
   );
 
+  const playButton = el(
+    "button",
+    {
+      type: "button",
+      class: "btn btn--primary btn--sm",
+      "aria-pressed": "false",
+      title: "Play or pause the event cursor (Space)",
+    },
+    "Play",
+  );
+  playButton.addEventListener("click", () => togglePlayback());
+  const stepBackButton = button("Step back", () => stepBy(-1), {
+    class: "btn btn--ghost btn--sm",
+    title: "Select the previous event; from no selection, the last event (,)",
+  });
+  const stepButton = button("Step", () => stepBy(1), {
+    class: "btn btn--ghost btn--sm",
+    title: "Select the next event; from no selection, the first event (.)",
+  });
+  const nextFaultButton = button(
+    "Next injected",
+    () => jumpToNext(isInjected, "injected fault"),
+    {
+      class: "btn btn--ghost btn--sm",
+      title: `${formatCount(injectedIndexes.length)} injected decisions; f (wraps)`,
+    },
+  );
+  const nextSkippedButton = button(
+    "Next suppressed",
+    () => jumpToNext(isSuppressedOrSkipped, "suppressed or skipped decision"),
+    {
+      class: "btn btn--ghost btn--sm",
+      title: `${formatCount(suppressedIndexes.length)} suppressed/skipped decisions; d (wraps)`,
+    },
+  );
+  const nextFailureButton = button(
+    "Next failure",
+    () => jumpToNext((entry, index) => failureIndexes.has(index), "failed check"),
+    {
+      class: "btn btn--ghost btn--sm",
+      title:
+        failureIndexes.size === 0
+          ? "No failed check has a mappable recorded event"
+          : `${formatCount(failureIndexes.size)} failed check${failureIndexes.size === 1 ? "" : "s"}; jumps to their nearest recorded events (x, wraps)`,
+    },
+  );
+  const speedSelect = el(
+    "select",
+    {
+      id: "timeline-speed",
+      class: "select select--sm",
+      "aria-label": "Playback speed in events per second",
+    },
+    ...PLAYBACK_SPEEDS.map((value) => el("option", { value: String(value) }, `${value} ev/s`)),
+  );
+  speedSelect.value = String(DEFAULT_PLAYBACK_SPEED);
+  speedSelect.addEventListener("change", () => {
+    const next = Number(speedSelect.value);
+    speed = PLAYBACK_SPEEDS.includes(next) ? next : DEFAULT_PLAYBACK_SPEED;
+    announce(`Playback speed set to ${speed} events per second.`);
+    if (playing) schedulePlayback();
+  });
+  const timeInput = el("input", {
+    id: "timeline-time",
+    name: "time",
+    type: "text",
+    inputmode: "decimal",
+    autocomplete: "off",
+    spellcheck: "false",
+    placeholder: "2.4ms or 2400000ns",
+    "aria-label": "Virtual time to jump to",
+  });
+  const timeGo = button("Jump", () => jumpToTime(), {
+    class: "btn btn--ghost btn--sm",
+    title: "Select the nearest event at or before this virtual time (g)",
+  });
+  const timeForm = el(
+    "form",
+    {
+      class: "timeline-time",
+      onSubmit: (event) => {
+        event.preventDefault();
+        jumpToTime();
+      },
+    },
+    el("label", { for: "timeline-time" }, "Jump to virtual time"),
+    timeInput,
+    timeGo,
+  );
+  const playbackStatus = el("span", {
+    class: "timeline-playback__status",
+    role: "status",
+    "aria-live": "polite",
+  });
+  const playbackBar = el(
+    "div",
+    { class: "timeline-playback" },
+    el("div", { class: "timeline-playback__group" }, playButton, stepBackButton, stepButton),
+    el(
+      "div",
+      { class: "timeline-playback__group" },
+      nextFaultButton,
+      nextSkippedButton,
+      nextFailureButton,
+    ),
+    el(
+      "div",
+      { class: "timeline-playback__group" },
+      el("label", { for: "timeline-speed", class: "timeline-playback__label" }, "Speed"),
+      speedSelect,
+    ),
+    timeForm,
+    playbackStatus,
+  );
+
   const timelineHost = el("div", { class: "timeline-host" });
   const inspectorHost = el("div", { class: "timeline-inspector" });
   const tableHost = el("div", {});
@@ -575,29 +969,62 @@ export async function timelineView({ campaignId, seed, signal }) {
 
   const selectedIndex = () => {
     if (selected === null) return -1;
-    return entries.findIndex((entry) => Number(entry.seq) === Number(selected));
+    if (
+      selectedIdx >= 0 &&
+      selectedIdx < entries.length &&
+      Number(entries[selectedIdx]?.seq) === Number(selected)
+    ) {
+      return selectedIdx;
+    }
+    selectedIdx = entries.findIndex((entry) => {
+      const seq = Number(entry?.seq);
+      return Number.isSafeInteger(seq) && seq >= 0 && seq === Number(selected);
+    });
+    return selectedIdx;
   };
 
-  const syncUrl = () => {
+  const writeUrl = () => {
     const path = window.location.pathname;
     const next = new URLSearchParams();
     if (searchInput.value) next.set("q", searchInput.value);
     if (selected !== null) next.set("event", String(selected));
     const query = next.toString();
+    window.history.replaceState(null, "", query ? `${path}?${query}` : path);
+  };
+
+  const syncUrl = () => {
+    const path = window.location.pathname;
     window.clearTimeout(urlTimer);
     urlTimer = window.setTimeout(() => {
       if (window.location.pathname !== path) return;
-      window.history.replaceState(null, "", query ? `${path}?${query}` : path);
+      writeUrl();
     }, 150);
   };
 
   const renderInspector = (entry, index) => {
+    const failuresAt = index >= 0 ? failureByIndex.get(index)?.failures ?? [] : [];
+    let ledger = null;
+    if (entry) {
+      const key = JSON.stringify([
+        entrySite(entry),
+        String(entry?.eligible_index),
+        String(entry?.at_ns),
+        entryOutcome(entry),
+      ]);
+      if (ledgerCache.has(key)) {
+        ledger = ledgerCache.get(key);
+      } else {
+        ledger = findLedgerMatch(universe?.ledger, entry);
+        ledgerCache.set(key, ledger);
+      }
+    }
     inspectorHost.replaceChildren(
       inspectorBody(
         entry,
         index,
         entries,
-        universe,
+        ledger,
+        failuresAt,
         (nextEntry, nextIndex) => selectEntry(nextEntry, nextIndex),
         () => selectEntry(entries[index - 1], index - 1),
         () => selectEntry(entries[index + 1], index + 1),
@@ -635,15 +1062,120 @@ export async function timelineView({ campaignId, seed, signal }) {
     nextMatch.disabled = matchCount === 0;
   };
 
-  const selectEntry = (entry, index, { fromCanvas = false } = {}) => {
+  const updateTableSelection = () => {
+    for (const row of tableHost.querySelectorAll("tr[data-index]")) {
+      const index = Number(row.dataset.index);
+      const entry = entries[index];
+      const isSelected = selected !== null && Number(selected) === Number(entry?.seq);
+      row.classList.toggle("is-selected", isSelected);
+    }
+  };
+
+  const announce = (message) => {
+    playbackStatus.textContent = message;
+  };
+
+  // A canvas redraw is O(entries) and the minimap rebuilds its buckets on every selection. During
+  // playback the cursor can advance faster than a useful paint, so coalesce paints to ~10 Hz; the
+  // inspector and table keep up with every event, and pause flushes the latest selection.
+  const paintCanvasSelection = (seq) => {
+    window.clearTimeout(canvasTimer);
+    canvasTimer = 0;
+    pendingCanvasSeq = null;
+    controller?.setSelected(seq);
+    lastCanvasPaint = performance.now();
+  };
+
+  const flushCanvasSelection = () => {
+    window.clearTimeout(canvasTimer);
+    canvasTimer = 0;
+    if (pendingCanvasSeq !== null) paintCanvasSelection(pendingCanvasSeq);
+    else if (selected !== null) paintCanvasSelection(selected);
+  };
+
+  const requestCanvasSelection = (seq) => {
+    pendingCanvasSeq = seq;
+    const elapsed = performance.now() - lastCanvasPaint;
+    if (elapsed >= 100) {
+      paintCanvasSelection(seq);
+      return;
+    }
+    if (canvasTimer) return;
+    canvasTimer = window.setTimeout(() => {
+      canvasTimer = 0;
+      if (pendingCanvasSeq !== null) paintCanvasSelection(pendingCanvasSeq);
+    }, 100 - elapsed);
+  };
+
+  const setPlaying = (next, { flushCanvas = true } = {}) => {
+    playing = Boolean(next);
+    window.clearTimeout(playTimer);
+    playTimer = 0;
+    if (!playing) {
+      if (flushCanvas) {
+        flushCanvasSelection();
+      } else {
+        window.clearTimeout(canvasTimer);
+        canvasTimer = 0;
+        pendingCanvasSeq = null;
+      }
+    }
+    playButton.textContent = playing ? "Pause" : "Play";
+    playButton.setAttribute("aria-pressed", playing ? "true" : "false");
+    syncControls();
+  };
+
+  const pausePlayback = ({ flushCanvas = true } = {}) => {
+    if (!playing) return false;
+    setPlaying(false, { flushCanvas });
+    return true;
+  };
+
+  const syncControls = () => {
+    const current = selectedIndex();
+    playButton.textContent = playing ? "Pause" : "Play";
+    playButton.disabled = entries.length === 0;
+    stepBackButton.disabled = entries.length === 0 || current === 0;
+    stepButton.disabled =
+      entries.length === 0 || (current >= 0 && current >= entries.length - 1);
+    nextFaultButton.disabled = entries.length === 0 || injectedIndexes.length === 0;
+    nextSkippedButton.disabled = entries.length === 0 || suppressedIndexes.length === 0;
+    nextFailureButton.disabled = entries.length === 0 || failureIndexes.size === 0;
+    speedSelect.disabled = entries.length === 0;
+    timeInput.disabled = entries.length === 0;
+    timeGo.disabled = entries.length === 0;
+  };
+
+  const selectEntry = (entry, index, { fromCanvas = false, fromPlayback = false } = {}) => {
     if (!entry || index < 0 || index >= entries.length) return;
-    selected = Number(entry.seq);
-    if (!fromCanvas) controller?.setSelected(selected);
+    const seq = Number(entry.seq);
+    if (!Number.isSafeInteger(seq) || seq < 0) return;
+    const paused = !fromPlayback && pausePlayback({ flushCanvas: !fromCanvas });
+    selected = seq;
+    selectedIdx = index;
+    if (fromCanvas) {
+      window.clearTimeout(canvasTimer);
+      canvasTimer = 0;
+      pendingCanvasSeq = null;
+      lastCanvasPaint = performance.now();
+    }
+    if (!fromCanvas) {
+      if (fromPlayback) requestCanvasSelection(selected);
+      else paintCanvasSelection(selected);
+    }
     renderInspector(entry, index);
     const targetPage = Math.floor(index / PAGE_SIZE) + 1;
-    if (targetPage !== page) page = targetPage;
-    renderTable();
+    if (targetPage !== page) {
+      page = targetPage;
+      renderTable();
+    } else {
+      updateTableSelection();
+    }
+    syncControls();
     syncUrl();
+    if (!fromPlayback) {
+      announce(paused ? `Paused at event #${formatCount(selected)}.` : `Event #${formatCount(selected)} selected.`);
+    }
   };
 
   const gotoMatch = (direction) => {
@@ -665,11 +1197,13 @@ export async function timelineView({ campaignId, seed, signal }) {
   };
 
   const applySearch = () => {
+    const paused = pausePlayback();
     tokens = parseSearch(searchInput.value);
     rematch();
     controller?.setTokens(tokens);
     renderTable();
     syncUrl();
+    if (paused) announce(`Paused at event #${formatCount(selected)}.`);
   };
 
   const onSearchInput = () => {
@@ -678,23 +1212,219 @@ export async function timelineView({ campaignId, seed, signal }) {
   };
   searchInput.addEventListener("input", onSearchInput);
 
+  const schedulePlayback = () => {
+    window.clearTimeout(playTimer);
+    if (!playing) return;
+    playTimer = window.setTimeout(() => {
+      playTimer = 0;
+      if (!playing) return;
+      const current = selectedIndex();
+      if (current < 0) {
+        selectEntry(entries[0], 0, { fromPlayback: true });
+      } else if (current >= entries.length - 1) {
+        setPlaying(false);
+        announce(`Reached the last event (#${formatCount(selected)}); playback paused.`);
+        return;
+      } else {
+        selectEntry(entries[current + 1], current + 1, { fromPlayback: true });
+      }
+      schedulePlayback();
+    }, playbackIntervalMs(speed));
+  };
+
+  const startPlayback = () => {
+    if (entries.length === 0) {
+      announce("No recorded events to play.");
+      return;
+    }
+    let index = selectedIndex();
+    if (index < 0) {
+      index = 0;
+      selectEntry(entries[0], 0, { fromPlayback: true });
+      paintCanvasSelection(selected);
+    } else if (index >= entries.length - 1) {
+      announce(
+        entries.length === 1
+          ? "Only one event is recorded; playback cannot advance."
+          : `Already at the last event (#${formatCount(selected)}); press Step back or select an earlier event to replay.`,
+      );
+      return;
+    }
+    setPlaying(true);
+    announce(
+      `Playing from event #${formatCount(entries[index].seq)} at ${speed} events per second.`,
+    );
+    schedulePlayback();
+  };
+
+  const togglePlayback = () => {
+    if (entries.length === 0) return;
+    if (playing) {
+      pausePlayback();
+      announce(`Paused at event #${formatCount(selected)}.`);
+      return;
+    }
+    startPlayback();
+  };
+
+  const stepBy = (delta) => {
+    if (entries.length === 0) return;
+    pausePlayback();
+    const current = selectedIndex();
+    const target =
+      current < 0
+        ? delta > 0
+          ? 0
+          : entries.length - 1
+        : Math.min(entries.length - 1, Math.max(0, current + delta));
+    if (current === target) {
+      announce(delta > 0 ? "Already at the last event." : "Already at the first event.");
+      return;
+    }
+    selectEntry(entries[target], target);
+    announce(`Event #${formatCount(selected)} of ${formatCount(entries.length)}.`);
+  };
+
+  const jumpToNext = (predicate, label) => {
+    if (entries.length === 0) return;
+    const current = selectedIndex();
+    const index = nextIndex(entries, current, predicate, { wrap: true });
+    if (index < 0) {
+      announce(`No ${label} in this trace.`);
+      return;
+    }
+    pausePlayback();
+    const wrapped = current >= 0 && index <= current;
+    selectEntry(entries[index], index);
+    announce(
+      index === current
+        ? `This is the only ${label}; event #${formatCount(selected)} is already selected.`
+        : `${label.charAt(0).toUpperCase()}${label.slice(1)} at event #${formatCount(selected)}` +
+            `${wrapped ? " (wrapped to the start)" : ""}.`,
+    );
+  };
+
+  const jumpToTime = () => {
+    if (entries.length === 0) return;
+    const targetNs = parseVirtualTimeNs(timeInput.value);
+    if (targetNs === null) {
+      announce("Enter a virtual time such as 0, 2500000ns, 500µs, 2.4ms or 1s.");
+      timeInput.focus();
+      return;
+    }
+    const resolved = lastIndexAtOrBefore(entries, targetNs);
+    if (resolved.index < 0) {
+      announce("No recorded event to jump to.");
+      return;
+    }
+    pausePlayback();
+    selectEntry(entries[resolved.index], resolved.index);
+    const afterLast = counts.maxAt !== null && targetNs > counts.maxAt;
+    announce(
+      `Event #${formatCount(selected)} at ${formatAt(entries[resolved.index].at_ns)} · ` +
+        `${
+          resolved.atOrBefore
+            ? afterLast
+              ? "last event (target is after the last recorded event)"
+              : "nearest at or before"
+            : "first event (no recorded event at or before)"
+        } ` +
+        `${formatAt(targetNs)}.`,
+    );
+  };
+
+  const isEditableTarget = (target) => {
+    const element = target instanceof Element ? target : null;
+    return Boolean(
+      element?.closest?.("input, textarea, select, [contenteditable]:not([contenteditable='false'])"),
+    );
+  };
+
+  // Space activates buttons and summaries natively; every other shortcut may still run there.
+  const isNativeSpaceTarget = (target) => {
+    const element = target instanceof Element ? target : null;
+    return Boolean(
+      element?.closest?.("button, summary, [role='button'], [role='checkbox'], [role='switch']"),
+    );
+  };
+
+  const onKeyDown = (event) => {
+    if (
+      event.defaultPrevented ||
+      event.repeat ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    if (event.key === "Escape" && playing) {
+      event.preventDefault();
+      pausePlayback();
+      announce(`Paused at event #${formatCount(selected)}.`);
+      return;
+    }
+    if (isEditableTarget(event.target)) return;
+    if (event.key === " " && isNativeSpaceTarget(event.target)) return;
+    if (event.key === " ") {
+      event.preventDefault();
+      togglePlayback();
+      return;
+    }
+    if (event.key === ".") {
+      event.preventDefault();
+      stepBy(1);
+      return;
+    }
+    if (event.key === ",") {
+      event.preventDefault();
+      stepBy(-1);
+      return;
+    }
+    if (event.key === "/") {
+      event.preventDefault();
+      searchInput.focus();
+      searchInput.select();
+      return;
+    }
+    const key = event.key.toLowerCase();
+    if (key === "f") {
+      event.preventDefault();
+      jumpToNext(isInjected, "injected fault");
+    } else if (key === "d") {
+      event.preventDefault();
+      jumpToNext(isSuppressedOrSkipped, "suppressed or skipped decision");
+    } else if (key === "x") {
+      event.preventDefault();
+      jumpToNext((entry, index) => failureIndexes.has(index), "failed check");
+    } else if (key === "g") {
+      event.preventDefault();
+      timeInput.focus();
+      timeInput.select();
+    }
+  };
+  window.addEventListener("keydown", onKeyDown);
+
   if (entries.length > 0) {
     controller = createTimeline({
       entries,
       tokens,
-      selectedSeq: initialSeq,
+      selectedSeq: initialSelection ? initialSelection.seq : null,
+      markers: failureGroups,
       onSelect: (entry, index) => selectEntry(entry, index, { fromCanvas: true }),
     });
-    timelineHost.replaceChildren(
-      laneLegend(entries),
-      controller.node,
-    );
-    const initialIndex = initialSeq === null ? -1 : selectedIndexFor(initialSeq, entries);
-    if (initialIndex >= 0) {
-      selected = initialSeq;
+    timelineHost.replaceChildren(laneLegend(entries, failures, failureGroups.length), controller.node);
+    if (initialSelection) {
+      selected = initialSelection.seq;
+      selectedIdx = initialSelection.index;
       controller.setSelected(selected);
-      page = Math.floor(initialIndex / PAGE_SIZE) + 1;
-      renderInspector(entries[initialIndex], initialIndex);
+      page = Math.floor(initialSelection.index / PAGE_SIZE) + 1;
+      renderInspector(entries[initialSelection.index], initialSelection.index);
+      announce(
+        initialSelection.source === "event"
+          ? `Event #${formatCount(selected)} selected from the link.`
+          : `Event #${formatCount(selected)} selected from the ${initialSelection.source} jump target.`,
+      );
     } else {
       renderInspector(null, -1);
     }
@@ -711,13 +1441,23 @@ export async function timelineView({ campaignId, seed, signal }) {
   }
 
   renderTable();
+  syncControls();
+  if (!entries.length) {
+    announce("No recorded events to play or jump between.");
+  }
+  if (
+    window.location.pathname === viewPath &&
+    (initialSelection || eventParam !== null || checkParam !== null || atParam !== null)
+  ) {
+    writeUrl();
+  }
 
   const timelinePanel = panel({
     title: "Fault timeline",
     subtitle: "Canonical decisions in event-sequence order; search dims non-matching events",
     count: entries.length,
     flush: true,
-    body: el("div", { class: "timeline-panel" }, toolbar, timelineHost),
+    body: el("div", { class: "timeline-panel" }, toolbar, playbackBar, timelineHost),
   });
 
   const inspectorPanel = panel({
@@ -725,6 +1465,20 @@ export async function timelineView({ campaignId, seed, signal }) {
     subtitle: "Frozen TraceEntry fields; no invented node or correlation data",
     body: inspectorHost,
   });
+
+  const failuresPanel =
+    failures.length > 0
+      ? panel({
+          title: "Failed checks",
+          subtitle:
+            "Nearest recorded event at or before each failure time; the canonical trace has no check event",
+          count: failures.length,
+          flush: true,
+          body: failedChecksBody(failures, entries, campaignId, findingIds, (entry, index) =>
+            selectEntry(entry, index),
+          ),
+        })
+      : null;
 
   const traceTablePanel = panel({
     title: "Trace entries",
@@ -772,6 +1526,7 @@ export async function timelineView({ campaignId, seed, signal }) {
       timelinePanel,
       inspectorPanel,
     ),
+    failuresPanel ? el("div", { class: "section-gap" }, failuresPanel) : null,
     el("div", { class: "section-gap" }, traceTablePanel),
     el("div", { class: "section-gap" }, rawPanel),
   );
@@ -782,12 +1537,11 @@ export async function timelineView({ campaignId, seed, signal }) {
     destroy() {
       window.clearTimeout(searchTimer);
       window.clearTimeout(urlTimer);
+      window.clearTimeout(playTimer);
+      window.clearTimeout(canvasTimer);
       searchInput.removeEventListener("input", onSearchInput);
+      window.removeEventListener("keydown", onKeyDown);
       controller?.destroy();
     },
   };
-}
-
-function selectedIndexFor(seq, entries) {
-  return entries.findIndex((entry) => Number(entry.seq) === Number(seq));
 }
