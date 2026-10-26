@@ -11,6 +11,22 @@ namespace cosmos {
 
 namespace {
 
+// One network producer. Recording is a stamped assignment into a preallocated ring; it never
+// allocates and never changes transport state.
+void record_net(EventSink* sink, EventKind kind, Time at, NodeId node, uint64_t task, int fd,
+                EventPayload payload = {}, uint64_t correlation = kNoCorrelation) {
+    if (sink == nullptr || !sink->enabled() || !sink->seeded()) return;
+    Event event;
+    event.at = at;
+    event.kind = kind;
+    event.node = node == static_cast<NodeId>(-1) ? kNoNode : node;
+    event.task = task;
+    event.correlation_id = correlation;
+    if (payload.subject == 0 && fd >= 0) payload.subject = static_cast<uint64_t>(fd);
+    event.payload = payload;
+    sink->record(event);
+}
+
 void write_addr(struct sockaddr* addr, socklen_t* addrlen, uint16_t port) {
     if (addr == nullptr || addrlen == nullptr) return;
     struct sockaddr_in full{};
@@ -126,6 +142,10 @@ int Net::socket(int domain, int type, int protocol) {
     const int fd = create_endpoint();
     if (fd < 0) return -1;
     get(fd)->nonblocking = (type & SOCK_NONBLOCK) != 0;
+    record_net(event_sink_, EventKind::network_socket, clock_.now(), get(fd)->node,
+               scheduler_.current_task_id(), fd,
+               EventPayload{.value = static_cast<uint64_t>(type),
+                            .extra = static_cast<uint64_t>(protocol)});
     return fd;
 }
 
@@ -158,6 +178,15 @@ int Net::pair(int domain, int type, int protocol, int out[2]) {
     a.peer_port = b.port;
     b.peer_port = a.port;
     signal_change();
+    const uint64_t task = scheduler_.current_task_id();
+    record_net(
+        event_sink_, EventKind::network_socket, clock_.now(), a.node, task, left,
+        EventPayload{.related = static_cast<uint64_t>(right), .value = static_cast<uint64_t>(type)},
+        0);
+    record_net(
+        event_sink_, EventKind::network_socket, clock_.now(), b.node, task, right,
+        EventPayload{.related = static_cast<uint64_t>(left), .value = static_cast<uint64_t>(type)},
+        0);
     out[0] = left;
     out[1] = right;
     return 0;
@@ -191,6 +220,8 @@ int Net::bind(int fd, const struct sockaddr* addr, socklen_t addrlen) {
         return -1;
     }
     ep->port = requested == 0 ? alloc_port() : requested;
+    record_net(event_sink_, EventKind::network_bind, clock_.now(), ep->node,
+               scheduler_.current_task_id(), fd, EventPayload{.value = ep->port});
     return 0;
 }
 
@@ -206,6 +237,9 @@ int Net::listen(int fd, int backlog) {
         return -1;
     }
     ep->listener = true;
+    record_net(event_sink_, EventKind::network_listen, clock_.now(), ep->node,
+               scheduler_.current_task_id(), fd,
+               EventPayload{.value = static_cast<uint64_t>(backlog)});
     return 0;
 }
 
@@ -258,6 +292,9 @@ int Net::connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
     server.peer_port = client.port;
     listener->pending.push_back(server_fd - kVirtualFdBase);
     signal_change();
+    record_net(event_sink_, EventKind::network_connect, clock_.now(), client.node,
+               scheduler_.current_task_id(), fd,
+               EventPayload{.related = static_cast<uint64_t>(server_fd), .value = port});
     return 0;
 }
 
@@ -293,8 +330,13 @@ int Net::accept(int fd, struct sockaddr* addr, socklen_t* addrlen) {
     Endpoint& server = endpoints_[static_cast<size_t>(server_index)];
     server.awaiting_accept = false;
     const Endpoint* peer = peer_of(server);
+    const int accepted_fd = kVirtualFdBase + server_index;
     write_addr(addr, addrlen, peer != nullptr ? peer->port : server.peer_port);
-    return kVirtualFdBase + server_index;
+    record_net(event_sink_, EventKind::network_accept, clock_.now(), ep->node,
+               scheduler_.current_task_id(), fd,
+               EventPayload{.related = static_cast<uint64_t>(accepted_fd),
+                            .value = peer != nullptr ? peer->port : server.peer_port});
+    return accepted_fd;
 }
 
 bool Net::readable(const Endpoint& ep) const {
@@ -320,20 +362,43 @@ void Net::signal_change() {
     scheduler_.cond_broadcast(&cond_);
 }
 
-void Net::enqueue(Endpoint& peer, InjectedFault fault, const void* buf, size_t len, Time now) {
+void Net::enqueue(Endpoint& peer, InjectedFault fault, const void* buf, size_t len, Time now,
+                  uint64_t correlation) {
     Packet packet;
+    packet.correlation_id = correlation;
     packet.bytes.assign(static_cast<const uint8_t*>(buf), static_cast<const uint8_t*>(buf) + len);
     if (fault.kind == FaultKind::PacketCorrupt) {
         for (uint8_t& byte : packet.bytes)
             byte ^= 0x01;
+        record_net(event_sink_, EventKind::network_corrupt, now, peer.node,
+                   scheduler_.current_task_id(),
+                   static_cast<int>(&peer - endpoints_.data()) + kVirtualFdBase,
+                   EventPayload{.value = static_cast<uint64_t>(len)}, correlation);
     }
     packet.deliver_at = fault.kind == FaultKind::PacketDelay ? now + fault.amount : now;
+    if (fault.kind == FaultKind::PacketDelay) {
+        record_net(event_sink_, EventKind::network_delay, now, peer.node,
+                   scheduler_.current_task_id(),
+                   static_cast<int>(&peer - endpoints_.data()) + kVirtualFdBase,
+                   EventPayload{.value = static_cast<uint64_t>(len), .amount_ns = fault.amount.ns},
+                   correlation);
+    }
     peer.rx_bytes += len;
     if (fault.kind == FaultKind::PacketReorder && !peer.rx.empty()) {
         peer.rx.insert(peer.rx.end() - 1, std::move(packet));
-        return;
+        record_net(event_sink_, EventKind::network_reorder, now, peer.node,
+                   scheduler_.current_task_id(),
+                   static_cast<int>(&peer - endpoints_.data()) + kVirtualFdBase,
+                   EventPayload{.value = static_cast<uint64_t>(len)}, correlation);
+    } else {
+        peer.rx.push_back(std::move(packet));
     }
-    peer.rx.push_back(std::move(packet));
+    record_net(event_sink_, EventKind::network_enqueue, now, peer.node,
+               scheduler_.current_task_id(),
+               static_cast<int>(&peer - endpoints_.data()) + kVirtualFdBase,
+               EventPayload{.value = static_cast<uint64_t>(len),
+                            .extra = static_cast<uint64_t>(peer.rx.size())},
+               correlation);
 }
 
 ssize_t Net::send(int fd, const void* buf, size_t len, int flags, InjectedFault fault) {
@@ -360,9 +425,39 @@ ssize_t Net::send(int fd, const void* buf, size_t len, int flags, InjectedFault 
     }
     const size_t count = fault.kind == FaultKind::ShortSend ? (len >= 2 ? len / 2 : len) : len;
     if (count == 0) return 0;
+    const uint64_t correlation = next_correlation_++;
+    const auto record_send = [&] {
+        record_net(event_sink_, EventKind::network_send, clock_.now(), ep->node,
+                   scheduler_.current_task_id(), fd,
+                   EventPayload{
+                       .related = static_cast<uint64_t>(peer - endpoints_.data() + kVirtualFdBase),
+                       .value = static_cast<uint64_t>(len),
+                       .extra = static_cast<uint64_t>(count)},
+                   correlation);
+    };
     // A partition drops the packet: the send still reports success, as a TCP buffer would.
-    if (separated(ep->node, peer->node)) return static_cast<ssize_t>(count);
-    if (fault.kind == FaultKind::PacketDrop) return static_cast<ssize_t>(count);
+    if (separated(ep->node, peer->node)) {
+        record_send();
+        record_net(event_sink_, EventKind::network_drop, clock_.now(), ep->node,
+                   scheduler_.current_task_id(), fd,
+                   EventPayload{
+                       .related = static_cast<uint64_t>(peer - endpoints_.data() + kVirtualFdBase),
+                       .value = static_cast<uint64_t>(count),
+                       .extra = static_cast<uint64_t>(NetworkDropReason::Partition)},
+                   correlation);
+        return static_cast<ssize_t>(count);
+    }
+    if (fault.kind == FaultKind::PacketDrop) {
+        record_send();
+        record_net(event_sink_, EventKind::network_drop, clock_.now(), ep->node,
+                   scheduler_.current_task_id(), fd,
+                   EventPayload{
+                       .related = static_cast<uint64_t>(peer - endpoints_.data() + kVirtualFdBase),
+                       .value = static_cast<uint64_t>(count),
+                       .extra = static_cast<uint64_t>(NetworkDropReason::PacketDrop)},
+                   correlation);
+        return static_cast<ssize_t>(count);
+    }
 
     const bool nonblocking = ep->nonblocking || (flags & MSG_DONTWAIT) != 0;
     while (!room_for(*peer, count)) {
@@ -393,7 +488,8 @@ ssize_t Net::send(int fd, const void* buf, size_t len, int flags, InjectedFault 
         peer = peer_of(*ep);
     }
 
-    enqueue(*peer, fault, buf, count, clock_.now());
+    record_send();
+    enqueue(*peer, fault, buf, count, clock_.now(), correlation);
     signal_change();
     return static_cast<ssize_t>(count);
 }
@@ -437,6 +533,7 @@ ssize_t Net::recv(int fd, void* buf, size_t len, int flags, InjectedFault fault)
             }
             const size_t available = packet.bytes.size() - packet.offset;
             const size_t count = available < len ? available : len;
+            const uint64_t packet_correlation = packet.correlation_id;
             std::memcpy(buf, packet.bytes.data() + packet.offset, count);
             if ((flags & MSG_PEEK) == 0) {
                 packet.offset += count;
@@ -445,6 +542,11 @@ ssize_t Net::recv(int fd, void* buf, size_t len, int flags, InjectedFault fault)
                 // Any consumption frees room, and a send blocked on room must be woken by it.
                 signal_change();
             }
+            record_net(event_sink_, EventKind::network_recv, clock_.now(), ep->node,
+                       scheduler_.current_task_id(), fd,
+                       EventPayload{.value = static_cast<uint64_t>(len),
+                                    .extra = static_cast<uint64_t>(count)},
+                       packet_correlation);
             return static_cast<ssize_t>(count);
         }
         if (ep->peer_closed) return 0;
@@ -505,6 +607,10 @@ int Net::shutdown(int fd, int how) {
         }
     }
     signal_change();
+    record_net(event_sink_, EventKind::network_endpoint_state, clock_.now(), ep->node,
+               scheduler_.current_task_id(), fd,
+               EventPayload{.value = static_cast<uint64_t>(how),
+                            .extra = static_cast<uint64_t>(ep->peer_closed ? 1 : 0)});
     return 0;
 }
 
@@ -528,6 +634,8 @@ int Net::close(int fd) {
         errno = EBADF;
         return -1;
     }
+    record_net(event_sink_, EventKind::network_close, clock_.now(), ep->node,
+               scheduler_.current_task_id(), fd);
     release(*ep);
     signal_change();
     return 0;
@@ -686,18 +794,37 @@ bool Net::separated(NodeId first, NodeId second) const {
 
 void Net::partition(const NodeSet& a, const NodeSet& b) {
     if (a.empty() || b.empty()) return;
+    const uint64_t correlation = next_correlation_++;
+    for (NodeId node : a) {
+        record_net(event_sink_, EventKind::network_partition, clock_.now(), node, kNoTask, -1,
+                   EventPayload{.value = 0}, correlation);
+    }
+    for (NodeId node : b) {
+        record_net(event_sink_, EventKind::network_partition, clock_.now(), node, kNoTask, -1,
+                   EventPayload{.value = 1}, correlation);
+    }
     splits_.push_back(Split{a, b});
     signal_change();
 }
 
-void Net::heal_partition(const NodeSet& a, const NodeSet& b) {
+bool Net::heal_partition(const NodeSet& a, const NodeSet& b) {
     for (auto split = splits_.begin(); split != splits_.end(); ++split) {
         if (split->a == a && split->b == b) {
+            const uint64_t correlation = next_correlation_++;
+            for (NodeId node : a) {
+                record_net(event_sink_, EventKind::network_heal, clock_.now(), node, kNoTask, -1,
+                           EventPayload{.value = 0}, correlation);
+            }
+            for (NodeId node : b) {
+                record_net(event_sink_, EventKind::network_heal, clock_.now(), node, kNoTask, -1,
+                           EventPayload{.value = 1}, correlation);
+            }
             splits_.erase(split);
             signal_change();
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 void Net::heal_all_partitions() {
@@ -710,12 +837,48 @@ void Net::crash_node(NodeId node) {
     bool changed = false;
     for (Endpoint& ep : endpoints_) {
         if (!ep.used || ep.node != node) continue;
+        const int fd = static_cast<int>(&ep - endpoints_.data()) + kVirtualFdBase;
+        record_net(event_sink_, EventKind::network_close, clock_.now(), ep.node, kNoTask, fd,
+                   EventPayload{.value = static_cast<uint64_t>(NetworkDropReason::Crash)});
         Endpoint* peer = peer_of(ep);
         if (peer != nullptr) peer->peer_closed = true;
         release(ep);
         changed = true;
     }
     if (changed) signal_change();
+}
+
+std::vector<EndpointInfo> Net::endpoint_infos() const {
+    std::vector<EndpointInfo> infos;
+    for (size_t index = 0; index < endpoints_.size(); ++index) {
+        const Endpoint& ep = endpoints_[index];
+        if (!ep.used) continue;
+        const Endpoint* peer = peer_of(ep);
+        infos.push_back(EndpointInfo{
+            kVirtualFdBase + static_cast<int>(index),
+            ep.node,
+            ep.listener,
+            ep.connected,
+            ep.awaiting_accept,
+            ep.nonblocking,
+            ep.peer_closed,
+            ep.port,
+            ep.peer_port,
+            peer != nullptr ? kVirtualFdBase + static_cast<int>(peer - endpoints_.data()) : -1,
+            static_cast<uint64_t>(ep.rx_bytes),
+            static_cast<uint64_t>(ep.rx.size()),
+            static_cast<uint64_t>(ep.pending.size()),
+        });
+    }
+    return infos;
+}
+
+std::vector<PartitionInfo> Net::partition_infos() const {
+    std::vector<PartitionInfo> infos;
+    infos.reserve(splits_.size());
+    for (const Split& split : splits_)
+        infos.push_back(PartitionInfo{split.a, split.b});
+    return infos;
 }
 
 } // namespace cosmos

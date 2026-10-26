@@ -44,6 +44,7 @@ enum class EventDomain : uint8_t {
     Random,
     Application,
     Operator,
+    Node,
     _Count
 };
 
@@ -67,6 +68,8 @@ constexpr const char* name_of(EventDomain domain) {
         return "application";
     case EventDomain::Operator:
         return "operator";
+    case EventDomain::Node:
+        return "node";
     case EventDomain::_Count:
         break;
     }
@@ -153,6 +156,11 @@ enum class EventKind : uint16_t {
 
     operator_command,
     operator_breakpoint_hit,
+
+    node_crash,
+    node_reboot,
+    node_pause,
+    node_resume,
 
     _Count
 };
@@ -246,6 +254,11 @@ inline constexpr std::array<EventKindInfo, kEventKindCount> kEventKinds{{
 
     {EventKind::operator_command, EventDomain::Operator, "operator.command"},
     {EventKind::operator_breakpoint_hit, EventDomain::Operator, "operator.breakpoint_hit"},
+
+    {EventKind::node_crash, EventDomain::Node, "node.crash"},
+    {EventKind::node_reboot, EventDomain::Node, "node.reboot"},
+    {EventKind::node_pause, EventDomain::Node, "node.pause"},
+    {EventKind::node_resume, EventDomain::Node, "node.resume"},
 }};
 
 constexpr bool event_kinds_are_consistent() {
@@ -323,7 +336,16 @@ struct EventPayload {
 // correlation reserve 0, so producers must number real task/correlation ids from 1.
 inline constexpr NodeId kNoNode = static_cast<NodeId>(-1);
 inline constexpr uint64_t kNoTask = 0;
+// The main fiber is a real task, but pthread_self() reports 0 for it. Events use this synthetic
+// id so `task == kNoTask` keeps meaning "absent"; spawned tasks are numbered from 2.
+inline constexpr uint64_t kMainTask = 1;
 inline constexpr uint64_t kNoCorrelation = 0;
+// Correlation ids are namespaced by producer so a consumer can group one universe's stream without
+// merging unrelated chains. Network send/partition ids occupy the first range, operator command
+// ids the second, and application span ids the third.
+inline constexpr uint64_t kNetworkCorrelationBase = 1ULL << 32;
+inline constexpr uint64_t kOperatorCorrelationBase = 2ULL << 32;
+inline constexpr uint64_t kApplicationCorrelationBase = 3ULL << 32;
 // v1 assigns sequences 0 .. kMaxEventSequence. UINT64_MAX itself is reserved so dropped + count
 // and first_seq + index can never overflow.
 inline constexpr uint64_t kMaxEventSequence = std::numeric_limits<uint64_t>::max() - 1;
@@ -365,6 +387,12 @@ struct EventGap {
 // assignment into that buffer. One writer only: a universe belongs to one OS thread, and this
 // class does not lock. Copying is disabled because it would allocate a second buffer; move it or
 // copy the decoded EventStream instead.
+// An inspection breakpoint. The hook sees every accepted event after it has been stamped with its
+// universe and sequence. It must not allocate, perform I/O, or call back into the simulation; a
+// true return asks the scheduler to pause at the next boundary. This is an observation hook, not a
+// producer: refusing or rewriting an event is not possible through it.
+using EventObserver = bool (*)(void* context, const Event& event) noexcept;
+
 class EventSink {
   public:
     explicit EventSink(size_t capacity = 0) : entries_(capacity), capacity_(capacity) {}
@@ -382,6 +410,24 @@ class EventSink {
 
     bool enabled() const { return capacity_ != 0; }
     bool seeded() const { return seeded_; }
+
+    // Installs the inspection breakpoint hook. The sink does not own the context; it must outlive
+    // the capture. Installing a hook on a disabled sink is legal and does nothing until enabled.
+    void set_observer(EventObserver observer, void* context) noexcept {
+        observer_ = observer;
+        observer_context_ = context;
+        observer_hit_ = false;
+    }
+    void clear_observer() noexcept {
+        observer_ = nullptr;
+        observer_context_ = nullptr;
+        observer_hit_ = false;
+    }
+    bool observer_hit() const noexcept { return observer_hit_; }
+    EventObserver observer() const noexcept { return observer_; }
+    void* observer_context() const noexcept { return observer_context_; }
+    // Called by the owner after it has observed the pause, before resuming the universe.
+    void clear_observer_hit() noexcept { observer_hit_ = false; }
     size_t capacity() const { return capacity_; }
     uint64_t universe_seed() const { return universe_seed_; }
 
@@ -417,13 +463,17 @@ class EventSink {
         if (!event.has_wall) event.wall_ns = 0;
         event.universe = universe_seed_;
         event.seq = next_seq_++;
-        entries_[write_] = event;
+        const size_t slot = write_;
+        entries_[slot] = event;
         if (++write_ == capacity_) write_ = 0;
         if (size_ < capacity_) {
             ++size_;
         } else {
             // The slot just written held the oldest event; the next slot is now the oldest.
             head_ = write_;
+        }
+        if (observer_ != nullptr && !observer_hit_) {
+            observer_hit_ = observer_(observer_context_, entries_[slot]);
         }
         return true;
     }
@@ -473,6 +523,9 @@ class EventSink {
         rejected_ = other.rejected_;
         universe_seed_ = other.universe_seed_;
         seeded_ = other.seeded_;
+        observer_ = other.observer_;
+        observer_context_ = other.observer_context_;
+        observer_hit_ = other.observer_hit_;
 
         other.entries_.clear();
         other.capacity_ = 0;
@@ -483,6 +536,9 @@ class EventSink {
         other.rejected_ = 0;
         other.universe_seed_ = 0;
         other.seeded_ = false;
+        other.observer_ = nullptr;
+        other.observer_context_ = nullptr;
+        other.observer_hit_ = false;
     }
 
     std::vector<Event> entries_{};
@@ -494,6 +550,9 @@ class EventSink {
     uint64_t rejected_ = 0;
     uint64_t universe_seed_ = 0;
     bool seeded_ = false;
+    EventObserver observer_ = nullptr;
+    void* observer_context_ = nullptr;
+    bool observer_hit_ = false;
 };
 
 // A decoded capture. `dropped` is the number of events the ring evicted before the first retained

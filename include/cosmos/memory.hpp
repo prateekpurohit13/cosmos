@@ -1,5 +1,8 @@
 #pragma once
 
+#include "cosmos/event_sink.hpp"
+#include "cosmos/time.hpp"
+
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -7,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <string>
 #include <unordered_map>
 
 extern "C" {
@@ -82,6 +86,11 @@ template <typename T, typename U>
 bool operator==(const RawRealAllocator<T>&, const RawRealAllocator<U>&) {
     return true;
 }
+
+// A string whose storage bypasses the tracked heap. Telemetry names, labels and open-span
+// bookkeeping can be created while a universe is current without spending a Fault draw or
+// polluting HeapStats; this is the same Rule 7 rule the engine containers follow.
+using RawString = std::basic_string<char, std::char_traits<char>, RawRealAllocator<char>>;
 
 class TrackedHeap;
 
@@ -174,6 +183,7 @@ class AllocRegistry {
 struct HeapStats {
     size_t total_allocated_bytes = 0;
     size_t active_allocations = 0;
+    size_t active_bytes = 0;
     size_t total_allocation_count = 0;
 };
 
@@ -238,6 +248,7 @@ class TrackedHeap {
 
         stats_.total_allocated_bytes += size;
         stats_.active_allocations++;
+        stats_.active_bytes += size;
         stats_.total_allocation_count++;
 
         void* user_ptr = static_cast<char*>(raw) + header_size;
@@ -261,12 +272,18 @@ class TrackedHeap {
         if (header->magic != COSMOS_CANARY_MAGIC) {
             // Corruption: keep the block registered so the bad memory is not silently freed via
             // a bogus address.
+            record_canary(user_ptr);
             return false;
         }
 
         header->magic = COSMOS_FREED_MAGIC;
         if (stats_.active_allocations > 0) {
             stats_.active_allocations--;
+        }
+        if (stats_.active_bytes >= header->requested_size) {
+            stats_.active_bytes -= header->requested_size;
+        } else {
+            stats_.active_bytes = 0;
         }
         detail::AllocRegistry::instance().unregister(user_ptr);
 
@@ -315,10 +332,34 @@ class TrackedHeap {
 
     const HeapStats& stats() const { return stats_; }
     size_t active_count() const { return stats_.active_allocations; }
+    size_t active_bytes() const { return stats_.active_bytes; }
+
+    // A universe-owned inspection sink, attached after construction and before the run. A canary
+    // corruption is recorded here because only the heap sees the bad header. Recording never
+    // allocates and never changes the free decision.
+    void set_event_sink(EventSink* sink, const VirtualClock* clock) {
+        event_sink_ = sink;
+        clock_ = clock;
+    }
 
   private:
+    void record_canary(void* user_ptr) noexcept {
+        if (event_sink_ == nullptr || !event_sink_->enabled() || !event_sink_->seeded()) return;
+        const auto* header = header_for(user_ptr);
+        Event event;
+        event.at = clock_ != nullptr ? clock_->now() : Time::zero();
+        event.kind = EventKind::memory_canary;
+        event.node = kNoNode;
+        event.payload.subject = header->alloc_id;
+        event.payload.value = header->magic;
+        event.payload.extra = COSMOS_CANARY_MAGIC;
+        event_sink_->record(event);
+    }
+
     uint64_t next_alloc_id_{0};
     HeapStats stats_{};
+    EventSink* event_sink_ = nullptr;
+    const VirtualClock* clock_ = nullptr;
 };
 
 } // namespace cosmos

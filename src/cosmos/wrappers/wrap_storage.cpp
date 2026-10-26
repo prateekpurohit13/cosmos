@@ -121,6 +121,14 @@ void track_open_for_node(cosmos::Simulator* sim, int fd, const char* path, int f
     sim->storage().track_open(fd, path, (flags & O_TRUNC) != 0);
 }
 
+// One storage producer. Called after the wrapped call has decided its result; recording cannot
+// change the file, errno or the durability model.
+void record_storage_event(cosmos::Simulator* sim, cosmos::EventKind kind, int fd,
+                          cosmos::EventPayload payload) {
+    payload.subject = static_cast<uint64_t>(fd);
+    cosmos::wrappers::record_event(sim, kind, payload);
+}
+
 // A successful open can land on fd 0 after the application closed stdin. The descriptor is then
 // the application's file, not the harness stream, so stdin ownership must be released first.
 void note_open_result(cosmos::Simulator* sim, int fd, const char* path, int flags) {
@@ -185,6 +193,10 @@ int __wrap_open(const char* pathname, int flags, ...) {
     // Only a successful open registers: a faulted open returned above and creates nothing.
     const int fd = __real_open(pathname, flags, mode);
     note_open_result(sim, fd, pathname, flags);
+    if (fd >= 0) {
+        record_storage_event(sim, cosmos::EventKind::storage_open, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
+    }
     return fd;
 }
 
@@ -224,6 +236,10 @@ int __wrap_open64(const char* pathname, int flags, ...) {
     }
     const int fd = __real_open64(pathname, flags, mode);
     note_open_result(sim, fd, pathname, flags);
+    if (fd >= 0) {
+        record_storage_event(sim, cosmos::EventKind::storage_open, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
+    }
     return fd;
 }
 
@@ -246,6 +262,10 @@ int __wrap___open_2(const char* pathname, int flags) {
     }
     const int fd = __real___open_2(pathname, flags);
     note_open_result(sim, fd, pathname, flags);
+    if (fd >= 0) {
+        record_storage_event(sim, cosmos::EventKind::storage_open, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
+    }
     return fd;
 }
 
@@ -268,6 +288,10 @@ int __wrap___open64_2(const char* pathname, int flags) {
     }
     const int fd = __real___open64_2(pathname, flags);
     note_open_result(sim, fd, pathname, flags);
+    if (fd >= 0) {
+        record_storage_event(sim, cosmos::EventKind::storage_open, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
+    }
     return fd;
 }
 
@@ -297,11 +321,18 @@ ssize_t __wrap_read(int fd, void* buf, size_t count) {
     switch (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::read)) {
     case cosmos::FaultKind::ReadEio:
         errno = EIO;
+        record_storage_event(sim, cosmos::EventKind::storage_read, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(EIO)});
         return -1;
     default:
         break;
     }
-    return __real_read(fd, buf, count);
+    const ssize_t ret = __real_read(fd, buf, count);
+    record_storage_event(sim, cosmos::EventKind::storage_read, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
+    return ret;
 }
 
 // glibc substitutes __read_chk for read() when the destination size is known; --wrap=read does not
@@ -328,11 +359,18 @@ ssize_t __wrap___read_chk(int fd, void* buf, size_t count, size_t buflen) {
     switch (cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::read)) {
     case cosmos::FaultKind::ReadEio:
         errno = EIO;
+        record_storage_event(sim, cosmos::EventKind::storage_read, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(EIO)});
         return -1;
     default:
         break;
     }
-    return __real___read_chk(fd, buf, count, buflen);
+    const ssize_t ret = __real___read_chk(fd, buf, count, buflen);
+    record_storage_event(sim, cosmos::EventKind::storage_read, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
+    return ret;
 }
 
 ssize_t __wrap_write(int fd, const void* buf, size_t count) {
@@ -353,6 +391,9 @@ ssize_t __wrap_write(int fd, const void* buf, size_t count) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_write, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(error)});
         return -1;
     }
 
@@ -360,6 +401,9 @@ ssize_t __wrap_write(int fd, const void* buf, size_t count) {
     const PreImage image = capture_pre_image(sim->storage(), fd, -1, count);
     const ssize_t ret = __real_write(fd, buf, write_request(kind, count));
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_write, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -384,12 +428,18 @@ ssize_t __wrap___write_chk(int fd, const void* buf, size_t count, size_t buflen)
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_write, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(error)});
         return -1;
     }
 
     const PreImage image = capture_pre_image(sim->storage(), fd, -1, count);
     const ssize_t ret = __real_write(fd, buf, write_request(kind, count));
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_write, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -413,12 +463,20 @@ ssize_t __wrap_pwrite(int fd, const void* buf, size_t count, off_t offset) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_pwrite, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(error),
+                                                  .amount_ns = static_cast<int64_t>(offset)});
         return -1;
     }
 
     const PreImage image = capture_pre_image(sim->storage(), fd, offset, count);
     const ssize_t ret = __real_pwrite(fd, buf, write_request(kind, count), offset);
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_pwrite, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret),
+                                              .amount_ns = static_cast<int64_t>(offset)});
     return ret;
 }
 
@@ -440,12 +498,20 @@ ssize_t __wrap_pwrite64(int fd, const void* buf, size_t count, off64_t offset) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_pwrite, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                                  .extra = static_cast<uint64_t>(error),
+                                                  .amount_ns = static_cast<int64_t>(offset)});
         return -1;
     }
 
     const PreImage image = capture_pre_image(sim->storage(), fd, static_cast<off_t>(offset), count);
     const ssize_t ret = __real_pwrite64(fd, buf, write_request(kind, count), offset);
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_pwrite, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret),
+                                              .amount_ns = static_cast<int64_t>(offset)});
     return ret;
 }
 
@@ -470,6 +536,9 @@ ssize_t __wrap_writev(int fd, const struct iovec* iov, int count) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_writev, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(total),
+                                                  .extra = static_cast<uint64_t>(error)});
         return -1;
     }
 
@@ -488,6 +557,9 @@ ssize_t __wrap_writev(int fd, const struct iovec* iov, int count) {
         ret = __real_writev(fd, iov, count);
     }
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_writev, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(total),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -510,6 +582,10 @@ ssize_t __wrap_pwritev(int fd, const struct iovec* iov, int count, off_t offset)
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::write);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_writev, fd,
+                             cosmos::EventPayload{.value = static_cast<uint64_t>(total),
+                                                  .extra = static_cast<uint64_t>(error),
+                                                  .amount_ns = static_cast<int64_t>(offset)});
         return -1;
     }
 
@@ -526,6 +602,10 @@ ssize_t __wrap_pwritev(int fd, const struct iovec* iov, int count, off_t offset)
         ret = __real_pwritev(fd, iov, count, offset);
     }
     record_success(sim->storage(), fd, image, ret, sim->current_node());
+    record_storage_event(sim, cosmos::EventKind::storage_writev, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(total),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret),
+                                              .amount_ns = static_cast<int64_t>(offset)});
     return ret;
 }
 
@@ -547,6 +627,8 @@ int __wrap_fsync(int fd) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::fsync);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_fsync, fd,
+                             cosmos::EventPayload{.extra = static_cast<uint64_t>(error)});
         return -1;
     }
     const int ret = __real_fsync(fd);
@@ -554,6 +636,8 @@ int __wrap_fsync(int fd) {
     if (ret == 0) {
         sim->storage().commit_fsync(fd);
     }
+    record_storage_event(sim, cosmos::EventKind::storage_fsync, fd,
+                         cosmos::EventPayload{.extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -577,12 +661,16 @@ int __wrap_fdatasync(int fd) {
         cosmos::wrappers::decide_for(sim, cosmos::FaultClass::Storage, cosmos::SiteId::fsync);
     if (const int error = storage_fault_errno(kind); error != 0) {
         errno = error;
+        record_storage_event(sim, cosmos::EventKind::storage_fdatasync, fd,
+                             cosmos::EventPayload{.extra = static_cast<uint64_t>(error)});
         return -1;
     }
     const int ret = __real_fdatasync(fd);
     if (ret == 0) {
         sim->storage().commit_fsync(fd);
     }
+    record_storage_event(sim, cosmos::EventKind::storage_fdatasync, fd,
+                         cosmos::EventPayload{.extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -606,6 +694,9 @@ int __wrap_ftruncate(int fd, off_t length) {
     if (ret == 0) {
         sim->storage().record_truncate(fd, static_cast<off_t>(length));
     }
+    record_storage_event(sim, cosmos::EventKind::storage_ftruncate, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(length),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 
@@ -627,6 +718,9 @@ int __wrap_ftruncate64(int fd, off64_t length) {
     if (ret == 0) {
         sim->storage().record_truncate(fd, static_cast<off_t>(length));
     }
+    record_storage_event(sim, cosmos::EventKind::storage_ftruncate, fd,
+                         cosmos::EventPayload{.value = static_cast<uint64_t>(length),
+                                              .extra = static_cast<uint64_t>(ret < 0 ? 0 : ret)});
     return ret;
 }
 

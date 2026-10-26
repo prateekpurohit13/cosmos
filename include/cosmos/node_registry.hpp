@@ -8,6 +8,11 @@
 
 namespace cosmos {
 
+struct NodeInfo {
+    NodeId id = 0;
+    bool live = true;
+};
+
 // Live/crashed state per simulated node. Episodes (P6) and storage durability both read it; who
 // may crash a node and when is the harness's decision, not this class's.
 class NodeRegistry {
@@ -36,6 +41,16 @@ class NodeRegistry {
 
     uint32_t crashed_count() const { return crashed_count_; }
     uint32_t live_count() const { return node_count() - crashed_count_; }
+
+    // Read-only rows for the node state tab, ordered by node id.
+    std::vector<NodeInfo> node_infos() const {
+        std::vector<NodeInfo> infos;
+        infos.reserve(crashed_.size());
+        for (size_t id = 0; id < crashed_.size(); ++id) {
+            infos.push_back(NodeInfo{static_cast<NodeId>(id), !crashed_[id]});
+        }
+        return infos;
+    }
 
     // Growing marks the new nodes live; shrinking refuses when it would forget a crashed one.
     [[nodiscard]] bool set_node_count(uint32_t count) {

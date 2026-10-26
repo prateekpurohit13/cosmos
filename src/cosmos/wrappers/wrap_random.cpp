@@ -87,6 +87,10 @@ ssize_t __wrap_getrandom(void* buf, size_t buflen, unsigned int flags) {
         out += chunk;
         remaining -= chunk;
     }
+    cosmos::wrappers::record_event(
+        sim, cosmos::EventKind::random_draw,
+        cosmos::EventPayload{.value = static_cast<uint64_t>(count),
+                             .extra = static_cast<uint64_t>(cosmos::StreamDomain::User)});
     return static_cast<ssize_t>(count);
 }
 
@@ -96,7 +100,13 @@ long int __wrap_random(void) {
     }
     // No SiteId::random and no legal FaultKind: value-only, never draws from a fault stream.
     auto* sim = cosmos::Simulator::current();
-    return static_cast<long int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
+    const long int value =
+        static_cast<long int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
+    cosmos::wrappers::record_event(
+        sim, cosmos::EventKind::random_draw,
+        cosmos::EventPayload{.value = static_cast<uint64_t>(value),
+                             .extra = static_cast<uint64_t>(cosmos::StreamDomain::User)});
+    return value;
 }
 
 // rand() does not re-enter our wrapped random(), so it needs its own wrapper or it leaks host
@@ -106,7 +116,12 @@ int __wrap_rand(void) {
         return __real_rand();
     }
     auto* sim = cosmos::Simulator::current();
-    return static_cast<int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
+    const int value = static_cast<int>(sim->user_rng().range(0, static_cast<uint64_t>(RAND_MAX)));
+    cosmos::wrappers::record_event(
+        sim, cosmos::EventKind::random_draw,
+        cosmos::EventPayload{.value = static_cast<uint64_t>(value),
+                             .extra = static_cast<uint64_t>(cosmos::StreamDomain::User)});
+    return value;
 }
 
 // Without a universe this is host code seeding the host RNG, and it reaches the real call like

@@ -62,8 +62,8 @@ void put_u64(std::string& bytes, size_t offset, uint64_t value) {
 void test_kind_table_is_complete_and_named() {
     // Pins the frozen U3.1 taxonomy: appending a kind is a deliberate contract change, not a
     // drive-by edit that silently rewrites the wire enum.
-    static_assert(cosmos::kEventKindCount == 70);
-    static_assert(cosmos::kEventDomainCount == 8);
+    static_assert(cosmos::kEventKindCount == 74);
+    static_assert(cosmos::kEventDomainCount == 9);
 
     for (size_t slot = 0; slot < cosmos::kEventKindCount; ++slot) {
         const cosmos::EventKindInfo& info = cosmos::kEventKinds[slot];
@@ -91,6 +91,7 @@ void test_kind_table_is_complete_and_named() {
            "application.annotation");
     assert(std::string_view(cosmos::name_of(EventKind::operator_breakpoint_hit)) ==
            "operator.breakpoint_hit");
+    assert(std::string_view(cosmos::name_of(EventKind::node_crash)) == "node.crash");
 
     std::cout << "[PASS] test_kind_table_is_complete_and_named" << std::endl;
 }

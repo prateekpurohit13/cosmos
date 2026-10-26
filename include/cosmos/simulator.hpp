@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cosmos/event_sink.hpp"
 #include "cosmos/fault_injector.hpp"
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
@@ -8,6 +9,7 @@
 #include "cosmos/random.hpp"
 #include "cosmos/storage.hpp"
 #include "cosmos/task.hpp"
+#include "cosmos/telemetry.hpp"
 #include "cosmos/time.hpp"
 #include <algorithm>
 #include <cassert>
@@ -84,6 +86,7 @@ template <typename Injector> class BasicSimulator {
     bool crash_node(NodeId node) {
         if (!nodes_.crash(node)) return false;
         net_.crash_node(node);
+        record_node_event(EventKind::node_crash, node);
         return true;
     }
 
@@ -100,6 +103,7 @@ template <typename Injector> class BasicSimulator {
             }
         }
         storage_.reboot(node, torn);
+        record_node_event(EventKind::node_reboot, node);
         return true;
     }
 
@@ -238,6 +242,98 @@ template <typename Injector> class BasicSimulator {
 
     bool has_injector() const { return injector_.has_value(); }
 
+    // Inspection event capture. Call enable_event_capture() before a universe starts: it allocates
+    // the fixed ring once, outside the wrapped allocation path. A disabled sink is a no-op for
+    // every producer, so instrumentation costs one branch when capture is off.
+    EventSink& event_sink() { return event_sink_; }
+    const EventSink& event_sink() const { return event_sink_; }
+    EventSink* event_sink_or_null() { return event_sink_.enabled() ? &event_sink_ : nullptr; }
+    const EventSink* event_sink_or_null() const {
+        return event_sink_.enabled() ? &event_sink_ : nullptr;
+    }
+
+    void enable_event_capture(size_t capacity) {
+        if (capacity == 0) return;
+        // A hook installed on the disabled sink is legal (see EventSink); enabling capture must
+        // not silently discard it.
+        const EventObserver observer = event_sink_.observer();
+        void* observer_context = event_sink_.observer_context();
+        event_sink_ = EventSink(capacity, seed_);
+        if (observer != nullptr) event_sink_.set_observer(observer, observer_context);
+        scheduler_.set_event_sink(&event_sink_);
+        net_.set_event_sink(&event_sink_);
+        storage_.set_event_sink(&event_sink_, &clock_);
+        heap_.set_event_sink(&event_sink_, &clock_);
+        telemetry_.attach(&event_sink_, &clock_);
+        sink_attached_ = true;
+    }
+
+    // Records a final summary leak event when the universe leaves allocations behind. The stream
+    // cannot carry a per-allocation table without a second hot-path map; the artifact state does.
+    void record_final_events() {
+        if (!event_sink_.enabled() || !event_sink_.seeded()) return;
+        const HeapStats& stats = heap_.stats();
+        if (stats.active_allocations == 0) return;
+        Event event;
+        event.at = clock_.now();
+        event.kind = EventKind::memory_leak;
+        event.node = kNoNode;
+        event.payload.value = static_cast<uint64_t>(stats.active_allocations);
+        event.payload.extra = static_cast<uint64_t>(stats.active_bytes);
+        event_sink_.record(event);
+    }
+
+    bool event_capture_attached() const { return sink_attached_; }
+
+    Telemetry& telemetry() { return telemetry_; }
+    const Telemetry& telemetry() const { return telemetry_; }
+
+    // Deterministic label registry for framework application events (always/sometimes/reachable).
+    // Telemetry has its own typed series registry; these labels are the check and coverage ids
+    // that already exist in ScenarioReport, so an event can be joined to the report without
+    // putting a string on the record path.
+    uint64_t application_label(std::string_view name) {
+        if (name.empty()) return 0;
+        for (size_t index = 0; index < application_labels_.size(); ++index) {
+            const RawString& label = application_labels_[index];
+            if (label.size() == name.size() &&
+                std::string_view(label.data(), label.size()) == name) {
+                return index + 1;
+            }
+        }
+        application_labels_.emplace_back(name.begin(), name.end());
+        return application_labels_.size();
+    }
+    const std::vector<RawString, RawRealAllocator<RawString>>& application_labels() const {
+        return application_labels_;
+    }
+
+    void record_application_event(EventKind kind, std::string_view label, uint64_t value,
+                                  int64_t amount_ns = 0) {
+        EventSink* sink = event_sink_or_null();
+        if (sink == nullptr || !sink->seeded()) return;
+        Event event;
+        event.at = now();
+        event.kind = kind;
+        event.node = current_node();
+        event.task = scheduler_.current_task_id();
+        event.payload.subject = application_label(label);
+        event.payload.value = value;
+        event.payload.amount_ns = amount_ns;
+        sink->record(event);
+    }
+
+  private:
+    void record_node_event(EventKind kind, NodeId node) {
+        if (!event_sink_.enabled() || !event_sink_.seeded()) return;
+        Event event;
+        event.at = clock_.now();
+        event.kind = kind;
+        event.node = node;
+        event_sink_.record(event);
+    }
+
+  public:
     // Returns nullptr when the slot is empty. A pointer rather than a checked reference because
     // this header compiles into the caller: an assert would vanish under NDEBUG and leave a
     // disengaged optional being dereferenced, and throwing inside __wrap_malloc is not an option.
@@ -334,6 +430,12 @@ template <typename Injector> class BasicSimulator {
     // Declared after clock_ on purpose: the injector borrows it, and destruction is reverse order.
     std::optional<Injector> injector_{};
     TraceOptions default_trace_options_{};
+    // Declared last: every producer above borrows it only through enable_event_capture(), which
+    // runs before the universe is current.
+    EventSink event_sink_{};
+    Telemetry telemetry_{};
+    std::vector<RawString, RawRealAllocator<RawString>> application_labels_{};
+    bool sink_attached_{false};
 };
 
 using Simulator = BasicSimulator<BasicFaultInjector<VirtualClock>>;

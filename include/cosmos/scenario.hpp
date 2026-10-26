@@ -217,6 +217,7 @@ class Scenario {
         }
         // Outside the guard: the harness's own bookkeeping must not become a block this universe
         // owns, or it contaminates the accounting it is about to report — and P2-S3's leak check.
+        if (!ok) sim_->record_application_event(EventKind::app_always, id, 0);
         report_.checks.push_back(CheckResult{std::move(id), std::move(detail), ok, at});
         if (!ok) report_.no_check_failed = false;
         return ok;
@@ -237,6 +238,7 @@ class Scenario {
     // observing the world, so ordering it after quiesce would buy nothing and surprise the natural
     // "set a flag in the workload, note it straight after run()" pattern.
     void note_covered(std::string id, bool hit) {
+        sim_->record_application_event(EventKind::app_reachable, id, hit ? 1 : 0);
         report_.coverage.push_back(CoverageNote{std::move(id), hit});
     }
 
@@ -246,12 +248,14 @@ class Scenario {
     // Mid-run invariant violations land here: unlike check(), this needs no preceding quiesce, so
     // an `always` inside the workload is recorded the moment it fails.
     void record_violation(std::string id, std::string detail = "") {
+        sim_->record_application_event(EventKind::app_always, id, 0);
         report_.checks.push_back(CheckResult{std::move(id), std::move(detail), false, sim_->now()});
         report_.no_check_failed = false;
     }
 
     // Coalesced by id: a workload may call this in a loop, and only the OR across calls matters.
     void record_sometimes(std::string id, bool hit) {
+        if (hit) sim_->record_application_event(EventKind::app_sometimes, id, 1);
         for (CoverageNote& note : report_.coverage) {
             if (note.id == id) {
                 note.hit = note.hit || hit;

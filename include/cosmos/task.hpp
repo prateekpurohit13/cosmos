@@ -6,6 +6,7 @@
 // which ready fiber runs next draws from the Schedule stream. Virtual time
 // advances only when no fiber is runnable, to the earliest timer.
 
+#include "cosmos/event_sink.hpp"
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/random.hpp"
@@ -57,6 +58,7 @@ struct Task {
 
 struct SimMutex {
     pthread_mutex_t* key = nullptr;
+    uint64_t id = 0;
     bool locked = false;
     Task* owner = nullptr;
     std::vector<Task*, RawRealAllocator<Task*>> waiters;
@@ -68,6 +70,7 @@ struct SimCond {
         pthread_mutex_t* mu = nullptr;
     };
     pthread_cond_t* key = nullptr;
+    uint64_t id = 0;
     std::vector<Waiter, RawRealAllocator<Waiter>> waiters;
 };
 
@@ -75,6 +78,41 @@ struct Timer {
     Time wakeup{};
     uint64_t seq = 0;
     Task* task = nullptr;
+};
+
+// Read-only state rows for the scheduler inspector (U3.3). They are produced on demand, outside
+// the hot path, and never expose a Task*: a UI must key on the deterministic ids below.
+struct TaskInfo {
+    uint64_t id = 0;
+    NodeId node = 0;
+    Task::State state = Task::State::Ready;
+    bool detached = false;
+    uint64_t stack_size = 0;
+    uint64_t joiners = 0;
+};
+
+struct MutexInfo {
+    uint64_t id = 0;
+    bool locked = false;
+    uint64_t owner = 0;
+    uint64_t waiters = 0;
+};
+
+struct CondInfo {
+    uint64_t id = 0;
+    uint64_t waiters = 0;
+};
+
+struct TimerInfo {
+    uint64_t seq = 0;
+    uint64_t task = 0;
+    Time wakeup{};
+};
+
+struct DeadlineInfo {
+    uint64_t id = 0;
+    Time at{};
+    bool armed = false;
 };
 
 // A virtual-time callback; `id` breaks ties so firing order follows arming order.
@@ -103,6 +141,10 @@ class Scheduler {
 
     // Node of the running fiber; 0 for the main fiber and for engine callbacks.
     NodeId current_node() const { return current_ != nullptr ? current_->node : 0; }
+
+    // Event identity for the current fiber: kNoTask when no fiber is running, kMainTask for the
+    // main fiber, otherwise the pthread id. pthread_self() still reports 0 for the main fiber.
+    uint64_t current_task_id() const;
 
     // Paused nodes stop at their next scheduler boundary; the resume re-readies their fibers.
     void pause_node(NodeId node);
@@ -154,8 +196,25 @@ class Scheduler {
     Task* current_task() { return current_; }
     const Task* current_task() const { return current_; }
     Rng& schedule_rng() { return schedule_rng_; }
+    const Rng& schedule_rng() const { return schedule_rng_; }
     size_t ready_count() const { return ready_.size(); }
     size_t task_count() const { return all_tasks_.size(); }
+    size_t parked_count() const { return parked_.size(); }
+    bool node_paused_at(size_t node) const { return node < paused_.size() && paused_[node]; }
+
+    // Read-only enumerators. They allocate, so they are for the state inspector, never a wrapper
+    // or a running-fiber hot path. Ordering is deterministic: task id, creation order, timer seq.
+    std::vector<TaskInfo> task_infos() const;
+    std::vector<MutexInfo> mutex_infos() const;
+    std::vector<CondInfo> cond_infos() const;
+    std::vector<TimerInfo> timer_infos() const;
+    std::vector<DeadlineInfo> deadline_infos() const;
+
+    // The inspection sink is owned by the universe. A null sink disables producer recording.
+    void set_event_sink(EventSink* sink) { event_sink_ = sink; }
+    EventSink* event_sink() const { return event_sink_; }
+    // True after an installed breakpoint matched and the scheduler has reached a safe boundary.
+    bool inspection_stop_requested() const;
 
     // Trampoline + exit path, public for makecontext.
     static void task_trampoline();
@@ -207,9 +266,12 @@ class Scheduler {
     size_t deadline_count_ = 0;
     uint64_t next_deadline_id_ = 1;
     uint64_t timer_seq_ = 0;
-    uint64_t next_id_ = 1;
+    uint64_t next_id_ = 2; // 1 is kMainTask; spawned ids never collide with it
+    uint64_t next_mutex_id_ = 1;
+    uint64_t next_cond_id_ = 1;
     bool deadlocked_ = false;
     Task* drain_requester_ = nullptr;
+    EventSink* event_sink_ = nullptr;
 };
 
 } // namespace cosmos

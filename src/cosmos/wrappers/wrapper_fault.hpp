@@ -3,6 +3,7 @@
 // Header-only on purpose: each __wrap_* must stay in its own section so --gc-sections can discard
 // an unused wrapper without dragging in the others (docs/design.md §2).
 
+#include "cosmos/event_sink.hpp"
 #include "cosmos/faults.hpp"
 // For kVirtualFdBase: the storage surface must not treat the socket layer's fds as files.
 #include "cosmos/net.hpp"
@@ -136,6 +137,25 @@ inline constexpr bool memory_calloc_eligible(size_t nmemb, size_t size) {
 inline constexpr bool memory_realloc_eligible(const void* ptr, size_t size, bool owned_by_sim) {
     if (size == 0) return false;
     return ptr == nullptr || owned_by_sim;
+}
+
+// One inspection event from a wrapper. This is observation only: it runs after the wrapped call
+// has decided its result and never allocates, faults, or changes errno. A disabled capture costs
+// one null check. Events are attributed to the running fiber's node and task.
+template <typename Sim>
+void record_event(Sim* sim, EventKind kind, EventPayload payload = {},
+                  uint64_t correlation = kNoCorrelation) {
+    if (sim == nullptr) return;
+    EventSink* sink = sim->event_sink_or_null();
+    if (sink == nullptr || !sink->seeded()) return;
+    Event event;
+    event.at = sim->now();
+    event.kind = kind;
+    event.node = sim->current_node();
+    event.task = sim->scheduler().current_task_id();
+    event.correlation_id = correlation;
+    event.payload = payload;
+    sink->record(event);
 }
 
 } // namespace cosmos::wrappers

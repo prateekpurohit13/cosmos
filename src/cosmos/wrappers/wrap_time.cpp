@@ -66,8 +66,18 @@ int __wrap_clock_gettime(clockid_t clock_id, struct timespec* tp) {
         // Forward and permanent: validate() rejects a negative amount, and moving the universe
         // clock is what keeps every later reading monotonic (Rule 15).
         sim->clock().advance(fault.amount);
+        cosmos::wrappers::record_event(
+            sim, cosmos::EventKind::clock_step,
+            cosmos::EventPayload{.subject = static_cast<uint64_t>(clock_id),
+                                 .value = static_cast<uint64_t>(sim->now().ns),
+                                 .amount_ns = fault.amount.ns});
         return sim->clock().clock_gettime(clock_id, tp);
     }
+    cosmos::wrappers::record_event(
+        sim, cosmos::EventKind::clock_gettime,
+        cosmos::EventPayload{.subject = static_cast<uint64_t>(clock_id),
+                             .value = static_cast<uint64_t>(sim->now().ns),
+                             .extra = static_cast<uint64_t>(sim->clock().realtime_ns())});
     return 0;
 }
 
@@ -84,6 +94,10 @@ int __wrap_nanosleep(const struct timespec* req, struct timespec* rem) {
         return sim->scheduler().sleep_ns(req, rem);
     }
     const int64_t requested_ns = cosmos::wrappers::clock_timespec_ns(*req);
+    cosmos::wrappers::record_event(
+        sim, cosmos::EventKind::clock_sleep,
+        cosmos::EventPayload{.value = static_cast<uint64_t>(requested_ns),
+                             .amount_ns = requested_ns});
 
     // Scoped to the decision only: the sleeps below suspend this fiber and run siblings
     // on the same OS thread, which must not observe in_wrapper_logic (fibers share it).
@@ -122,6 +136,10 @@ int __wrap_clock_nanosleep(clockid_t clock_id, int flags, const struct timespec*
         return sim->scheduler().sleep_clock(clock_id, flags, req, rem);
     }
     int64_t sleep_ns = cosmos::wrappers::clock_timespec_ns(*req);
+    cosmos::wrappers::record_event(sim, cosmos::EventKind::clock_sleep,
+                                   cosmos::EventPayload{.value = static_cast<uint64_t>(sleep_ns),
+                                                        .extra = static_cast<uint64_t>(flags),
+                                                        .amount_ns = sleep_ns});
 
     if (flags == TIMER_ABSTIME) {
         // An absolute request names a deadline, not a length, so only the time left until it can be
@@ -171,7 +189,16 @@ int __wrap_gettimeofday(struct timeval* tv, void* tz) {
     if (!cosmos::Simulator::has_current()) {
         return __real_gettimeofday(tv, tz);
     }
-    return cosmos::Simulator::current()->clock().gettimeofday(tv, tz);
+    cosmos::wrappers::ReentrancyGuard guard;
+    auto* sim = cosmos::Simulator::current();
+    const int rc = sim->clock().gettimeofday(tv, tz);
+    if (rc == 0) {
+        cosmos::wrappers::record_event(
+            sim, cosmos::EventKind::clock_gettimeofday,
+            cosmos::EventPayload{.value = static_cast<uint64_t>(sim->now().ns),
+                                 .extra = static_cast<uint64_t>(sim->clock().realtime_ns())});
+    }
+    return rc;
 }
 
 } // extern "C"

@@ -9,6 +9,7 @@
 // MSG_WAITALL is ignored (a short read is returned instead of waiting for the full
 // length), as are the out-of-band flags.
 
+#include "cosmos/event_sink.hpp"
 #include "cosmos/faults.hpp"
 #include "cosmos/memory.hpp"
 #include "cosmos/task.hpp"
@@ -46,6 +47,33 @@ struct EndpointState {
     bool nonblocking = false;
 };
 
+// Read-only rows for the network state tab. `fd` is the virtual descriptor, `peer_fd` the linked
+// peer when the back-link is still valid (0 otherwise). rx_packets counts queued packets, not
+// bytes, so a delayed packet is visible before it becomes readable.
+struct EndpointInfo {
+    int fd = -1;
+    NodeId node = 0;
+    bool listener = false;
+    bool connected = false;
+    bool awaiting_accept = false;
+    bool nonblocking = false;
+    bool peer_closed = false;
+    uint16_t port = 0;
+    uint16_t peer_port = 0;
+    int peer_fd = -1;
+    uint64_t rx_bytes = 0;
+    uint64_t rx_packets = 0;
+    uint64_t pending_accepts = 0;
+};
+
+struct PartitionInfo {
+    std::vector<NodeId> a;
+    std::vector<NodeId> b;
+};
+
+// Why a packet never reached a receive queue. Append-only, like every other event code.
+enum class NetworkDropReason : uint64_t { Partition = 1, PacketDrop = 2, Crash = 3 };
+
 // True for any fd number the virtual layer owns, whether currently open or not.
 // Used by wrappers to distinguish virtual fds from host fds without a Simulator.
 inline constexpr bool is_virtual_fd(int fd) {
@@ -78,15 +106,22 @@ class Net {
 
     // Topology (docs design §6): traffic between the two node groups is dropped until healed.
     void partition(const NodeSet& a, const NodeSet& b);
-    void heal_partition(const NodeSet& a, const NodeSet& b);
+    bool heal_partition(const NodeSet& a, const NodeSet& b);
     void heal_all_partitions();
     size_t partition_count() const { return splits_.size(); }
     // Closes every endpoint owned by the node; peers observe the close.
     void crash_node(NodeId node);
 
+    // Read-only enumerators for the state inspector (U3.3). Deterministic order (fd, insertion).
+    std::vector<EndpointInfo> endpoint_infos() const;
+    std::vector<PartitionInfo> partition_infos() const;
+    void set_event_sink(EventSink* sink) { event_sink_ = sink; }
+    EventSink* event_sink() const { return event_sink_; }
+
   private:
     struct Packet {
         Time deliver_at{};
+        uint64_t correlation_id = 0;
         std::vector<uint8_t, RawRealAllocator<uint8_t>> bytes{};
         size_t offset = 0;
     };
@@ -127,7 +162,8 @@ class Net {
     bool writable(const Endpoint& ep) const;
     bool room_for(const Endpoint& ep, size_t count) const;
     void signal_change();
-    void enqueue(Endpoint& peer, InjectedFault fault, const void* buf, size_t len, Time now);
+    void enqueue(Endpoint& peer, InjectedFault fault, const void* buf, size_t len, Time now,
+                 uint64_t correlation);
     bool separated(NodeId first, NodeId second) const;
 
     struct Split {
@@ -140,6 +176,8 @@ class Net {
     std::array<Endpoint, kMaxEndpoints> endpoints_{};
     std::vector<Split> splits_;
     uint16_t next_port_ = 40000;
+    uint64_t next_correlation_ = kNetworkCorrelationBase;
+    EventSink* event_sink_ = nullptr;
     pthread_mutex_t mu_ = PTHREAD_MUTEX_INITIALIZER;
     pthread_cond_t cond_ = PTHREAD_COND_INITIALIZER;
 };

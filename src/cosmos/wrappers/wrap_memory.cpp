@@ -51,6 +51,38 @@ bool decided_oom(cosmos::Simulator* sim, cosmos::SiteId site) {
            cosmos::FaultKind::OutOfMemory;
 }
 
+// One memory producer. The heap owns allocation ids; this only reports what the heap already
+// decided, so recording can never change a free or realloc outcome.
+void record_memory(cosmos::Simulator* sim, cosmos::EventKind kind, cosmos::EventPayload payload) {
+    cosmos::EventSink* sink = sim->event_sink_or_null();
+    if (sink == nullptr || !sink->seeded()) return;
+    cosmos::Event event;
+    event.at = sim->now();
+    event.kind = kind;
+    event.node = sim->current_node();
+    event.task = sim->scheduler().current_task_id();
+    event.payload = payload;
+    sink->record(event);
+}
+
+void record_allocation(cosmos::Simulator* sim, void* ptr) {
+    if (ptr == nullptr) return;
+    const auto* header = cosmos::header_for(ptr);
+    record_memory(sim, cosmos::EventKind::memory_alloc,
+                  cosmos::EventPayload{
+                      .subject = header->alloc_id,
+                      .value = static_cast<uint64_t>(header->requested_size),
+                      .extra = static_cast<uint64_t>(sim->heap().stats().active_allocations)});
+}
+
+void record_free(cosmos::Simulator* sim, uint64_t alloc_id, size_t size) {
+    record_memory(sim, cosmos::EventKind::memory_free,
+                  cosmos::EventPayload{
+                      .subject = alloc_id,
+                      .value = static_cast<uint64_t>(size),
+                      .extra = static_cast<uint64_t>(sim->heap().stats().active_allocations)});
+}
+
 } // namespace
 
 extern "C" {
@@ -73,7 +105,9 @@ void* __wrap_malloc(size_t size) {
         return nullptr;
     }
 
-    return sim->heap().allocate(size);
+    void* ptr = sim->heap().allocate(size);
+    record_allocation(sim, ptr);
+    return ptr;
 }
 
 void __wrap_free(void* ptr) {
@@ -85,11 +119,22 @@ void __wrap_free(void* ptr) {
     // address header_size past the block and corrupt the host allocator instead.
     auto ownership = cosmos::detail::AllocRegistry::instance().ownership_of(ptr);
     if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
-        ownership.owner->deallocate(ptr);
+        const auto* header = cosmos::header_for(ptr);
+        const uint64_t alloc_id = header->alloc_id;
+        const size_t size = header->requested_size;
+        if (ownership.owner->deallocate(ptr) && cosmos::Simulator::has_current()) {
+            record_free(cosmos::Simulator::current(), alloc_id, size);
+        }
         return;
     }
     if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
+        const auto* header = cosmos::header_for(ptr);
+        const uint64_t alloc_id = header->alloc_id;
+        const size_t size = header->requested_size;
         free_orphaned_block(ptr);
+        if (cosmos::Simulator::has_current()) {
+            record_free(cosmos::Simulator::current(), alloc_id, size);
+        }
         return;
     }
 
@@ -118,6 +163,7 @@ void* __wrap_calloc(size_t nmemb, size_t size) {
     void* ptr = sim->heap().allocate(total_size);
     if (ptr) {
         memset(ptr, 0, total_size);
+        record_allocation(sim, ptr);
     }
     return ptr;
 }
@@ -132,9 +178,20 @@ void* __wrap_realloc(void* ptr, size_t size) {
 
     if (size == 0) {
         if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
-            ownership.owner->deallocate(ptr);
+            const auto* header = cosmos::header_for(ptr);
+            const uint64_t alloc_id = header->alloc_id;
+            const size_t old_size = header->requested_size;
+            if (ownership.owner->deallocate(ptr) && cosmos::Simulator::has_current()) {
+                record_free(cosmos::Simulator::current(), alloc_id, old_size);
+            }
         } else if (ownership.kind == cosmos::detail::OwnerKind::Orphaned) {
+            const auto* header = cosmos::header_for(ptr);
+            const uint64_t alloc_id = header->alloc_id;
+            const size_t old_size = header->requested_size;
             free_orphaned_block(ptr);
+            if (cosmos::Simulator::has_current()) {
+                record_free(cosmos::Simulator::current(), alloc_id, old_size);
+            }
         } else if (ptr) {
             __real_free(ptr);
         }
@@ -151,7 +208,9 @@ void* __wrap_realloc(void* ptr, size_t size) {
             errno = ENOMEM;
             return nullptr;
         }
-        return sim->heap().allocate(size);
+        void* allocated = sim->heap().allocate(size);
+        record_allocation(sim, allocated);
+        return allocated;
     }
 
     if (ownership.kind == cosmos::detail::OwnerKind::Owned) {
@@ -163,9 +222,21 @@ void* __wrap_realloc(void* ptr, size_t size) {
                 return nullptr;
             }
         }
+        const auto* old_header = cosmos::header_for(ptr);
+        const uint64_t old_id = old_header->alloc_id;
+        const size_t old_size = old_header->requested_size;
         void* new_ptr = ownership.owner->reallocate(ptr, size);
         if (!new_ptr) {
             errno = ENOMEM;
+            return nullptr;
+        }
+        if (cosmos::Simulator::has_current()) {
+            const auto* new_header = cosmos::header_for(new_ptr);
+            record_memory(cosmos::Simulator::current(), cosmos::EventKind::memory_realloc,
+                          cosmos::EventPayload{.subject = new_header->alloc_id,
+                                               .related = old_id,
+                                               .value = static_cast<uint64_t>(size),
+                                               .extra = static_cast<uint64_t>(old_size)});
         }
         return new_ptr;
     }

@@ -585,6 +585,28 @@ add_test(NAME test_trace COMMAND test_trace)
 
 # The event sink records into a preallocated ring; the wrapped allocator channel proves that a
 # record is not an application allocation and that a full ring counts the eviction.
+add_executable(test_inspection test_inspection.cpp)
+target_link_libraries(test_inspection PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_inspection PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_inspection PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=rand"
+    )
+endif()
+
+add_test(NAME test_inspection COMMAND test_inspection)
+
 add_executable(test_event_sink test_event_sink.cpp)
 target_link_libraries(test_event_sink PRIVATE cosmos)
 
@@ -605,6 +627,29 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_test(NAME test_event_sink COMMAND test_event_sink)
+
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_inspection_static test_inspection.cpp)
+    target_link_libraries(test_inspection_static PRIVATE cosmos)
+    target_compile_options(test_inspection_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_inspection_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+        "-Wl,--wrap=rand"
+    )
+    add_test(NAME test_inspection_static COMMAND test_inspection_static)
+else()
+    message(STATUS "test_inspection_static skipped: no static libstdc++ for this toolchain")
+endif()
 
 # operator new only reaches the wrappers under a static libstdc++, so the no-allocation claim is
 # only measurable in this second link.

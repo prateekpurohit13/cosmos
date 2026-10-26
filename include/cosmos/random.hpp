@@ -34,6 +34,7 @@ class Rng {
     }
 
     uint64_t next() {
+        ++draws_;
         const uint64_t result = rotate_left(state_[1] * 5, 7) * 9;
         const uint64_t t = state_[1] << 17;
 
@@ -67,10 +68,15 @@ class Rng {
 
     bool coin(double p) { return uniform() < p; }
 
+    // Number of values drawn from this stream. Inspection metadata only; it is not part of the
+    // stream state and replay never reads it.
+    uint64_t draws() const { return draws_; }
+
   private:
     static uint64_t rotate_left(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
 
     uint64_t state_[4];
+    uint64_t draws_{0};
 };
 
 enum class StreamDomain : uint64_t {

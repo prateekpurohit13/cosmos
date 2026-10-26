@@ -1,6 +1,8 @@
 #pragma once
 
+#include "cosmos/event_sink.hpp"
 #include "cosmos/faults.hpp"
+#include "cosmos/time.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +14,21 @@
 #include <vector>
 
 namespace cosmos {
+
+// Read-only row for the storage state tab. Sizes are bytes, offsets are virtual file positions.
+// One fd can appear under more than one file only after a rebuild; the model never shares fds.
+struct FileInfo {
+    uint64_t id = 0;
+    std::string path{};
+    NodeId node = 0;
+    int64_t durable_size = 0;
+    uint64_t unsynced_records = 0;
+    uint64_t unsynced_bytes = 0;
+    int64_t last_sync_offset = 0;
+    uint64_t last_sync_length = 0;
+    bool degraded = false;
+    uint64_t open_fds = 0;
+};
 
 // Simulated durability (docs/design.md §8): a write lands in an un-synced page cache, fsync makes
 // it durable, and a reboot discards whatever was not. Bytes stay in the host file so lseek and
@@ -52,6 +69,17 @@ class StorageModel {
     size_t tracked_bytes() const { return tracked_bytes_; }
     size_t file_count() const { return files_.size(); }
 
+    // Read-only enumerator for the state inspector (U3.3), ordered by file id (creation order).
+    std::vector<FileInfo> file_infos() const;
+
+    // The inspection sink is owned by the universe; a null sink disables producer recording. The
+    // clock is borrowed and may be null in tests, in which case events carry virtual time zero.
+    void set_event_sink(EventSink* sink, const VirtualClock* clock) {
+        event_sink_ = sink;
+        clock_ = clock;
+    }
+    EventSink* event_sink() const { return event_sink_; }
+
   private:
     // One write: where it started, how many bytes it wrote, and the bytes that were there.
     struct WriteRecord {
@@ -61,6 +89,7 @@ class StorageModel {
     };
 
     struct FileState {
+        uint64_t id = 0;
         NodeId node = 0;
         off_t durable_size = 0;
         std::vector<WriteRecord> unsynced;
@@ -76,7 +105,10 @@ class StorageModel {
     std::map<int, std::string> fd_paths_;
     size_t tracked_bytes_{0};
     NodeId active_node_{0};
+    uint64_t next_file_id_{1};
     bool degraded_{false};
+    EventSink* event_sink_ = nullptr;
+    const VirtualClock* clock_ = nullptr;
 };
 
 // The bytes a torn reboot zeroes at the end of the last synced range.

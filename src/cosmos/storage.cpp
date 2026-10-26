@@ -21,6 +21,19 @@ namespace cosmos {
 
 namespace {
 
+void record_storage(EventSink* sink, const VirtualClock* clock, EventKind kind, NodeId node,
+                    EventPayload payload, uint64_t correlation = kNoCorrelation) {
+    if (sink == nullptr || !sink->enabled() || !sink->seeded()) return;
+    Event event;
+    event.at = clock != nullptr ? clock->now() : Time::zero();
+    event.kind = kind;
+    event.node = node;
+    event.task = kNoTask;
+    event.correlation_id = correlation;
+    event.payload = payload;
+    sink->record(event);
+}
+
 // Reports the kernel size; false when fstat fails, because "unknown" must not read as "empty".
 bool size_of(int fd, off_t& size) {
     struct stat info{};
@@ -68,6 +81,7 @@ void StorageModel::track_open(int fd, std::string path, bool truncate) {
     FileState& file = entry->second;
     if (inserted) {
         // The owner is the opener; every later write re-homes the file to its writer.
+        file.id = next_file_id_++;
         file.node = active_node_;
         file.durable_size = actual;
     } else if (actual < file.durable_size) {
@@ -101,6 +115,12 @@ void StorageModel::record_write(int fd, off_t offset, std::string_view previous,
 
     file.unsynced.push_back(WriteRecord{offset, length, std::string(previous)});
     tracked_bytes_ += previous.size();
+    record_storage(event_sink_, clock_, EventKind::storage_dirty, file.node,
+                   EventPayload{.subject = file.id,
+                                .related = static_cast<uint64_t>(fd),
+                                .value = static_cast<uint64_t>(length),
+                                .extra = static_cast<uint64_t>(tracked_bytes_),
+                                .amount_ns = static_cast<int64_t>(offset)});
 
     if (tracked_bytes_ > kMaxTrackedBytes) {
         // Past the budget the file stops being discard-tracked: holding half a history would
@@ -108,6 +128,9 @@ void StorageModel::record_write(int fd, off_t offset, std::string_view previous,
         degraded_ = true;
         file.degraded = true;
         drop_unsynced(file);
+        record_storage(
+            event_sink_, clock_, EventKind::storage_degraded, file.node,
+            EventPayload{.subject = file.id, .value = static_cast<uint64_t>(tracked_bytes_)});
     }
 }
 
@@ -125,12 +148,20 @@ void StorageModel::commit_fsync(int fd) {
         file.degraded = true;
         drop_unsynced(file);
         file.last_sync.reset();
+        record_storage(event_sink_, clock_, EventKind::storage_degraded, file.node,
+                       EventPayload{.subject = file.id});
         return;
     }
     // fsync's boundary is the file's size as the kernel reports it.
+    const uint64_t committed = static_cast<uint64_t>(file.unsynced.size());
     file.durable_size = actual;
     if (!file.unsynced.empty()) file.last_sync = file.unsynced.back();
     drop_unsynced(file);
+    record_storage(event_sink_, clock_, EventKind::storage_durable, file.node,
+                   EventPayload{.subject = file.id,
+                                .related = static_cast<uint64_t>(fd),
+                                .value = static_cast<uint64_t>(actual),
+                                .extra = committed});
 }
 
 void StorageModel::record_truncate(int fd, off_t new_size) {
@@ -176,7 +207,17 @@ void StorageModel::reboot(NodeId node, bool torn) {
             break;
         }
         const bool borrowed = fd >= 0;
+        const uint64_t unsynced_count = static_cast<uint64_t>(file.unsynced.size());
         rollback(file, fd, path);
+        // rollback() records storage.degraded when it cannot restore; do not also claim the
+        // records were put back.
+        if (!file.degraded) {
+            record_storage(event_sink_, clock_, EventKind::storage_rollback, file.node,
+                           EventPayload{.subject = file.id,
+                                        .value = unsynced_count,
+                                        .extra = static_cast<uint64_t>(file.durable_size),
+                                        .amount_ns = 0});
+        }
         if (fd < 0) {
             // The file is gone or unopenable, so its bytes cannot be un-written.
             drop_unsynced(file);
@@ -194,6 +235,13 @@ void StorageModel::reboot(NodeId node, bool torn) {
                 static_cast<ssize_t>(zeros.size())) {
                 degraded_ = true;
                 file.degraded = true;
+                record_storage(event_sink_, clock_, EventKind::storage_degraded, file.node,
+                               EventPayload{.subject = file.id});
+            } else {
+                record_storage(event_sink_, clock_, EventKind::storage_torn, file.node,
+                               EventPayload{.subject = file.id,
+                                            .value = static_cast<uint64_t>(tear),
+                                            .amount_ns = static_cast<int64_t>(at)});
             }
         }
 
@@ -209,6 +257,8 @@ void StorageModel::rollback(FileState& file, int& fd, const std::string& path) {
         // The model cannot restore this file; stop pretending it can.
         degraded_ = true;
         file.degraded = true;
+        record_storage(event_sink_, clock_, EventKind::storage_degraded, file.node,
+                       EventPayload{.subject = file.id});
         return;
     }
 
@@ -220,6 +270,8 @@ void StorageModel::rollback(FileState& file, int& fd, const std::string& path) {
             // A partial restore is not the state the crash produced.
             degraded_ = true;
             file.degraded = true;
+            record_storage(event_sink_, clock_, EventKind::storage_degraded, file.node,
+                           EventPayload{.subject = file.id});
             return;
         }
     }
@@ -227,6 +279,8 @@ void StorageModel::rollback(FileState& file, int& fd, const std::string& path) {
     if (host_ftruncate(fd, file.durable_size) != 0) {
         degraded_ = true;
         file.degraded = true;
+        record_storage(event_sink_, clock_, EventKind::storage_degraded, file.node,
+                       EventPayload{.subject = file.id});
     }
 }
 
@@ -234,6 +288,36 @@ void StorageModel::drop_unsynced(FileState& file) {
     for (const WriteRecord& record : file.unsynced)
         tracked_bytes_ -= record.previous.size();
     file.unsynced.clear();
+}
+
+std::vector<FileInfo> StorageModel::file_infos() const {
+    std::vector<FileInfo> infos;
+    infos.reserve(files_.size());
+    for (const auto& [path, file] : files_) {
+        uint64_t open_fds = 0;
+        for (const auto& [fd, fd_path] : fd_paths_) {
+            (void)fd;
+            if (fd_path == path) ++open_fds;
+        }
+        uint64_t unsynced_bytes = 0;
+        for (const WriteRecord& record : file.unsynced)
+            unsynced_bytes += record.previous.size();
+        infos.push_back(FileInfo{
+            file.id,
+            path,
+            file.node,
+            static_cast<int64_t>(file.durable_size),
+            static_cast<uint64_t>(file.unsynced.size()),
+            unsynced_bytes,
+            file.last_sync.has_value() ? static_cast<int64_t>(file.last_sync->offset) : 0,
+            file.last_sync.has_value() ? static_cast<uint64_t>(file.last_sync->length) : 0,
+            file.degraded,
+            open_fds,
+        });
+    }
+    std::sort(infos.begin(), infos.end(),
+              [](const FileInfo& left, const FileInfo& right) { return left.id < right.id; });
+    return infos;
 }
 
 } // namespace cosmos

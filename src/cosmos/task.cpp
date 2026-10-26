@@ -1,5 +1,6 @@
 #include "cosmos/task.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <ctime>
@@ -41,6 +42,33 @@ bool timer_holds(const std::vector<Timer, RawRealAllocator<Timer>>& timers, Task
     return false;
 }
 
+// Event task identity. The main fiber's pthread id is 0, which the envelope reserves for absence.
+uint64_t event_task_id(const Task* task) {
+    if (task == nullptr) return kNoTask;
+    return task->id == 0 ? kMainTask : static_cast<uint64_t>(task->id);
+}
+
+// One scheduler producer. Recording is a stamped assignment into a preallocated ring; it never
+// allocates and never changes scheduler state. A disabled or unseeded sink is a no-op.
+void record_scheduler(EventSink* sink, EventKind kind, Time at, uint64_t task, NodeId node,
+                      EventPayload payload = {}, uint64_t correlation = kNoCorrelation) {
+    if (sink == nullptr || !sink->enabled() || !sink->seeded()) return;
+    Event event;
+    event.at = at;
+    event.kind = kind;
+    event.node = node;
+    event.task = task;
+    event.correlation_id = correlation;
+    event.payload = payload;
+    sink->record(event);
+}
+
+void record_task(EventSink* sink, EventKind kind, Time at, const Task* task,
+                 EventPayload payload = {}, uint64_t correlation = kNoCorrelation) {
+    record_scheduler(sink, kind, at, event_task_id(task), task != nullptr ? task->node : kNoNode,
+                     payload, correlation);
+}
+
 void sleep_block(Scheduler* sched);
 
 } // namespace
@@ -80,6 +108,7 @@ SimMutex& Scheduler::get_or_create_mutex(pthread_mutex_t* key) {
     if (SimMutex* found = find_mutex(key)) return *found;
     SimMutex mu;
     mu.key = key;
+    mu.id = next_mutex_id_++;
     mutexes_.push_back(mu);
     return mutexes_.back();
 }
@@ -95,11 +124,18 @@ SimCond& Scheduler::get_or_create_cond(pthread_cond_t* key) {
     if (SimCond* found = find_cond(key)) return *found;
     SimCond cond;
     cond.key = key;
+    cond.id = next_cond_id_++;
     conds_.push_back(cond);
     return conds_.back();
 }
 
 Task* Scheduler::pick_next_ready() {
+    // A matched breakpoint yields to the drain owner at the next scheduler choice. No ready task
+    // is popped, so resuming the drain observes exactly the same ready order. This is the only
+    // point where a paused universe hands control back to its inspector.
+    if (inspection_stop_requested() && drain_requester_ != nullptr) {
+        return drain_requester_;
+    }
     if (ready_.size() == 1) {
         Task* task = ready_.back();
         ready_.pop_back();
@@ -108,6 +144,12 @@ Task* Scheduler::pick_next_ready() {
     const uint64_t idx = schedule_rng_.range(0, ready_.size() - 1);
     Task* task = ready_[static_cast<size_t>(idx)];
     ready_.erase(ready_.begin() + static_cast<ptrdiff_t>(idx));
+    record_task(event_sink_, EventKind::scheduler_choice, clock_.now(), task,
+                EventPayload{.subject = static_cast<uint64_t>(idx),
+                             .related = 0,
+                             .value = static_cast<uint64_t>(ready_.size()),
+                             .extra = 0,
+                             .amount_ns = 0});
     return task;
 }
 
@@ -117,10 +159,16 @@ void Scheduler::switch_to(Task* next) {
         next->state = Task::State::Running;
         return;
     }
+    record_task(event_sink_, EventKind::scheduler_run, clock_.now(), next,
+                EventPayload{.value = static_cast<uint64_t>(ready_.size())});
     current_ = next;
     next->state = Task::State::Running;
     t_active_scheduler = this;
     swapcontext(&prev->ctx, &next->ctx);
+}
+
+bool Scheduler::inspection_stop_requested() const {
+    return event_sink_ != nullptr && event_sink_->enabled() && event_sink_->observer_hit();
 }
 
 bool Scheduler::has_blocked() const {
@@ -141,6 +189,8 @@ bool Scheduler::has_blocked() const {
 
 void Scheduler::push_timer(Task* task, Time wakeup) {
     timers_.push_back(Timer{wakeup, timer_seq_++, task});
+    record_task(event_sink_, EventKind::scheduler_timer_arm, clock_.now(), task,
+                EventPayload{.value = timer_seq_ - 1, .amount_ns = wakeup.ns}, 0);
 }
 
 void Scheduler::compact_deadlines() {
@@ -157,6 +207,8 @@ bool Scheduler::cancel_deadline(uint64_t id) {
         if (deadlines_[i].id == id && deadlines_[i].fn != nullptr) {
             deadlines_[i].fn = nullptr;
             compact_deadlines();
+            record_scheduler(event_sink_, EventKind::scheduler_timer_cancel, clock_.now(), kNoTask,
+                             kNoNode, EventPayload{.subject = id});
             return true;
         }
     }
@@ -189,6 +241,8 @@ void Scheduler::fire_deadlines(Time now) {
         if (best == kMaxDeadlines) break;
         const Deadline entry = deadlines_[best];
         deadlines_[best].fn = nullptr;
+        record_scheduler(event_sink_, EventKind::scheduler_timer_fire, clock_.now(), kNoTask,
+                         kNoNode, EventPayload{.subject = entry.id, .amount_ns = entry.at.ns});
         entry.fn(entry.context);
     }
     compact_deadlines();
@@ -199,6 +253,8 @@ bool Scheduler::node_paused(NodeId node) const { return node < paused_.size() &&
 void Scheduler::make_ready(Task* task) {
     task->state = Task::State::Ready;
     task->wake_error = 0;
+    record_task(event_sink_, EventKind::scheduler_wake, clock_.now(), task,
+                EventPayload{.value = paused_.empty() ? 0 : (node_paused(task->node) ? 1U : 0U)});
     if (node_paused(task->node)) {
         parked_.push_back(task);
     } else {
@@ -209,6 +265,7 @@ void Scheduler::make_ready(Task* task) {
 void Scheduler::pause_node(NodeId node) {
     if (node >= paused_.size()) paused_.resize(static_cast<size_t>(node) + 1, false);
     paused_[node] = true;
+    record_scheduler(event_sink_, EventKind::node_pause, clock_.now(), kNoTask, node);
     for (auto it = ready_.begin(); it != ready_.end();) {
         if ((*it)->node == node) {
             parked_.push_back(*it);
@@ -221,6 +278,7 @@ void Scheduler::pause_node(NodeId node) {
 
 void Scheduler::resume_node(NodeId node) {
     if (node < paused_.size()) paused_[node] = false;
+    record_scheduler(event_sink_, EventKind::node_resume, clock_.now(), kNoTask, node);
     for (auto it = parked_.begin(); it != parked_.end();) {
         if ((*it)->node == node) {
             ready_.push_back(*it);
@@ -295,6 +353,8 @@ bool Scheduler::advance_to_next_timer() {
     remaining.reserve(timers_.size());
     for (const Timer& timer : timers_) {
         if (timer.wakeup <= earliest) {
+            record_task(event_sink_, EventKind::scheduler_timer_fire, clock_.now(), timer.task,
+                        EventPayload{.subject = timer.seq, .amount_ns = timer.wakeup.ns});
             make_ready(timer.task);
         } else {
             remaining.push_back(timer);
@@ -339,6 +399,9 @@ int Scheduler::spawn(NodeId node, pthread_t* out, void* (*start)(void*), void* a
     } while (task->id == 0);
     task->state = Task::State::Ready;
     task->owner = this;
+    record_task(event_sink_, EventKind::scheduler_spawn, clock_.now(), task,
+                EventPayload{.value = static_cast<uint64_t>(all_tasks_.size()),
+                             .extra = static_cast<uint64_t>(kFiberStackSize)});
     if (::getcontext(&task->ctx) != 0) {
         task->~Task();
         __real_free(stack);
@@ -361,6 +424,8 @@ int Scheduler::join(pthread_t id, void** retval) {
     if (target == nullptr) return ESRCH;
     if (target->id == current_->id) return EDEADLK;
     if (target->detached) return EINVAL;
+    record_task(event_sink_, EventKind::scheduler_join, clock_.now(), current_,
+                EventPayload{.related = static_cast<uint64_t>(target->id)});
     if (target->state == Task::State::Done) {
         if (retval != nullptr) *retval = target->retval;
         return 0;
@@ -369,6 +434,9 @@ int Scheduler::join(pthread_t id, void** retval) {
     target->joiners.push_back(self);
     self->state = Task::State::BlockedJoin;
     self->wake_error = 0;
+    record_task(event_sink_, EventKind::scheduler_block, clock_.now(), self,
+                EventPayload{.related = static_cast<uint64_t>(target->id),
+                             .value = static_cast<uint64_t>(Task::State::BlockedJoin)});
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
     } else if (advance_until_ready()) {
@@ -398,6 +466,8 @@ int Scheduler::detach(pthread_t id) {
     if (target == nullptr) return ESRCH;
     if (target->detached) return EINVAL;
     target->detached = true;
+    record_task(event_sink_, EventKind::scheduler_detach, clock_.now(), current_,
+                EventPayload{.related = static_cast<uint64_t>(target->id)});
     return 0;
 }
 
@@ -434,6 +504,7 @@ int Scheduler::mutex_init(pthread_mutex_t* mu, const pthread_mutexattr_t* attr) 
     }
     SimMutex entry;
     entry.key = mu;
+    entry.id = next_mutex_id_++;
     mutexes_.push_back(entry);
     return 0;
 }
@@ -456,12 +527,23 @@ int Scheduler::mutex_lock(pthread_mutex_t* mu) {
     if (!entry.locked) {
         entry.locked = true;
         entry.owner = self;
+        record_scheduler(event_sink_, EventKind::scheduler_mutex_lock, clock_.now(), self->id,
+                         self->node, EventPayload{.subject = entry.id, .related = self->id});
         return 0;
     }
     if (entry.owner == self) return EDEADLK;
     entry.waiters.push_back(self);
     self->state = Task::State::BlockedMutex;
     self->wake_error = 0;
+    record_scheduler(
+        event_sink_, EventKind::scheduler_mutex_contend, clock_.now(), self->id, self->node,
+        EventPayload{.subject = entry.id,
+                     .related =
+                         entry.owner != nullptr ? static_cast<uint64_t>(entry.owner->id) : kNoTask,
+                     .value = static_cast<uint64_t>(entry.waiters.size())});
+    record_task(event_sink_, EventKind::scheduler_block, clock_.now(), self,
+                EventPayload{.subject = entry.id,
+                             .value = static_cast<uint64_t>(Task::State::BlockedMutex)});
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
     } else if (advance_until_ready()) {
@@ -489,15 +571,20 @@ int Scheduler::mutex_unlock(pthread_mutex_t* mu) {
     if (mu == nullptr) return EINVAL;
     SimMutex* entry = find_mutex(mu);
     if (entry == nullptr || !entry->locked || entry->owner != current_) return EPERM;
+    uint64_t next_owner = kNoTask;
     if (!entry->waiters.empty()) {
         Task* waiter = entry->waiters.front();
         entry->waiters.erase(entry->waiters.begin());
         entry->owner = waiter;
+        next_owner = event_task_id(waiter);
         make_ready(waiter);
     } else {
         entry->locked = false;
         entry->owner = nullptr;
     }
+    record_scheduler(event_sink_, EventKind::scheduler_mutex_unlock, clock_.now(),
+                     event_task_id(current_), current_->node,
+                     EventPayload{.subject = entry->id, .related = next_owner});
     Task* self = current_;
     make_ready(self);
     switch_to(pick_next_ready());
@@ -521,6 +608,7 @@ int Scheduler::cond_init(pthread_cond_t* cond, const pthread_condattr_t* attr) {
     if (find_cond(cond) != nullptr) return EBUSY;
     SimCond entry;
     entry.key = cond;
+    entry.id = next_cond_id_++;
     conds_.push_back(entry);
     return 0;
 }
@@ -542,6 +630,8 @@ int Scheduler::cond_wait(pthread_cond_t* cond, pthread_mutex_t* mu) {
     SimMutex& mu_entry = get_or_create_mutex(mu);
     Task* self = current_;
     if (!mu_entry.locked || mu_entry.owner != self) return EPERM;
+    record_scheduler(event_sink_, EventKind::scheduler_cond_wait, clock_.now(), event_task_id(self),
+                     self->node, EventPayload{.subject = cond_entry.id, .related = mu_entry.id});
     if (!mu_entry.waiters.empty()) {
         Task* waiter = mu_entry.waiters.front();
         mu_entry.waiters.erase(mu_entry.waiters.begin());
@@ -554,6 +644,9 @@ int Scheduler::cond_wait(pthread_cond_t* cond, pthread_mutex_t* mu) {
     cond_entry.waiters.push_back(SimCond::Waiter{self, mu});
     self->state = Task::State::BlockedCond;
     self->wake_error = 0;
+    record_task(event_sink_, EventKind::scheduler_block, clock_.now(), self,
+                EventPayload{.subject = cond_entry.id,
+                             .value = static_cast<uint64_t>(Task::State::BlockedCond)});
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
     } else if (advance_until_ready()) {
@@ -593,10 +686,20 @@ void Scheduler::deliver_cond_waiter(SimCond::Waiter waiter) {
 
 int Scheduler::cond_signal(pthread_cond_t* cond) {
     if (cond == nullptr) return EINVAL;
-    if (SimCond* entry = find_cond(cond); entry != nullptr && !entry->waiters.empty()) {
+    uint64_t woken = 0;
+    SimCond* entry = find_cond(cond);
+    if (entry != nullptr && !entry->waiters.empty()) {
         SimCond::Waiter waiter = entry->waiters.front();
         entry->waiters.erase(entry->waiters.begin());
+        woken = event_task_id(waiter.task);
+        record_scheduler(event_sink_, EventKind::scheduler_cond_signal, clock_.now(),
+                         event_task_id(current_), current_->node,
+                         EventPayload{.subject = entry->id, .related = woken, .value = 1});
         deliver_cond_waiter(waiter);
+    } else {
+        record_scheduler(event_sink_, EventKind::scheduler_cond_signal, clock_.now(),
+                         event_task_id(current_), current_->node,
+                         EventPayload{.subject = entry != nullptr ? entry->id : 0, .value = 0});
     }
     Task* self = current_;
     make_ready(self);
@@ -606,11 +709,21 @@ int Scheduler::cond_signal(pthread_cond_t* cond) {
 
 int Scheduler::cond_broadcast(pthread_cond_t* cond) {
     if (cond == nullptr) return EINVAL;
-    if (SimCond* entry = find_cond(cond); entry != nullptr && !entry->waiters.empty()) {
+    uint64_t woken = 0;
+    SimCond* entry = find_cond(cond);
+    if (entry != nullptr && !entry->waiters.empty()) {
         std::vector<SimCond::Waiter, RawRealAllocator<SimCond::Waiter>> waking;
         waking.swap(entry->waiters);
+        woken = static_cast<uint64_t>(waking.size());
+        record_scheduler(event_sink_, EventKind::scheduler_cond_broadcast, clock_.now(),
+                         event_task_id(current_), current_->node,
+                         EventPayload{.subject = entry->id, .value = woken});
         for (SimCond::Waiter waiter : waking)
             deliver_cond_waiter(waiter);
+    } else {
+        record_scheduler(event_sink_, EventKind::scheduler_cond_broadcast, clock_.now(),
+                         event_task_id(current_), current_->node,
+                         EventPayload{.subject = entry != nullptr ? entry->id : 0, .value = 0});
     }
     Task* self = current_;
     make_ready(self);
@@ -620,6 +733,7 @@ int Scheduler::cond_broadcast(pthread_cond_t* cond) {
 
 void Scheduler::yield() {
     Task* self = current_;
+    record_task(event_sink_, EventKind::scheduler_yield, clock_.now(), self);
     make_ready(self);
     switch_to(pick_next_ready());
 }
@@ -703,6 +817,12 @@ void Scheduler::run_until_quiescence() {
     drain_requester_ = current_;
     deadlocked_ = false;
     while (true) {
+        // A matched inspection breakpoint pauses the drain at a scheduler boundary. The paused
+        // tasks keep their state; a later call resumes exactly where this one stopped.
+        if (inspection_stop_requested()) {
+            drain_requester_ = nullptr;
+            return;
+        }
         if (ready_.empty() && timers_.empty() && deadline_count_ == 0) break;
         if (ready_.empty()) {
             advance_to_next_timer();
@@ -712,6 +832,10 @@ void Scheduler::run_until_quiescence() {
     }
     deadlocked_ = has_blocked();
     drain_requester_ = nullptr;
+    if (deadlocked_) {
+        record_scheduler(event_sink_, EventKind::scheduler_deadlock, clock_.now(), kNoTask, kNoNode,
+                         EventPayload{.value = static_cast<uint64_t>(task_count())});
+    }
 }
 
 void Scheduler::wake_joiners(Task* done) {
@@ -733,6 +857,8 @@ void Scheduler::task_trampoline() {
 
 void Scheduler::on_task_exit(Task* done) {
     done->state = Task::State::Done;
+    record_task(event_sink_, EventKind::scheduler_exit, clock_.now(), done,
+                EventPayload{.value = static_cast<uint64_t>(done->joiners.size())});
     wake_joiners(done);
     if (!ready_.empty()) {
         switch_to(pick_next_ready());
@@ -751,6 +877,73 @@ void Scheduler::on_task_exit(Task* done) {
         }
     }
     ::abort();
+}
+
+uint64_t Scheduler::current_task_id() const { return event_task_id(current_); }
+
+std::vector<TaskInfo> Scheduler::task_infos() const {
+    std::vector<TaskInfo> infos;
+    infos.reserve(all_tasks_.size() + 1);
+    infos.push_back(TaskInfo{kMainTask, main_task_.node, main_task_.state, main_task_.detached,
+                             static_cast<uint64_t>(main_task_.stack_size),
+                             static_cast<uint64_t>(main_task_.joiners.size())});
+    for (const Task* task : all_tasks_) {
+        if (task == nullptr) continue;
+        infos.push_back(TaskInfo{event_task_id(task), task->node, task->state, task->detached,
+                                 static_cast<uint64_t>(task->stack_size),
+                                 static_cast<uint64_t>(task->joiners.size())});
+    }
+    std::sort(infos.begin(), infos.end(),
+              [](const TaskInfo& left, const TaskInfo& right) { return left.id < right.id; });
+    return infos;
+}
+
+std::vector<MutexInfo> Scheduler::mutex_infos() const {
+    std::vector<MutexInfo> infos;
+    infos.reserve(mutexes_.size());
+    for (const SimMutex& mu : mutexes_) {
+        infos.push_back(MutexInfo{
+            mu.id, mu.locked, mu.owner != nullptr ? static_cast<uint64_t>(mu.owner->id) : kNoTask,
+            static_cast<uint64_t>(mu.waiters.size())});
+    }
+    std::sort(infos.begin(), infos.end(),
+              [](const MutexInfo& left, const MutexInfo& right) { return left.id < right.id; });
+    return infos;
+}
+
+std::vector<CondInfo> Scheduler::cond_infos() const {
+    std::vector<CondInfo> infos;
+    infos.reserve(conds_.size());
+    for (const SimCond& cond : conds_) {
+        infos.push_back(CondInfo{cond.id, static_cast<uint64_t>(cond.waiters.size())});
+    }
+    std::sort(infos.begin(), infos.end(),
+              [](const CondInfo& left, const CondInfo& right) { return left.id < right.id; });
+    return infos;
+}
+
+std::vector<TimerInfo> Scheduler::timer_infos() const {
+    std::vector<TimerInfo> infos;
+    infos.reserve(timers_.size());
+    for (const Timer& timer : timers_) {
+        infos.push_back(TimerInfo{timer.seq, event_task_id(timer.task), timer.wakeup});
+    }
+    std::sort(infos.begin(), infos.end(),
+              [](const TimerInfo& left, const TimerInfo& right) { return left.seq < right.seq; });
+    return infos;
+}
+
+std::vector<DeadlineInfo> Scheduler::deadline_infos() const {
+    std::vector<DeadlineInfo> infos;
+    infos.reserve(deadline_count_);
+    for (size_t index = 0; index < deadline_count_; ++index) {
+        infos.push_back(DeadlineInfo{deadlines_[index].id, deadlines_[index].at,
+                                     deadlines_[index].fn != nullptr});
+    }
+    std::sort(infos.begin(), infos.end(), [](const DeadlineInfo& left, const DeadlineInfo& right) {
+        return left.id < right.id;
+    });
+    return infos;
 }
 
 } // namespace cosmos
