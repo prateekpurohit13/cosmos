@@ -1156,8 +1156,8 @@ state and must be updated at the end of every implementation session.
 
 ### A.1 Current implementation snapshot
 
-As of **2026-10-26**, baseline `f1ad1345` (`main`) plus the Phase 2 `U2.2` replay work from
-session 5:
+As of **2026-10-26**, baseline `5fb8a66b` (`main`) plus the Phase 2 `U2.3` compare work from
+session 6:
 
 | Area | State | Notes |
 |---|---|---|
@@ -1168,18 +1168,19 @@ session 5:
 | Minimization | **Available** | `minimize()` and `MinimizeReport` exist; no UI consumes them yet. |
 | UI stack | **Implemented** | Vanilla ES modules + Python stdlib server; see `O1`/`O2`/`O3`, `O11` and `O13` in A.11. |
 | v1 | **Phase 1 complete** | Campaign cockpit, universe explorer/detail and finding triage render from `ui/fixtures/demo/`. |
-| v2 | **`U2.1` and `U2.2` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. Replay controls play/pause/step, jump to injected/suppressed/failure decisions and virtual time, mark failed checks at the nearest recorded event, and open findings/checks at the failure evidence. |
+| v2 | **`U2.1`–`U2.3` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. Replay controls play/pause/step, jump to injected/suppressed/failure decisions and virtual time, mark failed checks at the nearest recorded event, and open findings/checks at the failure evidence. The compare view diffs config, report and canonical entries for two seeds in one campaign, labels the first event, virtual-time and report divergences, and keeps missing traces explicit. |
 | Engine tests | **Existing** | Run the baseline before changing engine/export code. |
-| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (59 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, deep-link restoration, theme redraw, missing trace and hash mismatch were checked in a browser. |
+| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (61 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, compare selection, same-seed/invalid-seed/empty-seed fallbacks, config diff, missing/seed-mismatched/truncated/drop-count-undeclared trace disable states, deep-link restoration, theme redraw and hash mismatch were checked in a browser. |
 
-**Current phase:** Phase 2 (v2 fault timeline and finding replay); Phase 0, Phase 1, `U2.1` and
-`U2.2` are complete. **Next task:** `U2.3` — compare two universes by config, report and trace.
+**Current phase:** Phase 2 (v2 fault timeline and finding replay); Phase 0, Phase 1 and
+`U2.1`–`U2.3` are complete. **Next task:** `U2.4` — minimize UI with the 1-minimal label.
 
 The v1 cockpit answers what failed, in which seed, with what ledger, whether the campaign was
 vacuous, and a build-scoped repro identity (or a command when the manifest declares one). The v2
 timeline answers when each post-gate decision happened, whether it injected anything, and where
-the failure sits relative to the recorded decisions. Neither view invents engine events the
-artifact did not record.
+the failure sits relative to the recorded decisions. The compare view answers which of two
+universes diverged first and on which axis. None of these views invents engine events or ordering
+the artifact did not record.
 
 ### A.2 Read order for a new session
 
@@ -1204,7 +1205,7 @@ nix develop .#clang -c just test
 
 ### A.3 Scope fence for the current phase
 
-**Target:** Phase 2 (v2 fault timeline and finding replay). Phase 0, Phase 1 and `U2.1`–`U2.2`
+**Target:** Phase 2 (v2 fault timeline and finding replay). Phase 0, Phase 1 and `U2.1`–`U2.3`
 are complete.
 
 We have a local, artifact-driven v1 UI: a campaign cockpit and universe/finding inspector. The
@@ -1379,6 +1380,7 @@ not a `{total, failed}` object, and it has no top-level `eligible`/`fired`: deri
 /campaigns/<campaign-id>/universes       universe explorer
 /campaigns/<campaign-id>/universes/<seed>  universe detail
 /campaigns/<campaign-id>/universes/<seed>/timeline  fault timeline (U2.1)
+/campaigns/<campaign-id>/compare?left=<seed>&right=<seed>  two-universe compare (U2.3)
 /campaigns/<campaign-id>/findings/<assertion-id>  finding triage
 ```
 
@@ -1388,6 +1390,23 @@ deep-link form carries the build when a server can resolve build-scoped storage:
 `/builds/<build-id>/campaigns/<campaign-id>/universes/<seed>`. The local server mounts one
 artifact root and keeps the shorter form; the manifest always carries the build identity so a link
 cannot be mistaken for another build (D9).
+
+The compare route takes `left` and `right` seeds in the query string and keeps them there with
+`history.replaceState`. Either side accepts a decimal or `0x`-prefixed seed; the view resolves both
+against the campaign's universe rows and canonicalizes the URL to the rows' decimal strings. An
+invalid or unknown seed (including an empty parameter) falls back to a default with a visible
+warning rather than failing the page. The view uses the existing universe and trace APIs, compares
+canonical entries pairwise in frozen encoding order, and never treats a trace-hash difference as
+behavioural divergence because the canonical header carries the seed. Missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces disable the event
+comparison explicitly; report and config comparison still render.
+
+Report rows compare in this fixed order: status; virtual end; report flags (`no_check_failed`,
+`vacuous`, `verify_failed`, `verify_mismatch`, `died`, `signal`, `threw`); `active_allocations`;
+`out_of_scope_assertions`; `ledger_dropped`; `config_hash`; trace metadata (`present`, `traced`,
+`dropped`); checks (totals, then each assertion's `passed`/`at_ns`/`detail` sorted by id); coverage
+hits by id; sites (`activated`/`eligible`/`fired`) in slot order; ledger row count and the first
+differing row in the recorded ledger prefix (`ledger_dropped` is shown separately). Wall time,
+`seed` and trace hashes are excluded from the report diff.
 
 The read-only trace API is
 `GET /api/campaigns/<campaign-id>/universes/<seed>/trace`. It resolves the universe row and
@@ -1441,10 +1460,12 @@ field. Two regenerations are byte-identical.
 | `docs/fault-injection.md` | Ledger/trace/vacuity semantics | UI language and invariants |
 | `docs/state-exploration.md` | Coverage guidance, snapshots | Future views |
 | `docs/architecture.md` | `Snapshot` seam | Future time travel |
-| `ui/web/` | Vanilla ES modules, HTML, CSS | Cockpit, explorer, universe, finding and timeline views |
+| `ui/web/` | Vanilla ES modules, HTML, CSS | Cockpit, explorer, universe, finding, timeline and compare views |
 | `ui/web/lib/trace.js` | Trace classification, search grammar, ledger correlation | Timeline semantics and deterministic search |
 | `ui/web/lib/timeline.js` | Canvas lanes, virtual-time ticks, minimap, selection, failure markers | Fault timeline rendering and keyboard navigation |
 | `ui/web/lib/playback.js` | Event-boundary stepping, virtual-time targets, failure resolution | Deterministic replay controls and finding → failure jumps |
+| `ui/web/lib/compare.js` | Pairwise canonical-entry compare, fixed-order report diff, bounded config JSON diff, seed normalization | Two-universe compare semantics |
+| `ui/web/views/compare.js` | Compare selection, trace/report/config diff rendering, divergence labels | Two-universe compare view |
 | `ui/server/serve.py` | Python stdlib artifact server | Local artifact loading, API, canonical trace decoding, SPA fallback |
 | `ui/server/test_serve.py` | Server contract tests | Path, schema, headers, API shape, trace variants |
 | `ui/README.md` | Run and data-contract notes | Operator entry point |
@@ -1452,7 +1473,7 @@ field. Two regenerations are byte-identical.
 `ui/` contains the fixture, the server and the frontend. There is still no npm build, bundler or
 frontend test framework; the browser app is directly reviewable ES modules.
 
-### A.7 Layout (implemented through session 4)
+### A.7 Layout (implemented through session 6)
 
 ```text
 ui/
@@ -1461,8 +1482,8 @@ ui/
     index.html
     app.js               # shell, theme, router dispatch, view teardown
     styles.css
-    lib/                 # DOM, API, formatting, fault metadata, components, trace, timeline, playback
-    views/               # campaigns, campaign, universes, universe, timeline, finding, errors
+    lib/                 # DOM, API, formatting, fault metadata, components, trace, timeline, playback, compare
+    views/               # campaigns, campaign, universes, universe, timeline, finding, compare, errors
   server/
     serve.py             # Python stdlib static + artifact API + canonical trace decoder
     test_serve.py        # server contract tests (including trace variants)
@@ -1496,7 +1517,7 @@ verified in one block. Statuses: `Not started`, `In progress`, `Done`, `Blocked`
 | `U1.4` | v1 acceptance: end-to-end fixture, docs, deterministic ordering, no generated files. | `U1.1`–`U1.3` | Gate G1 below passes. | Done — G1 passes; `ui/README.md`, server tests, browser smoke. |
 | `U2.1` | Fault timeline: trace ingestion, lanes, inspector, search, minimap. | `U0.3`, `U0.4` | A trace fixture renders every entry; dropped/truncated evidence is visible. | Done — read-only trace API, canvas lanes, virtual-time ticks, minimap, search, inspector, paginated entries, warnings; fixture has 24 entries across two lanes; 59 UI tests. |
 | `U2.2` | Replay controls and failure jump: play/step, next fault, failed-check marker. | `U2.1` | Finding → timeline at failure; event sequence and virtual time both shown. | Done — play/pause/step/next injected/next suppressed/next failed, virtual-time jump, dashed failure markers with honest before/after labels, finding and universe check links; browser smoke. |
-| `U2.3` | Compare two universes: config/report/trace diff, first divergence. | `U2.1` | Side-by-side view works on two fixtures. | Not started |
+| `U2.3` | Compare two universes: config/report/trace diff, first divergence. | `U2.1` | Side-by-side view works on two fixtures. | Done — campaign-scoped compare route, pairwise canonical-entry comparison, fixed-order report diff, bounded config diff, first event/virtual-time divergence, explicit missing/truncated trace handling; browser smoke. |
 | `U2.4` | Minimize UI: display `MinimizeReport`, candidates/kept, `--only-faults` repro. | `U1.3`, `U2.1` | Report renders; 1-minimal label is explicit. Execution UI may follow. | Not started |
 | `U3.1` | Event sink contract: envelope, sequence, virtual time, gap markers, versioning; bounded ring buffer. | `U0.1` | Contract documented; dropped events are explicit; hot path allocates nothing. | Not started |
 | `U3.2` | Instrument scheduler, network, storage, memory; add state enumerators. | `U3.1` | Events/state cover the tabs; existing tests still pass. | Not started |
@@ -1524,11 +1545,12 @@ fixture and:
 - operate with no simulation-engine changes and no canonical trace change;
 - pass `nix develop -c just test` (and the clang suite if export code changed).
 
-**G2 — v2 timeline:** **Partially passes as of session 5.** The fault timeline renders canonical
+**G2 — v2 timeline:** **Partially passes as of session 6.** The fault timeline renders canonical
 entries, the inspector shows frozen fields, search and selection work from artifacts,
 dropped/truncated/absent evidence is explicit, playback operates at deterministic event
-boundaries, and a finding or check opens the nearest recorded event at or before the failure.
-Still open: two-universe compare (`U2.3`) and `MinimizeReport` with the 1-minimal label (`U2.4`).
+boundaries, a finding or check opens the nearest recorded event at or before the failure, and two
+universes compare config, report and canonical entries with a labelled first event/virtual-time
+divergence. Still open: `MinimizeReport` with the 1-minimal label (`U2.4`).
 
 **G3 — v3 inspection:** Event sink and state tabs work; breakpoints run in a single-universe
 process; command log is recorded; gaps are visible; telemetry does not block or allocate in the
@@ -1602,6 +1624,7 @@ consequence.
 | O13 | Where canonical trace bytes are decoded | `U2.1` | **Server-side, in `ui/server/serve.py`, into the frozen `TraceEntry` fields.** | One decoder is covered by Python contract tests against `trace.hpp` constants; the browser never parses binary or duplicates codec logic. The endpoint returns decoded entries plus hash/seed verification and never rewrites canonical bytes. Rejected: browser `ArrayBuffer` decoding (would move the compatibility gate out of the tested server) and a new artifact JSON format (would duplicate canonical bytes). | Decided |
 | O14 | How a finding or check addresses a failure on the timeline | `U2.2` | **Transient `check=<assertion-id>` and `at=<virtual-time>` hints resolve to the last recorded event whose `at_ns` is at or before the target; the URL then canonicalizes to `event=<seq>`.** | `event` stays the only event identity. A failure after the last recorded event selects the last event and says so; one before the first selects the first and says so. The UI never fabricates a check event or claims the marker caused the failure. Rejected: inventing a synthetic check row in the canonical sequence, and leaving `check`/`at` in the canonical URL. | Decided |
 | O15 | How replay advances | `U2.2` | **A client-side cursor over recorded entries, paced in events per second (1/2/4/8/16/32), always landing on a canonical event.** | Play/pause, step, next injected, next suppressed/skipped, next failed check and virtual-time jump are observation only. They never advance virtual time, mutate a universe or add a command-log entry. Playback stops at the last event; manual selection pauses it. Rejected: wall-clock-paced virtual time and timer-driven synthetic events. | Decided |
+| O16 | How two universes are compared | `U2.3` | **One campaign-scoped route `/campaigns/<id>/compare?left=<seed>&right=<seed>`; canonical entries compare pairwise in frozen encoding order; report fields use one fixed documented order; wall time is displayed but never compared; trace hashes are identity, not a divergence signal.** | No new server endpoint: the view composes two universe details and two trace responses. `left`/`right` accept decimal or 0x seeds and canonicalize to the row's decimal string; invalid or unknown seeds fall back with a warning. Trace hash differences across seeds are expected because the canonical header carries the seed. Missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces disable event comparison explicitly instead of treating absent evidence as equal. Rejected: a server-side compare endpoint (duplicates UI logic), treating a differing trace hash as behavioural divergence, and diffing by wall time. | Decided |
 
 ### A.12 Risks and guardrails
 
@@ -1632,20 +1655,21 @@ consequence.
 
 ### A.13 Next action
 
-Start **`U2.3`** (compare two universes):
+Start **`U2.4`** (minimize UI):
 
-1. Add a read-only compare view for two seeds in one campaign: side-by-side config, report and
-trace summaries, with trace hashes and verify status.
-2. Define the first divergence by event sequence (then virtual time, then report field) and label
-it explicitly; do not sort or diff by wall time.
-3. Reuse the existing universe/trace APIs. Add a server endpoint only if the artifact contract
-cannot express the comparison; keep the canonical trace bytes untouched.
-4. Cover the two-fixture compare, identical seeds, different config hashes and a missing trace in
-the browser smoke pass; add server tests only if the API grows.
-5. Run `nix develop -c just lint` and `nix develop -c just test`; update A.1/A.8/B before
+1. Check whether the artifact surface already carries a `MinimizeReport`. If it does not, add the
+   smallest additive, versioned artifact document or field; do not change canonical trace bytes or
+   simulation semantics.
+2. Render the candidates, kept fires, passes/replays, crashed trials and the exact
+   `--only-faults=` repro over the existing fault timeline and finding views.
+3. Make the **“1-minimal, not globally minimal”** label prominent. Do not claim global minimality,
+   causality the report does not contain, or a repro that the artifact does not declare.
+4. Keep missing/empty minimization data explicit; a finding without a report is not an empty
+   success state.
+5. Run `nix develop -c just lint` and `nix develop -c just test`; update A.1/A.5/A.8/A.11/B before
    stopping.
 
-Current first deliverable: `U2.3` over the existing artifact surface. Do not add live control,
+Current first deliverable: `U2.4` over the existing artifact surface. Do not add live control,
 snapshots or a new engine event stream in this phase, and do not change the canonical trace
 format.
 
@@ -1664,19 +1688,19 @@ Appendix A.
 | 2026-10-26 | 3 | `U0.4`–`U1.4` | Added the Python stdlib artifact server, vanilla ES-module v1 dashboard (campaign cockpit, universe explorer/detail, finding triage), deterministic ordering, trace warnings, URL-state filters, theme, server contract tests and `ui/README.md`. | `nix develop -c just test` (40/40 + 39 UI tests); `nix develop .#clang -c just test`; `just lint`; browser checks on campaign, universes, universe, finding, filters, copy, theme, focus and error states; no console errors. | `U2.1` |
 | 2026-10-26 | 4 | `U2.1` | Added the server-side canonical trace decoder and read-only trace API, timeline view with canvas lanes, virtual-time ticks, minimap, search/matching, inspector, paginated entry table, hash/seed/drop warnings, event deep links, and a multi-lane 24-entry demo fixture. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 59 UI tests); browser checks on timeline rendering, selection, search/match navigation, pagination, theme redraw, missing trace and hash mismatch; no console errors. | `U2.2` |
 | 2026-10-26 | 5 | `U2.2` | Added deterministic replay controls (play/pause, step, next injected/suppressed/failed, event-boundary jump-to-virtual-time), failed-check markers at the nearest recorded event, a failed-checks table, and finding/universe links that open the timeline at the failure. Timeline `check`/`at` hints canonicalize to `event`. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 59 UI tests); browser checks on playback boundaries, keyboard shortcuts, speed changes, failure markers in both themes, finding and seed/check jumps, check/at fallbacks, deep-link restoration, missing trace and no console errors. | `U2.3` |
-| YYYY-MM-DD | N | `U0.x` | What changed, what was learned, what is blocked. | Commands run / tests passed. | `U0.y` |
+| 2026-10-26 | 6 | `U2.3` | Added the campaign-scoped compare route and view, deterministic pairwise canonical-entry comparison, fixed-order report diff, bounded realized-config diff, first event/virtual-time/report divergence labels, seed canonicalization and fallback warnings, same-seed handling, and explicit disable states for missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces. Added compare links from universe/timeline views and a small focus/scroll restoration for query-only renders. No server API or canonical trace change. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 61 UI tests); `nix develop .#clang -c just test`; browser checks on two-universe compare, selector/swap focus/scroll, same seed, invalid/unknown/empty seeds, missing/malformed/seed-mismatched/truncated/undeclared-drop traces, changed config hash, deep links, theme, and no console errors. | `U2.4` |
 
 **Next-session prompt:**
 
 ```text
-Next task: U2.3 — compare two universes by config, report and trace, including first divergence.
+Next task: U2.4 — MinimizeReport UI with the explicit 1-minimal label.
 Read: AGENTS.md, docs/ui-design.md Appendix A (A.1, A.3, A.5.1, A.8, A.11, A.13), Appendix B last row.
-Current phase/scope: Phase 2, v2 read-only replay; U2.1/U2.2 are complete and the artifact contract is frozen.
-Decisions: D2 event sequence is the default axis, D3 artifact-first, D5 canonical trace untouched,
-D8 1-minimal label, D10 virtual vs wall time, D12 deterministic ordering; O1/O2/O10/O11/O13/O14/O15.
+Current phase/scope: Phase 2, v2 read-only replay; U2.1–U2.3 are complete and the artifact contract is frozen.
+Decisions: D3 artifact-first, D5 canonical trace untouched, D8 1-minimal label, D10 virtual vs wall time,
+D12 deterministic ordering; O5 report-only minimization, O10 schema versioning, O13–O16.
 Do not: change simulation semantics or the canonical trace, add live control, snapshots, minimization
 execution, or commit generated files.
 First command: nix develop -c just test
-Done when: two fixture universes render side by side with config/report/trace differences, the first
-divergence is labelled by event sequence and virtual time, and missing traces stay explicit.
+Done when: a MinimizeReport renders candidates and kept fires, passes/replays/crashed trials, the exact
+--only-faults repro, and the 1-minimal label is explicit; missing report data stays explicit too.
 ```

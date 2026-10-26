@@ -5,8 +5,8 @@ A local, read-only campaign cockpit for the schema-v1 artifacts written by
 simulation semantics, canonical trace encoding, or `trace_hash` are touched.
 
 The v2 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
-fault timeline, deterministic replay controls and the finding → failed-check jump. It does not
-include a live event stream, two-universe compare, minimization execution, breakpoints, or
+fault timeline, deterministic replay controls, the finding → failed-check jump, and two-universe
+compare. It does not include a live event stream, minimization execution, breakpoints, or
 snapshots; those are later tasks in `docs/ui-design.md`.
 
 ## Run it
@@ -48,12 +48,13 @@ Two regenerations are byte-identical.
 | `/campaigns/<campaign-id>/universes` | Universe explorer |
 | `/campaigns/<campaign-id>/universes/<seed>` | Universe detail |
 | `/campaigns/<campaign-id>/universes/<seed>/timeline` | Fault timeline |
+| `/campaigns/<campaign-id>/compare?left=<seed>&right=<seed>` | Two-universe compare |
 | `/campaigns/<campaign-id>/findings/<assertion-id>` | Finding triage |
 
 All routes are deep-linkable. Explorer filters live in the query string (`status`, `finding`,
-`verify`, `q`, `page`). Timeline search and selection live in `q` and `event`. Both use
-`history.replaceState`, so browser navigation still moves between pages rather than filter or
-selection states.
+`verify`, `q`, `page`). Timeline search and selection live in `q` and `event`. Compare keeps
+`left` and `right` in the query string. All three use `history.replaceState`, so browser navigation
+still moves between pages rather than filter or selection states.
 
 Timeline links may also carry transient `check=<assertion-id>` and `at=<virtual-time>` hints. The
 view resolves them to the nearest recorded event at or before the check/time, then replaces the
@@ -61,6 +62,11 @@ URL with the canonical `event=<seq>` form. A finding or universe check time ther
 timeline at the failure evidence instead of the timeline start. When the failure precedes the
 first recorded event, the first event is selected and labelled; when it follows the last, the
 last event is selected and labelled.
+
+Compare accepts a decimal or `0x`-prefixed seed on either side. It resolves both against the
+campaign's universe rows, canonicalizes the URL to the rows' decimal seed strings, and falls back
+with a visible warning if a link names an invalid or unknown seed. Selecting a seed only changes
+the URL; no artifact or universe is modified.
 
 ## API
 
@@ -102,8 +108,8 @@ ui/
   README.md              this file
   web/                   vanilla ES modules, HTML and CSS; no build step
     app.js               shell, theme, router dispatch, view teardown
-    lib/                 DOM, API, formatting, fault metadata, components, trace, timeline, playback
-    views/               campaign list, cockpit, universes, universe, timeline, finding, errors
+    lib/                 DOM, API, formatting, fault metadata, components, trace, timeline, playback, compare
+    views/               campaign list, cockpit, universes, universe, timeline, finding, compare, errors
   server/serve.py        Python 3 stdlib static + artifact API + canonical trace decoder
   server/test_serve.py   server contract tests, including trace variants
   fixtures/demo/         checked-in deterministic artifact with 24-entry traces
@@ -121,10 +127,11 @@ nix develop -c just ui-test
 ```
 
 The suite covers the catalog, campaign/universe payloads, decimal and hex seed lookup, traversal
-rejection, Host validation, NUL paths, non-finite/surrogate artifact values, SPA fallback, static
-content types, HEAD behavior, security headers, broken artifacts, canonical trace decoding,
-multi-entry ordering, hash/seed mismatch reporting, missing trace files, and malformed
-source/truncated/trailing trace bytes. `just test` runs it after the C++ suite.
+rejection, Host validation, NUL paths, non-finite/surrogate artifact values, SPA fallback
+(including the compare route), static content types, HEAD behavior, security headers, broken
+artifacts, canonical trace decoding, multi-entry ordering, hash/seed mismatch reporting, missing
+trace files, and malformed source/truncated/trailing trace bytes. `just test` runs it after the
+C++ suite.
 
 ## Data rules the UI relies on
 
@@ -158,6 +165,21 @@ source/truncated/trailing trace bytes. `just test` runs it after the C++ suite.
   and step back selects the last; playback stops at the last event instead of silently rewinding.
   During playback the canvas cursor is coalesced to about 10 paints per second while the
   inspector and table keep up with every event.
+- Compare is also read-only. It loads two universe documents and two canonical traces through the
+  existing APIs. Canonical entries are compared pairwise in frozen encoding order; report fields
+  use one fixed order; the realized config objects are diffed key by key with a bounded recursion
+  and an explicit truncation notice. Wall duration is displayed as host metadata but is never
+  compared, sorted or used to define the first divergence. Trace hashes are identity, not a
+  divergence signal: the canonical header includes the universe seed, so equal decisions across
+  different seeds still hash differently. The view marks the first event-pair difference, the first
+  virtual-time difference and the first report/config field explicitly. Missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces disable event
+  comparison with a labelled explanation instead of treating absent evidence as equality. The fixed report order is: status; virtual end; report flags
+  (`no_check_failed`, `vacuous`, `verify_failed`, `verify_mismatch`, `died`, `signal`, `threw`);
+  `active_allocations`; `out_of_scope_assertions`; `ledger_dropped`; `config_hash`; trace metadata
+  (`present`, `traced`, `dropped`); checks (totals, then each assertion's `passed`/`at_ns`/`detail`
+  sorted by id); coverage hits by id; sites (`activated`/`eligible`/`fired`) in slot order; ledger
+  row count and the first differing row in the recorded prefix (`ledger_dropped` is shown
+  separately). Wall time, `seed` and trace hashes are excluded.
 - A failed check has no event in the canonical trace. The timeline draws a dashed red marker at
   the nearest recorded event at or before `checks[].at_ns`, groups multiple checks that resolve
   to the same event, and labels `before first recorded event` / `after last recorded event` when
@@ -171,10 +193,12 @@ source/truncated/trailing trace bytes. `just test` runs it after the C++ suite.
 ## v2 limits
 
 - No live campaign ingestion; the server reads completed artifacts.
-- No compare, minimization execution, snapshots, breakpoints, or interactive control yet.
-- The universe and trace tables are paginated at 100 rows and filter client-side. The trace API
-  refuses more than 100,000 entries or ~4.3 MB (4.1 MiB) rather than freezing the tab; a paged trace API
-  can replace that ceiling without changing the canonical trace format.
+- No minimization execution, snapshots, breakpoints, or interactive control yet.
+- The universe and trace tables are paginated at 100 rows and filter client-side. The compare view
+  compares the two selected universes only; it does not align more than two traces or build a
+  branch tree. The trace API refuses more than 100,000 entries or ~4.3 MB (4.1 MiB) rather than
+  freezing the tab; a paged trace API can replace that ceiling without changing the canonical
+  trace format.
 - The API is local-only and unauthenticated by design. Add auth only as part of a separate
   deployment decision.
 
