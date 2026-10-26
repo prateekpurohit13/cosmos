@@ -22,6 +22,15 @@ test:
     cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
     cmake --build {{build_dir}} --parallel
     ctest --test-dir {{build_dir}} --output-on-failure
+    @just ui-test
+
+# Run the local UI server contract tests (Python stdlib, no browser required)
+ui-test:
+    python3 -m unittest discover -s ui/server -p 'test_*.py' -v
+
+# Start the read-only UI server on loopback against an artifact root
+ui root="ui/fixtures" port="8000":
+    python3 ui/server/serve.py --root {{root}} --port {{port}}
 
 # Build all targets (production binaries, simulation examples, and tests)
 all:
