@@ -1156,27 +1156,29 @@ state and must be updated at the end of every implementation session.
 
 ### A.1 Current implementation snapshot
 
-As of **2026-10-26**, baseline `44c75271` (`main`) plus the Phase 1 UI work from session 3:
+As of **2026-10-26**, baseline `7661a259` (`main`) plus the Phase 2 `U2.1` timeline work from
+session 4:
 
 | Area | State | Notes |
 |---|---|---|
-| UI source | **Available** | `ui/web` is a vanilla ES-module app with no build step; `ui/server/serve.py` is a Python stdlib artifact server. |
+| UI source | **Available** | `ui/web` is a vanilla ES-module app with no build step; `ui/server/serve.py` is a Python stdlib artifact server with a read-only canonical-trace decoder. |
 | Per-universe export | **Available** | `include/cosmos/export.hpp`: `UniverseSummary`, JSON printers, `CampaignArtifactWriter`. |
 | Campaign JSON | **Available, v1** | `print_campaign_json()` and `universes.ndjson` carry `schema_version`, `Finding::at`, all seeds, trace metadata and realized config identity. |
-| Fault trace/ledger | **Exported** | Canonical trace bytes and structured ledger rows are captured per universe when a sink is attached. |
+| Fault trace/ledger | **Exported and decodable** | Canonical trace bytes and structured ledger rows are captured per universe when a sink is attached. The UI trace endpoint decodes `traces/<index>.bin` without re-encoding it. |
 | Minimization | **Available** | `minimize()` and `MinimizeReport` exist; no UI consumes them yet. |
-| UI stack | **Implemented** | Vanilla ES modules + Python stdlib server; see `O1`/`O2`/`O3` and `O11` in A.11. |
-| v1 | **Phase 1 complete** | Campaign cockpit, universe explorer/detail and finding triage render from `ui/fixtures/demo/`; no timeline/replay/control screens. |
+| UI stack | **Implemented** | Vanilla ES modules + Python stdlib server; see `O1`/`O2`/`O3`, `O11` and `O13` in A.11. |
+| v1 | **Phase 1 complete** | Campaign cockpit, universe explorer/detail and finding triage render from `ui/fixtures/demo/`. |
+| v2 | **`U2.1` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. |
 | Engine tests | **Existing** | Run the baseline before changing engine/export code. |
-| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (39 tests) runs in `just test`; campaign, universe, finding, filters, copy, theme, keyboard/focus and error states were checked in a browser. |
+| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (59 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, theme redraw, missing trace and hash mismatch were checked in a browser. |
 
-**Current phase:** Phase 2 (v2 fault timeline and finding replay); Phase 0 and Phase 1 are
-complete. **Next task:** `U2.1` — ingest canonical `traces/<index>.bin` bytes and render the
-fault timeline.
+**Current phase:** Phase 2 (v2 fault timeline and finding replay); Phase 0, Phase 1 and `U2.1` are
+complete. **Next task:** `U2.2` — replay controls and the finding → failure jump.
 
-Do not infer that “no timeline exists” means nothing is usable. Tier 1 data is already exposed:
-the v1 cockpit answers what failed, in which seed, with what ledger, whether the campaign was
-vacuous, and a build-scoped repro identity (or a command when the manifest declares one).
+The v1 cockpit answers what failed, in which seed, with what ledger, whether the campaign was
+vacuous, and a build-scoped repro identity (or a command when the manifest declares one). The v2
+timeline answers when each post-gate decision happened and whether it injected anything. Neither
+view invents engine events the artifact did not record.
 
 ### A.2 Read order for a new session
 
@@ -1271,8 +1273,8 @@ table current; a gap is closed only when a test proves the output.
 | G3 | A finding has only its first seed/index and a count. | **Closed.** `Finding::seeds` lists every failing seed in ascending universe-index order; JSON emits `seeds`. | “Show all repro seeds” | `U0.2` |
 | G4 | Per-universe `trace_hash` and verify result are not public. | **Closed.** `UniverseSummary` carries `trace_hash`, `trace_dropped`, `trace_capacity`, `verify_failed` and `verify_mismatch`. | Universe table, verify view | `U0.2` |
 | G5 | No per-universe applied config or activation set. | **Closed.** `UniverseSummary.config_json` is the realized injector config; `sites` carries each site's activation bit and counters. | Exact config display | `U0.2` |
-| G6 | Ledger is text inside a finding. | **Closed for v1.** `UniverseOutcome` copies structured `LedgerEntry` rows; the universe JSON carries both `ledger` and `ledger_text`. Timeline filtering remains v2. | Timeline, filtering, inspection | `U0.2`, `U2.1` |
-| G7 | Fault traces are not exported per universe. | **Closed.** `CampaignConfig::trace` keeps canonical `encode_trace()` bytes; the writer saves `traces/<index>.bin`. | Fault timeline, compare, minimize | `U0.2`, `U2.1` |
+| G6 | Ledger is text inside a finding. | **Closed for v1 and v2.** `UniverseOutcome` copies structured `LedgerEntry` rows; the universe JSON carries both `ledger` and `ledger_text`. The timeline correlates an exact ledger row when site, eligible call and virtual time match, and labels reason/correlation absence otherwise. | Timeline, filtering, inspection | `U0.2`, `U2.1` |
+| G7 | Fault traces are not exported per universe. | **Closed.** `CampaignConfig::trace` keeps canonical `encode_trace()` bytes; the writer saves `traces/<index>.bin`; the read-only trace API decodes them for the timeline. | Fault timeline, compare, minimize | `U0.2`, `U2.1` |
 | G8 | No campaign ID, timestamps or manifest. | **Closed.** `CampaignReport` carries `id`/`name`; `manifest.json` carries build, config, timestamps and completeness. | History, deep links, retention | `U0.1` |
 | G9 | No scheduler/network/storage/memory event stream. | Open. Only fault decisions are recorded. | Full timeline, state inspector | `U3.1`, `U3.2` |
 | G10 | No public enumeration of tasks, endpoints, files or allocations. | Open. `Scheduler`, `Net`, `StorageModel`, `TrackedHeap` expose counts/aggregates only. | State tabs | `U3.2` |
@@ -1282,6 +1284,7 @@ table current; a gap is closed only when a test proves the output.
 | G14 | No interactive control channel. | Open. Campaign forks slice workers; no per-universe command socket. | Breakpoints, pause/step | `U3.4` |
 | G15 | No schema versioning or artifact retention policy. | **Partially closed.** Every artifact object carries integer `schema_version: 1`; retention is still `O6`. | Stable UI, history | `U0.1` |
 | G16 | Campaign JSON omits trace capacity/dropped counts and per-universe trace status. | **Closed.** Campaign JSON carries `trace`/`trace_capacity`; each universe row carries `trace.dropped` and `trace.present`. | Trustworthy replay | `U0.2` |
+| G17 | Canonical `TraceEntry` has no node, task, correlation id or skip reason. | Open. The v2 timeline shows the frozen fields, an exact ledger match where one exists, and labels the absent fields rather than inventing them. | Causal replay and state tabs | `U3.1` |
 
 ### A.5.1 v1 artifact schema (frozen, `schema_version: 1`)
 
@@ -1366,24 +1369,42 @@ not a `{total, failed}` object, and it has no top-level `eligible`/`fired`: deri
 `quiesce_after_ns` (null = never), `rules` keyed by site (`rate`, `skip_first`, `max_injections`
 (null = unbounded), `amount_ns`, `fire_on_eligible_call`, `outcomes[]`), `episodes[]`, `knobs[]`.
 
-**URL scheme** (v1 routes; the server serves the SPA fallback):
+**URL scheme** (v2 routes; the server serves the SPA fallback):
 
 ```text
 /                                        campaign list
 /campaigns/<campaign-id>                 campaign cockpit
 /campaigns/<campaign-id>/universes       universe explorer
 /campaigns/<campaign-id>/universes/<seed>  universe detail
+/campaigns/<campaign-id>/universes/<seed>/timeline  fault timeline (U2.1)
 /campaigns/<campaign-id>/findings/<assertion-id>  finding triage
 ```
 
-The canonical deep-link form carries the build when a server can resolve build-scoped storage:
-`/builds/<build-id>/campaigns/<campaign-id>/universes/<seed>`. The v1 local server mounts one
+The timeline keeps its selection and search in the query string (`event`, `q`) with
+`history.replaceState`; the selection is a deep link to one canonical entry. The canonical
+deep-link form carries the build when a server can resolve build-scoped storage:
+`/builds/<build-id>/campaigns/<campaign-id>/universes/<seed>`. The local server mounts one
 artifact root and keeps the shorter form; the manifest always carries the build identity so a link
 cannot be mistaken for another build (D9).
 
-**Fixture:** `ui/fixtures/demo/` is the checked-in v1 artifact. It has four universes, one finding,
-two passes, a vacuous-site set and canonical traces. Regenerate deterministically with `nix develop
--c just ui-fixture`: the exporter writes the artifact, then `tools/normalise_ui_fixture.py` fixes
+The read-only trace API is
+`GET /api/campaigns/<campaign-id>/universes/<seed>/trace`. It resolves the universe row and
+detail document, reads `traces/<index>.bin`, validates the canonical header and fixed-width
+entries, and returns `entries[]` plus `declared_hash`, `computed_hash`, `hash_matches`,
+`seed_matches`, `count`, `size_bytes`, `capacity` and `dropped`. A hash or header-seed mismatch is
+reported with the decoded entries rather than hiding evidence; malformed bytes are a structured
+`artifact_trace_malformed` error. The endpoint refuses a trace that declares more than 100,000
+entries or whose file exceeds the corresponding ~4.3 MB (4.1 MiB) bound (`artifact_trace_too_large`) so a
+legal but enormous trace cannot materialize an unbounded JSON array in the browser. An entry whose
+`seq`, eligible index, virtual time or amount falls outside JavaScript's safe-integer range is
+rejected as `artifact_trace_malformed` rather than silently rounded. Entry `seq` values must also be
+strictly increasing, because `(universe, seq)` is the event identity. The endpoint never re-encodes
+or rewrites the canonical bytes.
+
+**Fixture:** `ui/fixtures/demo/` is the checked-in artifact. It has four universes, one finding,
+two passes, a vacuous-site set and a 24-entry canonical trace per universe spanning Memory and
+Clock lanes. Regenerate deterministically with `nix develop -c just ui-fixture`: the exporter
+writes the artifact, then `tools/normalise_ui_fixture.py` fixes
 `created_unix_ns`/`completed_unix_ns` (so `complete: true` stays consistent with the writer's
 invariant), zeroes `wall_ns` in `universes/*.json` and `universes.ndjson`, and pins the compiler
 field. Two regenerations are byte-identical.
@@ -1413,36 +1434,39 @@ field. Two regenerations are byte-identical.
 | `tests/test_trace.cpp` | Canonical encoding/hash | Do not break |
 | `tests/test_minimize.cpp` | Minimization report | UI contract fixture |
 | `tests/test_scenario.cpp` | Report, checks, coverage | Universe report fixture |
-| `tools/ui_export.cpp` | Demo artifact exporter (`cosmos_ui_export`) | Regenerates the fixture |
-| `ui/fixtures/demo/` | Checked-in v1 campaign artifact | UI smoke-test input |
+| `tools/ui_export.cpp` | Demo artifact exporter (`cosmos_ui_export`) | Regenerates the multi-lane fixture |
+| `ui/fixtures/demo/` | Checked-in deterministic campaign artifact | UI smoke-test input |
 | `docs/fault-injection.md` | Ledger/trace/vacuity semantics | UI language and invariants |
 | `docs/state-exploration.md` | Coverage guidance, snapshots | Future views |
 | `docs/architecture.md` | `Snapshot` seam | Future time travel |
-| `ui/web/` | Vanilla ES modules, HTML, CSS | v1 cockpit, explorer, universe, finding |
-| `ui/server/serve.py` | Python stdlib artifact server | Local artifact loading, API, SPA fallback |
-| `ui/server/test_serve.py` | Server contract tests | Path, schema, headers, API shape |
+| `ui/web/` | Vanilla ES modules, HTML, CSS | Cockpit, explorer, universe, finding and timeline views |
+| `ui/web/lib/trace.js` | Trace classification, search grammar, ledger correlation | Timeline semantics and deterministic search |
+| `ui/web/lib/timeline.js` | Canvas lanes, virtual-time ticks, minimap, selection | Fault timeline rendering and keyboard navigation |
+| `ui/server/serve.py` | Python stdlib artifact server | Local artifact loading, API, canonical trace decoding, SPA fallback |
+| `ui/server/test_serve.py` | Server contract tests | Path, schema, headers, API shape, trace variants |
 | `ui/README.md` | Run and data-contract notes | Operator entry point |
 
 `ui/` contains the fixture, the server and the frontend. There is still no npm build, bundler or
 frontend test framework; the browser app is directly reviewable ES modules.
 
-### A.7 Layout (implemented in session 3)
+### A.7 Layout (implemented through session 4)
 
 ```text
 ui/
   README.md              # how to run the UI, routes, API, data rules, limits
   web/                   # vanilla ES modules, HTML, CSS; no build step
     index.html
-    app.js               # shell, theme, router dispatch
+    app.js               # shell, theme, router dispatch, view teardown
     styles.css
-    lib/                 # DOM, API, formatting, fault metadata, components
-    views/               # campaigns, campaign, universes, universe, finding, errors
+    lib/                 # DOM, API, formatting, fault metadata, components, trace, timeline
+    views/               # campaigns, campaign, universes, universe, timeline, finding, errors
   server/
-    serve.py             # Python stdlib static + artifact API server
-    test_serve.py        # server contract tests
-  fixtures/demo/         # checked-in v1 campaign artifact
+    serve.py             # Python stdlib static + artifact API + canonical trace decoder
+    test_serve.py        # server contract tests (including trace variants)
+  fixtures/demo/         # checked-in deterministic artifact with canonical traces
 tools/
   ui_export.cpp          # demo exporter, builds as cosmos_ui_export
+  normalise_ui_fixture.py
 tests/
   test_ui_export.cpp     # C++ export contract tests
 ```
@@ -1467,8 +1491,8 @@ verified in one block. Statuses: `Not started`, `In progress`, `Done`, `Blocked`
 | `U1.2` | Universe explorer/detail: table, filters, checks, ledger, counters, config hash. | `U0.3`, `U0.4` | Deep-linkable universe page from fixture; counters match exported JSON. | Done — 100-row pagination (`O11`), URL-state filters, detail report. |
 | `U1.3` | Finding triage and deep links: grouping, prevalence, rare, repro, all seeds. | `U0.2`, `U1.1` | A finding links to its first universe and lists all exported seeds. | Done — prevalence, rare badge, all seed links, build-scoped repro. |
 | `U1.4` | v1 acceptance: end-to-end fixture, docs, deterministic ordering, no generated files. | `U1.1`–`U1.3` | Gate G1 below passes. | Done — G1 passes; `ui/README.md`, server tests, browser smoke. |
-| `U2.1` | Fault timeline: trace ingestion, lanes, inspector, search, minimap. | `U0.3`, `U0.4` | A trace fixture renders every entry; dropped/truncated evidence is visible. | Not started — next. |
-| `U2.2` | Replay controls and failure jump: play/step, next fault, failed-check marker. | `U2.1` | Finding → timeline at failure; event sequence and virtual time both shown. | Not started |
+| `U2.1` | Fault timeline: trace ingestion, lanes, inspector, search, minimap. | `U0.3`, `U0.4` | A trace fixture renders every entry; dropped/truncated evidence is visible. | Done — read-only trace API, canvas lanes, virtual-time ticks, minimap, search, inspector, paginated entries, warnings; fixture has 24 entries across two lanes; 59 UI tests. |
+| `U2.2` | Replay controls and failure jump: play/step, next fault, failed-check marker. | `U2.1` | Finding → timeline at failure; event sequence and virtual time both shown. | Not started — next. |
 | `U2.3` | Compare two universes: config/report/trace diff, first divergence. | `U2.1` | Side-by-side view works on two fixtures. | Not started |
 | `U2.4` | Minimize UI: display `MinimizeReport`, candidates/kept, `--only-faults` repro. | `U1.3`, `U2.1` | Report renders; 1-minimal label is explicit. Execution UI may follow. | Not started |
 | `U3.1` | Event sink contract: envelope, sequence, virtual time, gap markers, versioning; bounded ring buffer. | `U0.1` | Contract documented; dropped events are explicit; hot path allocates nothing. | Not started |
@@ -1497,9 +1521,11 @@ fixture and:
 - operate with no simulation-engine changes and no canonical trace change;
 - pass `nix develop -c just test` (and the clang suite if export code changed).
 
-**G2 — v2 timeline:** Fault trace timeline renders, finding jumps to the failed check, replay
-controls work from artifacts, two universes compare, and `MinimizeReport` is visible with the
-1-minimal label.
+**G2 — v2 timeline:** **Partially passes as of session 4.** The fault timeline renders canonical
+entries, the inspector shows frozen fields, search and selection work from artifacts, and
+dropped/truncated/absent evidence is explicit. Still open: finding → failed check and replay
+controls (`U2.2`), two-universe compare (`U2.3`), and `MinimizeReport` with the 1-minimal label
+(`U2.4`).
 
 **G3 — v3 inspection:** Event sink and state tabs work; breakpoints run in a single-universe
 process; command log is recorded; gaps are visible; telemetry does not block or allocate in the
@@ -1570,6 +1596,7 @@ consequence.
 | O10 | Schema versioning | `U0.1` | **Integer `schema_version: 1`**, additive fields, readers reject an unknown version; no field renames. | Config changes that alter decisions bump the fingerprint version; new artifact fields do not bump the schema. | Decided |
 | O11 | v1 universe-table rendering | `U1.2` | **100-row pagination with URL state** for v1. | Keeps a 10k-universe artifact usable without a virtualized DOM or a build step. Revisit virtualization when timeline/compare adds heavier views. | Decided |
 | O12 | Repro command source | `U1.3` | **Optional `manifest.repro` template containing `{seed}`; otherwise copy a build-scoped identity.** | The UI never invents program flags. A runnable command is copied only when the artifact declares one; the identity always carries program, build and seed. | Decided |
+| O13 | Where canonical trace bytes are decoded | `U2.1` | **Server-side, in `ui/server/serve.py`, into the frozen `TraceEntry` fields.** | One decoder is covered by Python contract tests against `trace.hpp` constants; the browser never parses binary or duplicates codec logic. The endpoint returns decoded entries plus hash/seed verification and never rewrites canonical bytes. Rejected: browser `ArrayBuffer` decoding (would move the compatibility gate out of the tested server) and a new artifact JSON format (would duplicate canonical bytes). | Decided |
 
 ### A.12 Risks and guardrails
 
@@ -1592,24 +1619,28 @@ consequence.
 | UI server inside simulation hits virtual sockets | Keep the control plane outside the wrapped binary. |
 | Overbuilding before the contract | Do not start a phase before its artifact surface is settled; the v1 schema is frozen. |
 | Sensitive payloads leak into artifacts | Redact bodies by default; show length/hash; opt-in hexdump. |
+| Server-side trace decoder drifts from the C++ codec | Fixed widths and enum tokens mirror `include/cosmos/trace.hpp`; fixture and synthetic trace tests prove header, entries, hash and malformed variants. The C++ codec is unchanged. |
+| A huge trace floods the browser | The timeline is a separate request; the server refuses more than 100,000 entries or ~4.3 MB / 4.1 MiB (`artifact_trace_too_large`), the table is paginated at 100 rows, and the canvas/minimap draw the sequence without one DOM node per entry. A paged trace API is the later replacement, not a silent truncation. |
+| Search hides the causal context | Non-matching events are dimmed, not removed; the table keeps all entries and match navigation jumps the selection. |
 
 ### A.13 Next action
 
-Start **`U2.1`** (Phase 2 fault timeline):
+Start **`U2.2`** (replay controls and failure jump):
 
-1. Decode canonical `traces/<index>.bin` bytes into the frozen `TraceEntry` fields without
-   changing the codec or `trace_hash`.
-2. Add a fault timeline view with lanes, an event-sequence axis, virtual-time ticks, search and a
-   minimap. Ingest the fixture traces and prove every entry renders.
-3. Add an event inspector with raw fields, status, skip reason, eligible index and correlation
-   metadata where present.
-4. Make dropped/truncated/absent evidence visible; do not present a partial trace as complete.
+1. Add deterministic playback controls over the event sequence: play/pause, step one event, next
+   injected fault, next suppressed/skipped decision and jump to virtual time. Playback speed is
+   events per second, never wall-clock simulation time.
+2. Mark the failed check on the timeline from `universe.checks[].at_ns`, and make a finding link
+   open the nearest event at or before the failure instead of the timeline start.
+3. Add a visible cursor/selection policy that works with the existing search dimming and the
+   paginated table; keep event sequence as the default axis and virtual time as annotation.
+4. Cover play/pause/step boundaries, failure selection and deep-link restoration in the browser
+   smoke pass; add server-side tests only if the API grows.
 5. Run `nix develop -c just lint` and `nix develop -c just test`; update A.1/A.8/B before
    stopping.
 
-Current first deliverable: v1 is complete; the next artifact is the fault timeline over existing
-canonical traces. The artifact contract is frozen; do not change it to fit the frontend, and do
-not put wall time on the simulation axis.
+Current first deliverable: `U2.2` over the U2.1 timeline. Do not add live control, snapshots or a
+new engine event stream in this phase, and do not change the canonical trace format.
 
 ---
 
@@ -1624,19 +1655,20 @@ Appendix A.
 | 2026-10-26 | 1 | `U0.1`–`U0.3` | Froze the v1 artifact schema and stack decisions; added `json.hpp`, `faults_json.hpp`, `export.hpp`, per-universe config/ledger/trace capture, campaign JSON v1 fields, `cosmos_ui_export`, and `ui/fixtures/demo/`. | `nix develop -c just format-check`; `nix develop -c just test` (40/40); `nix develop .#clang -c just test`; artifact JSON parsed with Python. | `U0.4` |
 | 2026-10-26 | 2 | review fixes | Ran deepseek review rounds; fixed stale re-export, worker-channel streaming/memory, UTF-8 escaping, atomic-write symlinks, manifest/report identity, index gaps and locale-stable JSON; regenerated the fixture deterministically. | `just lint`, `just test` (40/40), clang suite; fixture byte-identical across two runs. | `U0.4` |
 | 2026-10-26 | 3 | `U0.4`–`U1.4` | Added the Python stdlib artifact server, vanilla ES-module v1 dashboard (campaign cockpit, universe explorer/detail, finding triage), deterministic ordering, trace warnings, URL-state filters, theme, server contract tests and `ui/README.md`. | `nix develop -c just test` (40/40 + 39 UI tests); `nix develop .#clang -c just test`; `just lint`; browser checks on campaign, universes, universe, finding, filters, copy, theme, focus and error states; no console errors. | `U2.1` |
+| 2026-10-26 | 4 | `U2.1` | Added the server-side canonical trace decoder and read-only trace API, timeline view with canvas lanes, virtual-time ticks, minimap, search/matching, inspector, paginated entry table, hash/seed/drop warnings, event deep links, and a multi-lane 24-entry demo fixture. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 59 UI tests); browser checks on timeline rendering, selection, search/match navigation, pagination, theme redraw, missing trace and hash mismatch; no console errors. | `U2.2` |
 | YYYY-MM-DD | N | `U0.x` | What changed, what was learned, what is blocked. | Commands run / tests passed. | `U0.y` |
 
 **Next-session prompt:**
 
 ```text
-Next task: U2.1 — canonical fault trace ingestion and the fault timeline.
+Next task: U2.2 — replay controls and the finding → failure jump.
 Read: AGENTS.md, docs/ui-design.md Appendix A (A.1, A.3, A.5.1, A.8, A.11, A.13), Appendix B last row.
-Current phase/scope: Phase 2, v2 read-only replay; v1 dashboard is complete and the artifact contract is frozen.
+Current phase/scope: Phase 2, v2 read-only replay; U2.1 timeline is complete and the artifact contract is frozen.
 Decisions: D2 event sequence is the default axis, D3 artifact-first, D5 canonical trace untouched,
-           D8 1-minimal label, D10 virtual vs wall time, D12 deterministic ordering; O1/O2/O10/O11.
-Do not: change simulation semantics or the canonical trace, add live control or snapshots, or
-         commit generated files.
+D8 1-minimal label, D10 virtual vs wall time, D12 deterministic ordering; O1/O2/O10/O11/O13.
+Do not: change simulation semantics or the canonical trace, add live control, snapshots, compare,
+minimization execution, or commit generated files.
 First command: nix develop -c just test
-Done when: a trace fixture renders every canonical entry in event-sequence order, the inspector
-         shows its raw fields, and dropped/truncated evidence is visible.
+Done when: a finding opens the timeline at its failed check, play/pause/step/next-fault operate at
+deterministic event boundaries, and both event sequence and virtual time are visible.
 ```

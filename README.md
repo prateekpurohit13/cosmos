@@ -33,7 +33,7 @@ just test        # or make test (or just t)
 # Build all targets (production binaries, simulation examples, and tests)
 just all         # or make all
 
-# Serve the read-only v1 artifact UI on loopback (see ui/README.md)
+# Serve the read-only artifact UI on loopback (see ui/README.md)
 just ui
 
 # Run the UI server contract tests
