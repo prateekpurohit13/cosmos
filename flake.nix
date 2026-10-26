@@ -14,6 +14,7 @@
         cmake
         gnumake
         just
+        python3
         clang-tools
         gdb
         jujutsu

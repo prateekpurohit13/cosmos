@@ -28,13 +28,24 @@ all:
     cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
     cmake --build {{build_dir}} --parallel
 
+# Build the v1 artifact exporter and write a demo campaign directory
+ui-export dir="ui/fixtures/demo" id="demo" trials="4":
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
+    cmake --build {{build_dir}} --parallel --target cosmos_ui_export
+    {{build_dir}}/tools/cosmos_ui_export {{dir}} {{id}} {{trials}}
+
+# Regenerate the checked-in fixture deterministically (fixed timestamps, zeroed wall time)
+ui-fixture:
+    just ui-export ui/fixtures/demo demo 4
+    python3 tools/normalise_ui_fixture.py ui/fixtures/demo
+
 # Format all C/C++ source and header files
 format:
-    find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +
+    find include src tests examples tools -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format -i {} +
 
 # Check code formatting without modifying files
 format-check:
-    find include src tests examples -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} +
+    find include src tests examples tools -type f \( -name "*.cpp" -o -name "*.hpp" -o -name "*.c" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} +
 
 # Lint codebase (alias for format-check)
 lint: format-check

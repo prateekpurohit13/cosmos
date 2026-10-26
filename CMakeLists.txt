@@ -17,6 +17,7 @@ endif()
 
 add_subdirectory(src/cosmos)
 add_subdirectory(examples)
+add_subdirectory(tools)
 
 if(COSMOS_BUILD_TESTS)
     enable_testing()
