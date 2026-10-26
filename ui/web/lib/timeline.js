@@ -1,5 +1,6 @@
 import { el } from "./dom.js";
 import { formatCount, formatNs } from "./format.js";
+import { finiteTimeNs } from "./trace.js";
 import {
   entryClass,
   entryMatches,
@@ -71,8 +72,8 @@ function timeTicks(entries, plotWidth) {
   const changes = [];
   let lastAt = null;
   for (let index = 0; index < entries.length; index += 1) {
-    const at = Number(entries[index]?.at_ns);
-    if (!Number.isFinite(at)) continue;
+    const at = finiteTimeNs(entries[index]?.at_ns);
+    if (at === null) continue;
     if (lastAt === null || at !== lastAt) {
       changes.push({ index, at });
       lastAt = at;
@@ -90,24 +91,29 @@ function timeTicks(entries, plotWidth) {
   return picked;
 }
 
-export function createTimeline({ entries, tokens = [], selectedSeq = null, onSelect }) {
+export function createTimeline({ entries, tokens = [], selectedSeq = null, markers = [], onSelect }) {
   const count = entries.length;
   const counts = traceCounts(entries);
   const laneNames = laneOrder(counts);
   if (laneNames.length === 0) laneNames.push("Unknown");
+  const failureGroups = (Array.isArray(markers) ? markers : [])
+    .filter((marker) => marker && Number.isInteger(marker.index) && marker.index >= 0 && marker.index < count)
+    .slice()
+    .sort((left, right) => left.index - right.index);
+  const failureByIndex = new Map(failureGroups.map((marker) => [marker.index, marker]));
 
   const tooltip = el("div", { class: "timeline-tooltip", hidden: true });
   const canvas = el("canvas", {
     class: "timeline__canvas",
     tabindex: "0",
     role: "img",
-    "aria-label": `Fault timeline with ${count} event${count === 1 ? "" : "s"}. Use the left and right arrow keys to select an event.`,
+    "aria-label": `Fault timeline with ${count} event${count === 1 ? "" : "s"} and ${failureGroups.length} failed-check marker${failureGroups.length === 1 ? "" : "s"}. Use the left and right arrow keys to select an event.`,
   });
   const minimap = el("canvas", {
     class: "timeline__minimap",
     tabindex: "0",
     role: "img",
-    "aria-label": "Trace density minimap. Use the left and right arrow keys to select an event.",
+    "aria-label": `Trace density minimap with ${failureGroups.length} failed-check marker${failureGroups.length === 1 ? "" : "s"}. Use the left and right arrow keys to select an event.`,
   });
   const frame = el("div", { class: "timeline__frame" }, canvas, tooltip);
   const minimapFrame = el("div", { class: "timeline__minimap-frame" }, minimap);
@@ -117,8 +123,13 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
     frame,
     el(
       "p",
-      { class: "timeline__hint" },
-      "Event sequence is the horizontal axis. Virtual-time ticks annotate it; wall time is never on this axis.",
+      {
+        class: "timeline__hint",
+      },
+      "Event sequence is the horizontal axis. Virtual-time ticks annotate it; wall time is never on this axis." +
+        (failureGroups.length > 0
+          ? " A dashed red line marks the nearest recorded event at or before a failed check."
+          : ""),
     ),
     minimapFrame,
   );
@@ -134,7 +145,7 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
   const indexBySeq = new Map();
   entries.forEach((entry, index) => {
     const seq = Number(entry?.seq);
-    if (Number.isFinite(seq) && !indexBySeq.has(seq)) indexBySeq.set(seq, index);
+    if (Number.isSafeInteger(seq) && seq >= 0 && !indexBySeq.has(seq)) indexBySeq.set(seq, index);
   });
 
   const selectedIndex = () => {
@@ -233,6 +244,24 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
       ctx.fillText(`t=${formatNs(tick.at)}`, x, plotTop - 8);
     }
 
+    // Failed checks have no event of their own. Draw them at the nearest recorded decision, and
+    // keep the line behind event markers so the selection and injection shapes stay readable.
+    if (failureGroups.length > 0) {
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = palette["--red"];
+      ctx.globalAlpha = 0.55;
+      for (const marker of failureGroups) {
+        const x = Math.round(xFor(marker.index, count, left, plotWidth)) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, plotTop);
+        ctx.lineTo(x, plotBottom);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     const laneY = new Map(laneNames.map((name, index) => [name, plotTop + index * ROW_HEIGHT + ROW_HEIGHT / 2]));
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
@@ -261,6 +290,22 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
     }
     ctx.globalAlpha = 1;
 
+    if (failureGroups.length > 0) {
+      ctx.save();
+      ctx.fillStyle = palette["--red"];
+      ctx.globalAlpha = 0.9;
+      for (const marker of failureGroups) {
+        const x = xFor(marker.index, count, left, plotWidth);
+        ctx.beginPath();
+        ctx.moveTo(x, plotBottom);
+        ctx.lineTo(x, plotBottom - 6);
+        ctx.lineTo(x + 6, plotBottom);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
     const chosen = selectedIndex();
     if (chosen >= 0) {
       const entry = entries[chosen];
@@ -288,7 +333,7 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
 
     canvas.setAttribute(
       "aria-label",
-      `Fault timeline with ${count} event${count === 1 ? "" : "s"} in ${laneNames.length} lane${laneNames.length === 1 ? "" : "s"}. ${currentTokens.length > 0 ? "Non-matching events are dimmed." : ""} Use the left and right arrow keys to select an event.`,
+      `Fault timeline with ${count} event${count === 1 ? "" : "s"} in ${laneNames.length} lane${laneNames.length === 1 ? "" : "s"} and ${failureGroups.length} failed-check marker${failureGroups.length === 1 ? "" : "s"}. ${currentTokens.length > 0 ? "Non-matching events are dimmed." : ""} Use the left and right arrow keys to select an event.`,
     );
   };
 
@@ -341,6 +386,20 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
         y -= barHeight;
       }
     }
+    if (failureGroups.length > 0) {
+      ctx.save();
+      ctx.strokeStyle = palette["--red"];
+      ctx.globalAlpha = 0.8;
+      ctx.lineWidth = 1;
+      for (const marker of failureGroups) {
+        const x = ((marker.index + 0.5) / Math.max(1, count)) * width;
+        ctx.beginPath();
+        ctx.moveTo(x + 0.5, 0);
+        ctx.lineTo(x + 0.5, height);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
     const chosen = selectedIndex();
     if (chosen >= 0) {
       const x = ((chosen + 0.5) / Math.max(1, count)) * width;
@@ -350,6 +409,22 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
       ctx.moveTo(x + 0.5, 0);
       ctx.lineTo(x + 0.5, height);
       ctx.stroke();
+    }
+    // Keep a failure marker discoverable when it shares the selection x position: the accent
+    // cursor line would otherwise cover the red line completely.
+    if (failureGroups.length > 0) {
+      ctx.save();
+      ctx.fillStyle = palette["--red"];
+      for (const marker of failureGroups) {
+        const x = ((marker.index + 0.5) / Math.max(1, count)) * width;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + 6, 0);
+        ctx.lineTo(x, 6);
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.restore();
     }
     ctx.strokeStyle = palette["--line"];
     ctx.strokeRect(0.5, 0.5, width - 1, height - 1);
@@ -376,9 +451,13 @@ export function createTimeline({ entries, tokens = [], selectedSeq = null, onSel
       return;
     }
     const entry = entries[index];
+    const failure = failureByIndex.get(index);
+    const failureText = failure
+      ? ` · failed check ${failure.failures.map((item) => item.id).join(", ")}`
+      : "";
     tooltip.textContent =
       `#${formatCount(entry?.seq)} · t=${formatNs(entry?.at_ns)} · ${entrySite(entry)}` +
-      ` · ${entryOutcome(entry)} · ${entryStatus(entry)}`;
+      ` · ${entryOutcome(entry)} · ${entryStatus(entry)}${failureText}`;
     const frameRect = frame.getBoundingClientRect();
     const x = event.clientX - frameRect.left;
     const y = event.clientY - frameRect.top;
