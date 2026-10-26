@@ -2,3 +2,6 @@ build*/
 .cache/
 compile_commands.json
 .direnv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
