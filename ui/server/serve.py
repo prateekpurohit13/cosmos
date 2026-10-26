@@ -48,6 +48,11 @@ TRACE_ENTRY_BYTES = TRACE_ENTRY.size
 MAX_TRACE_ENTRIES = 100_000
 MAX_TRACE_BYTES = TRACE_HEADER_BYTES + MAX_TRACE_ENTRIES * TRACE_ENTRY_BYTES
 MAX_SAFE_JS_INTEGER = (1 << 53) - 1
+# A minimization report carries two copies of the candidate set (candidates and kept) as JSON,
+# so its bound is intentionally smaller than the trace ceiling. The UI renders the report; a
+# report larger than this is refused rather than materialized in the browser.
+MAX_MINIMIZATION_BYTES = 8 * 1024 * 1024
+MAX_MINIMIZATION_ENTRIES = 100_000
 assert TRACE_HEADER_BYTES == 17
 assert TRACE_ENTRY_BYTES == 43
 
@@ -114,6 +119,9 @@ OUTCOME_NAMES = {
     19: "TornWrite",
 }
 STATUS_NAMES = {0: "FIRED", 1: "SUPPRESSED", 2: "SKIPPED"}
+SITE_IDS_BY_NAME = {name: site_id for site_id, name in SITE_NAMES.items()}
+OUTCOME_IDS_BY_NAME = {name: outcome_id for outcome_id, name in OUTCOME_NAMES.items()}
+STATUS_IDS_BY_NAME = {name: status_id for status_id, name in STATUS_NAMES.items()}
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
 
@@ -829,6 +837,336 @@ def _trace_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, An
     return base
 
 
+def _minimization_int(value: Any, where: str, field: str, *, signed: bool = False) -> int:
+    if type(value) is not int:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: {field} must be an integer",
+        )
+    limit = MAX_SAFE_JS_INTEGER
+    if (not signed and not 0 <= value <= limit) or (signed and abs(value) > limit):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: {field} is outside the safe-integer display range",
+        )
+    return value
+
+
+def _minimization_entry(value: Any, where: str, index: int, previous_seq: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} is not an object",
+        )
+    seq = _minimization_int(value.get("seq"), where, f"entry {index} seq")
+    if seq <= previous_seq:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} has non-increasing seq {seq} after {previous_seq}",
+        )
+    site = value.get("site")
+    if not isinstance(site, str) or site not in SITE_IDS_BY_NAME:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} has an unknown site",
+        )
+    fault_class = value.get("fault_class")
+    expected_class = SITE_CLASSES[SITE_IDS_BY_NAME[site]]
+    if fault_class != expected_class:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} fault_class does not match site {site}",
+        )
+    outcome = value.get("outcome")
+    if not isinstance(outcome, str) or outcome not in OUTCOME_IDS_BY_NAME:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} has an unknown outcome",
+        )
+    status = value.get("status")
+    if not isinstance(status, str) or status not in STATUS_IDS_BY_NAME:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} has an unknown status",
+        )
+    drew = value.get("drew")
+    if type(drew) is not bool:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: entry {index} drew must be a boolean",
+        )
+    return {
+        "seq": seq,
+        "eligible_index": _minimization_int(
+            value.get("eligible_index"), where, f"entry {index} eligible_index"
+        ),
+        "at_ns": _minimization_int(value.get("at_ns"), where, f"entry {index} at_ns", signed=True),
+        "site": site,
+        "fault_class": fault_class,
+        "outcome": outcome,
+        "amount_ns": _minimization_int(
+            value.get("amount_ns"), where, f"entry {index} amount_ns", signed=True
+        ),
+        "drew": drew,
+        "status": status,
+    }
+
+
+def _minimization_entries(value: Any, where: str, field: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: {field} must be an array",
+        )
+    if len(value) > MAX_MINIMIZATION_ENTRIES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_too_large",
+            f"{where}: {field} has {len(value)} entries; this UI supports at most "
+            f"{MAX_MINIMIZATION_ENTRIES}",
+        )
+    entries: list[dict[str, Any]] = []
+    previous_seq = 0
+    for index, raw in enumerate(value):
+        entry = _minimization_entry(raw, where, index, previous_seq)
+        previous_seq = entry["seq"]
+        entries.append(entry)
+    return entries
+
+
+def _read_minimization(
+    campaign_dir: Path, manifest: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any]:
+    """Read one optional per-seed MinimizeReport document.
+
+    Absence is an explicit ``present: false`` rather than an error: a finding without a
+    minimization report is not an empty success. A document that exists but disagrees with the
+    universe seed, or whose only-faults list is not the kept set, is a structured error.
+    """
+    seed = row["seed"]
+    directory = "minimizations"
+    paths = manifest.get("paths")
+    if isinstance(paths, dict):
+        declared = paths.get("minimization_dir")
+        if isinstance(declared, str) and declared:
+            directory = declared
+    relative = f"{directory.rstrip('/')}/{seed}.json"
+    base: dict[str, Any] = {
+        "present": False,
+        "path": relative,
+        "finding_id": None,
+        "program": "",
+        "refused": False,
+        "reason": "",
+        "candidates": [],
+        "kept": [],
+        "only_faults": [],
+        "repro": None,
+        "passes": 0,
+        "replays": 0,
+        "crashed_trials": 0,
+    }
+    try:
+        path = _artifact_file(campaign_dir, directory, f"{seed}.json")
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return base
+    except ValueError as exc:
+        # Path.resolve()/stat() can reject an embedded NUL before OSError is raised. The manifest
+        # is artifact input, so this is a structured malformed report, not a generic 500.
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{relative}: invalid minimization path: {exc}",
+        ) from exc
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_unreadable",
+            f"{relative} could not be read: {exc.strerror or exc}",
+        ) from exc
+    if size > MAX_MINIMIZATION_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_too_large",
+            f"{relative}: {size} bytes exceeds the {MAX_MINIMIZATION_BYTES}-byte "
+            "minimization limit",
+        )
+
+    document = _read_json_object(path, relative)
+    where = relative
+    document_seed = document.get("seed")
+    if not isinstance(document_seed, str) or not SEED_DEC_RE.fullmatch(document_seed):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed must be a decimal string",
+        )
+    # Python integers are unbounded; a hostile document must not turn a bad seed into a generic
+    # internal_error (or a misleading mismatch). Bound the parse exactly as the row validator does.
+    try:
+        document_seed_value = int(document_seed)
+    except ValueError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed is not a representable integer",
+        ) from exc
+    if document_seed_value > MAX_SEED:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed is wider than 64 bits",
+        )
+    if document_seed_value != int(seed):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_seed_mismatch",
+            f"{where}: report seed {document_seed} does not match universe seed {seed}",
+        )
+    document_seed_hex = document.get("seed_hex")
+    if (
+        not isinstance(document_seed_hex, str)
+        or len(document_seed_hex) > 18
+        or not SEED_HEX_RE.fullmatch(document_seed_hex)
+    ):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed_hex does not match seed",
+        )
+    try:
+        document_seed_hex_value = int(document_seed_hex, 16)
+    except ValueError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed_hex is not a representable integer",
+        ) from exc
+    if document_seed_hex_value != document_seed_value:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: seed_hex does not match seed",
+        )
+    finding_id = document.get("finding_id")
+    if not isinstance(finding_id, str) or not finding_id:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: finding_id must be a non-empty string",
+        )
+    program = document.get("program")
+    if not isinstance(program, str):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: program must be a string",
+        )
+    refused = document.get("refused")
+    if type(refused) is not bool:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: refused must be a boolean",
+        )
+    reason = document.get("reason")
+    if not isinstance(reason, str):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: reason must be a string",
+        )
+    candidates = _minimization_entries(document.get("candidates"), where, "candidates")
+    kept = _minimization_entries(document.get("kept"), where, "kept")
+    candidate_seqs = {entry["seq"] for entry in candidates}
+    if any(entry["seq"] not in candidate_seqs for entry in kept):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: kept contains a seq that is not a candidate",
+        )
+    kept_seqs = [entry["seq"] for entry in kept]
+    only_faults = document.get("only_faults")
+    if not isinstance(only_faults, list) or any(
+        type(seq) is not int or seq < 0 or seq > MAX_SAFE_JS_INTEGER for seq in only_faults
+    ):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: only_faults must be an array of safe non-negative integers",
+        )
+    if only_faults != kept_seqs:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: only_faults is not the kept decision set",
+        )
+    repro = document.get("repro")
+    if refused:
+        if kept or only_faults or repro is not None:
+            raise ArtifactError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "artifact_minimization_malformed",
+                f"{where}: a refused report must not carry a kept set or repro",
+            )
+    elif not isinstance(repro, str):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: repro must be a string for a completed report",
+        )
+
+    passes = _minimization_int(document.get("passes"), where, "passes")
+    replays = _minimization_int(document.get("replays"), where, "replays")
+    crashed_trials = _minimization_int(document.get("crashed_trials"), where, "crashed_trials")
+    if crashed_trials > replays:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_minimization_malformed",
+            f"{where}: crashed_trials exceeds replays",
+        )
+    return {
+        "present": True,
+        "path": relative,
+        "finding_id": finding_id,
+        "program": program,
+        "refused": refused,
+        "reason": reason,
+        "candidates": candidates,
+        "kept": kept,
+        "only_faults": only_faults,
+        "repro": repro,
+        "passes": passes,
+        "replays": replays,
+        "crashed_trials": crashed_trials,
+    }
+
+
+def _minimization_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
+    campaign_dir = _campaign_dir(root, campaign_id)
+    manifest = _read_manifest(campaign_dir, campaign_id)
+    row = _find_universe_row(campaign_dir, seed_text)
+    detail = _read_universe_detail(campaign_dir, row)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "manifest": manifest,
+        "universe": _universe_summary(detail),
+        "minimization": _read_minimization(campaign_dir, manifest, row),
+    }
+
+
 def _is_client_route(path: str) -> bool:
     if path == "/" or path == "/campaigns":
         return True
@@ -959,6 +1297,14 @@ class UIRequestHandler(SimpleHTTPRequestHandler):
                     and segments[5] == "trace"
                 ):
                     payload = _trace_payload(
+                        self.server.artifact_root, campaign_id, segments[4]
+                    )
+                elif (
+                    len(segments) == 6
+                    and segments[3] == "universes"
+                    and segments[5] == "minimization"
+                ):
+                    payload = _minimization_payload(
                         self.server.artifact_root, campaign_id, segments[4]
                     )
                 else:

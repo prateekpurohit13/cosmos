@@ -25,6 +25,7 @@ FIXTURE_ROOT = UI_DIR / "fixtures"
 WEB_ROOT = UI_DIR / "web"
 DEMO_SEED = "16860738450190168606"
 DEMO_SEED_HEX = "0xe9fd6049d65af21e"
+DEMO_PASS_SEED = "627405149472732430"
 
 TRACE_HEADER = struct.Struct("<BQQ")
 TRACE_ENTRY = struct.Struct("<QQqQqBBB")
@@ -172,6 +173,56 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(injected[0]["outcome"], "OutOfMemory")
         self.assertTrue(any(item["fault_class"] == "Clock" for item in injected))
         self.assertTrue(any(item["outcome"] == "None" for item in trace["entries"]))
+
+    def test_fixture_minimization_report_is_1_minimal(self) -> None:
+        status, _, payload = self.json_request(
+            f"/api/campaigns/demo/universes/{DEMO_SEED}/minimization"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["universe"]["seed"], DEMO_SEED)
+        report = payload["minimization"]
+        self.assertTrue(report["present"])
+        self.assertEqual(report["path"], f"minimizations/{DEMO_SEED}.json")
+        self.assertEqual(report["finding_id"], "odd-index-fails")
+        self.assertFalse(report["refused"])
+        self.assertEqual(len(report["candidates"]), 11)
+        self.assertEqual(len(report["kept"]), 1)
+        kept = report["kept"][0]
+        self.assertEqual(report["only_faults"], [kept["seq"]])
+        self.assertEqual(kept["site"], "malloc")
+        self.assertEqual(kept["outcome"], "OutOfMemory")
+        self.assertEqual(kept["status"], "FIRED")
+        self.assertIn(f"--only-faults={kept['seq']}", report["repro"])
+        self.assertEqual(report["passes"], 2)
+        self.assertEqual(report["replays"], 13)
+        self.assertEqual(report["crashed_trials"], 0)
+
+    def test_missing_minimization_report_is_explicit_not_empty_success(self) -> None:
+        status, _, payload = self.json_request(
+            f"/api/campaigns/demo/universes/{DEMO_PASS_SEED}/minimization"
+        )
+        self.assertEqual(status, 200)
+        report = payload["minimization"]
+        self.assertFalse(report["present"])
+        self.assertEqual(report["path"], f"minimizations/{DEMO_PASS_SEED}.json")
+        self.assertIsNone(report["finding_id"])
+        self.assertIsNone(report["repro"])
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["kept"], [])
+
+    def test_minimization_endpoint_unknown_universe_is_404(self) -> None:
+        status, _, payload = self.json_request(
+            "/api/campaigns/demo/universes/123/minimization"
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "universe_not_found")
+
+    def test_minimization_endpoint_rejects_invalid_seed(self) -> None:
+        status, _, payload = self.json_request(
+            "/api/campaigns/demo/universes/nope/minimization"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_seed")
 
     def test_trace_endpoint_rejects_an_invalid_seed(self) -> None:
         status, _, payload = self.json_request("/api/campaigns/demo/universes/nope/trace")
@@ -858,6 +909,423 @@ class DotfileCase(unittest.TestCase):
         status, body = self.request("/campaigns/.dotdemo")
         self.assertEqual(status, 200)
         self.assertIn(b'id="main"', body)
+
+
+class MinimizationArtifactCase(unittest.TestCase):
+    """A synthetic artifact for MinimizationReport variants the demo fixture does not cover."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        campaign = cls.root / "minimization"
+        (campaign / "universes").mkdir(parents=True)
+        (campaign / "minimization_reports").mkdir()
+        (campaign / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "campaign_id": "minimization",
+                    "name": "Minimization variants",
+                    "complete": True,
+                    "build": {"id": "minimization-build", "mode": "SIM"},
+                    "config": {"trials": 18, "trace": True, "trace_capacity": 4096},
+                    "paths": {"minimization_dir": "minimization_reports"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (campaign / "campaign.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "campaign_id": "minimization",
+                    "name": "Minimization variants",
+                    "runs": 18,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        entries = [
+            {
+                "seq": 1,
+                "eligible_index": 1,
+                "at_ns": 0,
+                "site": "malloc",
+                "fault_class": "Memory",
+                "outcome": "OutOfMemory",
+                "amount_ns": 0,
+                "drew": True,
+                "status": "FIRED",
+            },
+            {
+                "seq": 2,
+                "eligible_index": 2,
+                "at_ns": 1_000,
+                "site": "clock_gettime",
+                "fault_class": "Clock",
+                "outcome": "ClockStep",
+                "amount_ns": 50_000,
+                "drew": True,
+                "status": "FIRED",
+            },
+            {
+                "seq": 5,
+                "eligible_index": 3,
+                "at_ns": 2_000,
+                "site": "malloc",
+                "fault_class": "Memory",
+                "outcome": "OutOfMemory",
+                "amount_ns": 0,
+                "drew": True,
+                "status": "FIRED",
+            },
+        ]
+
+        rows = []
+        for index in range(18):
+            seed = 100 + index
+            row = {
+                "schema_version": 1,
+                "index": index,
+                "seed": str(seed),
+                "status": "failed",
+                "trace": {"present": False, "traced": False, "path": None, "hash": None},
+            }
+            rows.append(row)
+            detail = {
+                "schema_version": 1,
+                "index": index,
+                "seed": str(seed),
+                "seed_hex": f"0x{seed:016x}",
+                "status": "failed",
+                "virtual_end_ns": 5_000,
+                "checks": [],
+                "trace": row["trace"],
+            }
+            (campaign / "universes" / f"{index}.json").write_text(
+                json.dumps(detail), encoding="utf-8"
+            )
+        with (campaign / "universes.ndjson").open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+        def document(seed: int, **overrides):
+            value = {
+                "schema_version": 1,
+                "seed": str(seed),
+                "seed_hex": f"0x{seed:016x}",
+                "finding_id": "double-oom",
+                "program": "test_minimization",
+                "refused": False,
+                "reason": "",
+                "candidates": entries,
+                "kept": [entries[1]],
+                "only_faults": [2],
+                "repro": f"test_minimization --seed {seed} --only-faults=2",
+                "passes": 2,
+                "replays": 6,
+                "crashed_trials": 0,
+            }
+            value.update(overrides)
+            return value
+
+        docs = {
+            100: document(100),
+            102: document(
+                102,
+                refused=True,
+                reason="the trace is truncated (2 entries dropped)",
+                candidates=[entries[0]],
+                kept=[],
+                only_faults=[],
+                repro=None,
+                passes=0,
+                replays=0,
+            ),
+            103: document(999),
+            104: document(104, only_faults=[1]),
+            105: document(105, candidates=[entries[0], entries[1]], kept=[entries[2]], only_faults=[5]),
+            106: document(
+                106,
+                candidates=[{**entries[0], "status": "DONE"}],
+                kept=[],
+                only_faults=[],
+                repro="test_minimization --seed 106 --only-faults=",
+            ),
+            107: {**document(107), "schema_version": 2},
+            109: document(109, passes=-1),
+            110: {**document(110), "seed": "9" * 100, "seed_hex": "0x" + "f" * 100},
+            113: document(113, crashed_trials=2, replays=1),
+            114: document(
+                114,
+                candidates=[entries[2], entries[0]],
+                kept=[],
+                only_faults=[],
+                repro="test_minimization --seed 114 --only-faults=",
+            ),
+            115: document(115, finding_id=""),
+            111: document(
+                111,
+                candidates=[],
+                kept=[],
+                only_faults=[],
+                repro="test_minimization --seed 111 --only-faults=",
+                passes=1,
+                replays=1,
+            ),
+        }
+        for seed, value in docs.items():
+            (campaign / "minimization_reports" / f"{seed}.json").write_text(
+                json.dumps(value), encoding="utf-8"
+            )
+        (campaign / "minimization_reports" / "108.json").write_text("{not json", encoding="utf-8")
+        with (campaign / "minimization_reports" / "112.json").open("wb") as handle:
+            handle.truncate(serve.MAX_MINIMIZATION_BYTES + 1)
+
+        def write_small_campaign(
+            name: str, paths: dict[str, str] | None = None, report: dict[str, Any] | None = None
+        ) -> None:
+            directory = cls.root / name
+            (directory / "universes").mkdir(parents=True)
+            (directory / "minimizations").mkdir()
+            manifest = {
+                "schema_version": 1,
+                "campaign_id": name,
+                "name": name,
+                "complete": True,
+                "build": {"id": f"{name}-build", "mode": "SIM"},
+                "config": {"trials": 1},
+            }
+            if paths is not None:
+                manifest["paths"] = paths
+            (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (directory / "campaign.json").write_text(
+                json.dumps({"schema_version": 1, "campaign_id": name, "runs": 1}),
+                encoding="utf-8",
+            )
+            trace_meta = {"present": False, "traced": False, "path": None, "hash": None}
+            (directory / "universes.ndjson").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "index": 0,
+                        "seed": "42",
+                        "status": "failed",
+                        "trace": trace_meta,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (directory / "universes" / "0.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "index": 0,
+                        "seed": "42",
+                        "seed_hex": f"0x{42:016x}",
+                        "status": "failed",
+                        "virtual_end_ns": 0,
+                        "checks": [],
+                        "trace": trace_meta,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if report is not None:
+                (directory / "minimizations" / "42.json").write_text(
+                    json.dumps(report), encoding="utf-8"
+                )
+
+        # A manifest-declared directory outside the campaign must be a structured escape error,
+        # not a silent "not minimized".
+        write_small_campaign("escape", {"minimization_dir": "../escape-reports"})
+        # A manifest without paths keeps the default minimizations directory.
+        write_small_campaign("fallback", None, document(42))
+        # A NUL in an untrusted manifest path is a structured error, not a generic 500.
+        write_small_campaign("nul", {"minimization_dir": "minimizations\u0000x"})
+
+        cls.server = serve.create_server(cls.root, WEB_ROOT, "127.0.0.1", 0, quiet=True)
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever,
+            kwargs={"poll_interval": 0.02},
+            daemon=True,
+        )
+        cls.thread.start()
+        cls.host, cls.port = cls.server.server_address[:2]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+        cls.temp.cleanup()
+
+    def request_json(self, seed: str):
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request(
+                "GET", f"/api/campaigns/minimization/universes/{seed}/minimization"
+            )
+            response = connection.getresponse()
+            body = response.read()
+            return response.status, json.loads(body.decode("utf-8"))
+        finally:
+            connection.close()
+
+    def test_valid_report_is_returned_with_echoed_only_faults(self) -> None:
+        status, payload = self.request_json("100")
+        self.assertEqual(status, 200)
+        report = payload["minimization"]
+        self.assertTrue(report["present"])
+        self.assertEqual(report["finding_id"], "double-oom")
+        self.assertEqual([entry["seq"] for entry in report["candidates"]], [1, 2, 5])
+        self.assertEqual([entry["seq"] for entry in report["kept"]], [2])
+        self.assertEqual(report["only_faults"], [2])
+        self.assertEqual(report["repro"], "test_minimization --seed 100 --only-faults=2")
+        self.assertEqual(report["crashed_trials"], 0)
+
+    def test_refused_report_carries_no_kept_set_or_repro(self) -> None:
+        status, payload = self.request_json("102")
+        self.assertEqual(status, 200)
+        report = payload["minimization"]
+        self.assertTrue(report["present"])
+        self.assertTrue(report["refused"])
+        self.assertIn("truncated", report["reason"])
+        self.assertEqual(report["kept"], [])
+        self.assertEqual(report["only_faults"], [])
+        self.assertIsNone(report["repro"])
+
+    def test_empty_kept_is_a_completed_report_not_a_missing_one(self) -> None:
+        status, payload = self.request_json("111")
+        self.assertEqual(status, 200)
+        report = payload["minimization"]
+        self.assertTrue(report["present"])
+        self.assertFalse(report["refused"])
+        self.assertEqual(report["kept"], [])
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["repro"], "test_minimization --seed 111 --only-faults=")
+
+    def test_absent_report_is_present_false(self) -> None:
+        status, payload = self.request_json("101")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["minimization"]["present"])
+
+    def test_seed_mismatch_is_a_structured_error(self) -> None:
+        status, payload = self.request_json("103")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_seed_mismatch")
+
+    def test_only_faults_must_equal_the_kept_set(self) -> None:
+        status, payload = self.request_json("104")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("only_faults", payload["error"]["message"])
+
+    def test_kept_must_be_a_candidate(self) -> None:
+        status, payload = self.request_json("105")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("not a candidate", payload["error"]["message"])
+
+    def test_invalid_entry_status_is_rejected(self) -> None:
+        status, payload = self.request_json("106")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("status", payload["error"]["message"])
+
+    def test_unsupported_schema_is_rejected(self) -> None:
+        status, payload = self.request_json("107")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "unsupported_schema")
+
+    def test_malformed_json_is_a_structured_error(self) -> None:
+        status, payload = self.request_json("108")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_malformed")
+
+    def test_negative_counter_is_rejected(self) -> None:
+        status, payload = self.request_json("109")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("passes", payload["error"]["message"])
+
+    def test_crashed_trials_cannot_exceed_replays(self) -> None:
+        status, payload = self.request_json("113")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("crashed_trials", payload["error"]["message"])
+
+    def test_manifest_minimization_dir_is_honored(self) -> None:
+        status, payload = self.request_json("100")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            payload["minimization"]["path"], "minimization_reports/100.json"
+        )
+
+    def test_oversized_report_is_refused_before_read(self) -> None:
+        status, payload = self.request_json("112")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_too_large")
+
+    def test_huge_report_seed_is_a_structured_error(self) -> None:
+        status, payload = self.request_json("110")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("64 bits", payload["error"]["message"])
+
+    def test_non_monotonic_candidate_seq_is_rejected(self) -> None:
+        status, payload = self.request_json("114")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("non-increasing seq", payload["error"]["message"])
+
+    def test_empty_finding_id_is_rejected(self) -> None:
+        status, payload = self.request_json("115")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+        self.assertIn("finding_id", payload["error"]["message"])
+
+    def test_manifest_minimization_dir_cannot_escape(self) -> None:
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request(
+                "GET", "/api/campaigns/escape/universes/42/minimization"
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+        self.assertEqual(response.status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_path_escape")
+
+    def test_missing_manifest_paths_falls_back_to_default_dir(self) -> None:
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request(
+                "GET", "/api/campaigns/fallback/universes/42/minimization"
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["minimization"]["present"])
+        self.assertEqual(payload["minimization"]["path"], "minimizations/42.json")
+
+    def test_nul_manifest_minimization_dir_is_a_structured_error(self) -> None:
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request("GET", "/api/campaigns/nul/universes/42/minimization")
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+        self.assertEqual(response.status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
+
 
 
 if __name__ == "__main__":
