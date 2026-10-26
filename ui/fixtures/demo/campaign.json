@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "campaign_id": "demo",
+  "name": "Cosmos demo campaign",
+  "runs": 4,
+  "failed_runs": 2,
+  "crashed_runs": 0,
+  "refused": false,
+  "verify": false,
+  "trace": true,
+  "trace_capacity": 4096,
+  "base_seed": 1,
+  "node_count": 1,
+  "parallel": 1,
+  "base_seed_dec": "1",
+  "findings": [
+    {"id": "odd-index-fails", "index": 1, "seed": 16860738450190168606, "seed_dec": "16860738450190168606", "seed_hex": "0xe9fd6049d65af21e", "at_ns": 1000000, "universes_failed": 2, "rare": false, "detail": "universe 1 was asked to fail", "ledger": "Fault ledger:\n  t=0ms    Memory   site=malloc          FIRED       drew=yes  eligible #1 -> OutOfMemory\n\nPer-site counters:  malloc eligible=1 fired=1\n", "seeds": ["16860738450190168606", "17027085370592858547"]}
+  ],
+  "never_hit": [],
+  "vacuous": [
+    {"site": "calloc", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "realloc", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "open", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "read", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "write", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "fsync", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "connect", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "accept", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "send", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "recv", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "clock_gettime", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "nanosleep", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0},
+    {"site": "getrandom", "reason": "never_activated", "activated_runs": 0, "eligible": 0, "fired": 0}
+  ],
+  "sites": {"malloc": {"activated": 4, "eligible": 4, "fired": 4}, "calloc": {"activated": 0, "eligible": 0, "fired": 0}, "realloc": {"activated": 0, "eligible": 0, "fired": 0}, "open": {"activated": 0, "eligible": 0, "fired": 0}, "read": {"activated": 0, "eligible": 0, "fired": 0}, "write": {"activated": 0, "eligible": 0, "fired": 0}, "fsync": {"activated": 0, "eligible": 0, "fired": 0}, "connect": {"activated": 0, "eligible": 0, "fired": 0}, "accept": {"activated": 0, "eligible": 0, "fired": 0}, "send": {"activated": 0, "eligible": 0, "fired": 0}, "recv": {"activated": 0, "eligible": 0, "fired": 0}, "clock_gettime": {"activated": 0, "eligible": 0, "fired": 0}, "nanosleep": {"activated": 0, "eligible": 0, "fired": 0}, "getrandom": {"activated": 0, "eligible": 0, "fired": 0}, "crash_node": {"activated": 0, "eligible": 0, "fired": 0}, "partition": {"activated": 0, "eligible": 0, "fired": 0}, "pause_node": {"activated": 0, "eligible": 0, "fired": 0}, "torn_write": {"activated": 0, "eligible": 0, "fired": 0}},
+  "out_of_scope_assertions": 0
+}
