@@ -10,6 +10,7 @@
 
 #include "cosmos/assert.hpp"
 #include "cosmos/faults_json.hpp"
+#include "cosmos/inspection.hpp"
 #include "cosmos/ledger_print.hpp"
 #include "cosmos/scenario.hpp"
 #include "cosmos/simulator.hpp"
@@ -70,6 +71,12 @@ struct CampaignConfig {
     // export. verify implies tracing but does not keep the bytes. Off by default because a trace
     // is ~48 MB per universe at the default capacity (docs/ui-design.md §7.3).
     bool trace = false;
+    // Captures the versioned inspection event stream and, optionally, the final read-only state.
+    // Both are additive artifacts (O18); disabling them leaves the canonical trace and every
+    // existing artifact field unchanged. event_capacity is per universe and never grows.
+    bool events = false;
+    uint64_t event_capacity = 4096;
+    bool state = false;
     // Named in the repro line so a finding can be re-run verbatim, e.g. "myapp_test".
     std::string program;
     // Artifact identity (docs/ui-design.md Appendix A). Optional for callers that only print a
@@ -156,6 +163,11 @@ struct CampaignReport {
     std::string name;
     bool trace = false;
     uint64_t trace_capacity = 0;
+    // Inspection intent echoed for artifact validation (O18). `events` is an observation capture,
+    // not a second replay input (D5).
+    bool events = false;
+    uint64_t event_capacity = 0;
+    bool state = false;
 };
 
 namespace detail {
@@ -179,6 +191,16 @@ struct UniverseOutcome {
     uint64_t trace_hash = 0;     // canonical trace hash, valid only when traced
     uint64_t trace_dropped = 0;  // entries the trace buffer could not hold
     uint64_t trace_capacity = 0; // the buffer this universe was given
+    // Version-1 inspection stream (O18). Presence is separate from an empty capture.
+    bool events_attached = false;
+    bool events_encoded = false;
+    uint64_t event_capacity = 0;
+    uint64_t event_dropped = 0;
+    uint64_t event_rejected = 0;
+    std::string event_bytes;
+    std::string events_error; // nonempty when encode_events() refused the capture
+    // Final read-only state document, empty unless capture_state was requested.
+    std::string state_json;
     std::string verify_mismatch; // verify's first difference, empty on a deterministic run
     // Realized config and its identity. The config can differ per universe because
     // FaultConfig::sample() draws from the Swarm stream (D14).
@@ -205,6 +227,10 @@ struct UniverseOptions {
     // Keeps the realized config JSON and structured ledger entries. Only an artifact sink needs
     // them; a report-only campaign should not pay to copy them through the worker channel.
     bool capture_metadata = false;
+    // Versioned inspection capture (U3.2). The sink is constructed before the universe body runs.
+    bool events = false;
+    uint64_t event_capacity = 4096;
+    bool state = false;
 };
 
 // Runs one universe in this process: the Simulator is per universe, so no state crosses between
@@ -218,6 +244,7 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
     {
         Simulator sim(seed);
         sim.set_default_trace_options(options.trace);
+        if (options.events) sim.enable_event_capture(options.event_capacity);
         const auto wall_start = std::chrono::steady_clock::now();
         try {
             outcome.report = build_fn(sim, index);
@@ -252,6 +279,30 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
                 print_ledger(dump, *injector);
                 outcome.report.ledger_dump = dump.str();
             }
+        }
+        // The inspection capture is read while the sink and the final state still exist. Encoding
+        // allocates, so it happens after the workload, never on the record path.
+        if (options.events) {
+            sim.record_final_events();
+            outcome.events_attached = sim.event_capture_attached();
+            outcome.event_capacity = sim.event_sink().capacity();
+            outcome.event_dropped = sim.event_sink().dropped();
+            outcome.event_rejected = sim.event_sink().rejected();
+            // A sink that was never attached must not write an empty header; presence is
+            // separate from a complete zero-event capture.
+            if (outcome.events_attached) {
+                if (const auto encoded = encode_events(sim.event_sink()); encoded.has_value()) {
+                    outcome.event_bytes = *encoded;
+                    outcome.events_encoded = true;
+                } else {
+                    outcome.events_error = name_of(encoded.error());
+                }
+            }
+        }
+        if (options.state) {
+            std::ostringstream state;
+            print_state_json(state, capture_state(sim));
+            outcome.state_json = state.str();
         }
         // Hashed here for the same reason: the trace dies with the Simulator.
         if (const auto* injector = sim.injector_or_null()) {
@@ -539,6 +590,14 @@ inline std::string serialize_outcome(const UniverseOutcome& outcome) {
     }
     put_field(bytes, outcome.ledger_dropped);
     put_text(bytes, outcome.trace_bytes);
+    put_field(bytes, static_cast<uint8_t>(outcome.events_attached ? 1 : 0));
+    put_field(bytes, static_cast<uint8_t>(outcome.events_encoded ? 1 : 0));
+    put_field(bytes, outcome.event_capacity);
+    put_field(bytes, outcome.event_dropped);
+    put_field(bytes, outcome.event_rejected);
+    put_text(bytes, outcome.event_bytes);
+    put_text(bytes, outcome.events_error);
+    put_text(bytes, outcome.state_json);
     return bytes;
 }
 
@@ -672,6 +731,18 @@ class OutcomeReader {
             parsed.ledger_entries.push_back(entry);
         }
         if (!take(parsed.ledger_dropped) || !take_text(parsed.trace_bytes)) return false;
+        uint8_t events_attached = 0;
+        uint8_t events_encoded = 0;
+        if (!take(events_attached) || !take(events_encoded) || !take(parsed.event_capacity) ||
+            !take(parsed.event_dropped) || !take(parsed.event_rejected) ||
+            !take_text(parsed.event_bytes) || !take_text(parsed.events_error) ||
+            !take_text(parsed.state_json)) {
+            return false;
+        }
+        parsed.events_attached = events_attached != 0;
+        parsed.events_encoded = events_encoded != 0;
+        if (parsed.events_encoded && !parsed.events_attached) return false;
+        if (!parsed.events_encoded && !parsed.event_bytes.empty()) return false;
 
         outcome = std::move(parsed);
         return true;
@@ -838,6 +909,10 @@ inline CampaignReport refused_report(const CampaignConfig& config, const char* d
     report.name = config.name;
     report.trace = config.verify || config.trace;
     report.trace_capacity = config.trace_capacity;
+    report.events = config.events || config.state;
+    report.event_capacity =
+        report.events ? (config.event_capacity != 0 ? config.event_capacity : 4096) : 0;
+    report.state = config.state;
     Finding finding;
     finding.id = kVerifyFailedId;
     finding.detail = detail;
@@ -937,6 +1012,9 @@ inline void print_campaign_json(std::ostream& out, const CampaignReport& report)
     out << "  \"verify\": " << (report.verify ? "true" : "false") << ",\n";
     out << "  \"trace\": " << (report.trace ? "true" : "false") << ",\n";
     out << "  \"trace_capacity\": " << report.trace_capacity << ",\n";
+    out << "  \"events\": " << (report.events ? "true" : "false") << ",\n";
+    out << "  \"event_capacity\": " << report.event_capacity << ",\n";
+    out << "  \"state\": " << (report.state ? "true" : "false") << ",\n";
     out << "  \"base_seed\": " << report.base_seed << ",\n";
     out << "  \"node_count\": " << report.node_count << ",\n";
     out << "  \"parallel\": " << report.parallel << ",\n";
@@ -1013,11 +1091,17 @@ class Campaign {
         if (config.trace && config.trace_capacity == 0) {
             return refused_report(config, "CampaignConfig::trace needs trace_capacity > 0");
         }
+        if (config.events && config.event_capacity == 0) {
+            return refused_report(config, "CampaignConfig::events needs event_capacity > 0");
+        }
         const detail::UniverseOptions options{
             .trace = {.enabled = config.verify || config.trace, .capacity = config.trace_capacity},
             .verify = config.verify,
             .keep_trace_bytes = config.trace && static_cast<bool>(config.on_universe),
             .capture_metadata = static_cast<bool>(config.on_universe),
+            .events = config.events || config.state,
+            .event_capacity = config.event_capacity != 0 ? config.event_capacity : 4096,
+            .state = config.state,
         };
         const auto& sink = config.on_universe;
 
@@ -1086,6 +1170,10 @@ class Campaign {
         report.name = config.name;
         report.trace = config.verify || config.trace;
         report.trace_capacity = config.trace_capacity;
+        report.events = config.events || config.state;
+        report.event_capacity =
+            report.events ? (config.event_capacity != 0 ? config.event_capacity : 4096) : 0;
+        report.state = config.state;
         return report;
     }
 };

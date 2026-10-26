@@ -14,6 +14,7 @@
 //   <root>/universes.ndjson       one compact row per universe, ascending index
 //   <root>/universes/<index>.json full UniverseSummary
 //   <root>/traces/<index>.bin     canonical FaultTrace bytes, when captured
+//   <root>/events/<index>.bin     versioned inspection stream bytes, when captured
 //
 // Every JSON object carries `schema_version`. Seeds and hashes that do not fit a JavaScript
 // number are decimal/hex strings; a truncated seed is not a repro identity.
@@ -51,6 +52,7 @@ inline constexpr const char* kCampaignFile = "campaign.json";
 inline constexpr const char* kUniverseIndexFile = "universes.ndjson";
 inline constexpr const char* kUniverseDir = "universes";
 inline constexpr const char* kTraceDir = "traces";
+inline constexpr const char* kEventDir = "events";
 // Optional per-seed MinimizeReport documents; a campaign may have none.
 inline constexpr const char* kMinimizationDir = "minimizations";
 
@@ -104,6 +106,14 @@ struct UniverseSummary {
     uint64_t trace_capacity = 0;
     uint64_t trace_dropped = 0;
     std::string trace_path; // relative to the campaign root, empty when absent
+    bool events_attached = false;
+    bool events_present = false;
+    uint64_t event_capacity = 0;
+    uint64_t event_dropped = 0;
+    uint64_t event_rejected = 0;
+    std::string events_path;  // relative to the campaign root, empty when absent
+    std::string events_error; // nonempty when the capture was refused by the encoder
+    std::string state_json;   // complete state object, empty when not captured
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
     SiteActivationSet activated_sites{};
@@ -111,6 +121,10 @@ struct UniverseSummary {
 
 inline std::string trace_relative_path(uint64_t index) {
     return std::string(kTraceDir) + "/" + std::to_string(index) + ".bin";
+}
+
+inline std::string event_relative_path(uint64_t index) {
+    return std::string(kEventDir) + "/" + std::to_string(index) + ".bin";
 }
 
 inline std::string minimization_relative_path(uint64_t seed) {
@@ -139,6 +153,14 @@ inline UniverseSummary summarize(const detail::UniverseOutcome& outcome) {
     summary.trace_capacity = outcome.trace_capacity;
     summary.trace_dropped = outcome.trace_dropped;
     if (summary.trace_present) summary.trace_path = trace_relative_path(outcome.index);
+    summary.events_attached = outcome.events_attached;
+    summary.events_present = outcome.events_encoded;
+    summary.event_capacity = outcome.event_capacity;
+    summary.event_dropped = outcome.event_dropped;
+    summary.event_rejected = outcome.event_rejected;
+    if (summary.events_present) summary.events_path = event_relative_path(outcome.index);
+    summary.events_error = outcome.events_error;
+    summary.state_json = outcome.state_json;
 
     const ScenarioReport& report = outcome.report;
     summary.no_check_failed = report.no_check_failed;
@@ -260,6 +282,25 @@ inline size_t failed_checks(const UniverseSummary& summary) {
     return failed;
 }
 
+inline void print_events_json(std::ostream& out, const UniverseSummary& summary) {
+    out << "{\"present\": ";
+    json::boolean(out, summary.events_present);
+    out << ", \"attached\": ";
+    json::boolean(out, summary.events_attached);
+    out << ", \"path\": ";
+    if (summary.events_path.empty()) {
+        out << "null";
+    } else {
+        json::string(out, summary.events_path);
+    }
+    out << ", \"version\": " << static_cast<unsigned>(kEventStreamVersion)
+        << ", \"capacity\": " << summary.event_capacity
+        << ", \"dropped\": " << summary.event_dropped
+        << ", \"rejected\": " << summary.event_rejected << ", \"error\": ";
+    json::string(out, summary.events_error);
+    out << '}';
+}
+
 inline void print_trace_json(std::ostream& out, const UniverseSummary& summary) {
     out << "{\"present\": ";
     json::boolean(out, summary.trace_present);
@@ -328,6 +369,14 @@ inline void print_universe_json(std::ostream& out, const UniverseSummary& summar
     }
     out << ",\n  \"trace\": ";
     print_trace_json(out, summary);
+    out << ",\n  \"events\": ";
+    print_events_json(out, summary);
+    out << ",\n  \"state\": ";
+    if (summary.state_json.empty()) {
+        out << "null";
+    } else {
+        out << summary.state_json;
+    }
     out << ",\n  \"ledger\": ";
     print_ledger_json(out, summary.ledger);
     out << ",\n  \"ledger_dropped\": " << summary.ledger_dropped;
@@ -363,6 +412,10 @@ inline void print_universe_row_json(std::ostream& out, const UniverseSummary& su
     out << ", \"virtual_end_ns\": " << summary.virtual_end.ns
         << ", \"wall_ns\": " << summary.wall_ns << ", \"trace\": ";
     print_trace_json(out, summary);
+    out << ", \"events\": ";
+    print_events_json(out, summary);
+    out << ", \"state_present\": ";
+    json::boolean(out, !summary.state_json.empty());
     out << '}';
 }
 
@@ -412,7 +465,12 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     json::boolean(out, config.verify);
     out << ", \"trace\": ";
     json::boolean(out, config.verify || config.trace);
-    out << ", \"trace_capacity\": " << config.trace_capacity << ", \"program\": ";
+    out << ", \"trace_capacity\": " << config.trace_capacity << ", \"events\": ";
+    json::boolean(out, config.events);
+    out << ", \"event_capacity\": " << (config.events ? config.event_capacity : 0)
+        << ", \"state\": ";
+    json::boolean(out, config.state);
+    out << ", \"program\": ";
     json::string(out, config.program);
     out << "},\n";
     out << "  \"paths\": {\"campaign\": ";
@@ -423,6 +481,8 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     json::string(out, kUniverseDir);
     out << ", \"trace_dir\": ";
     json::string(out, kTraceDir);
+    out << ", \"event_dir\": ";
+    json::string(out, kEventDir);
     out << ", \"minimization_dir\": ";
     json::string(out, kMinimizationDir);
     out << "}\n}\n";
@@ -660,6 +720,14 @@ class CampaignArtifactWriter {
                 fail("manifest trace intent does not match the report");
             } else if (declared.trace_capacity != report.trace_capacity) {
                 fail("manifest trace_capacity does not match the report");
+            } else if ((declared.events || declared.state) != report.events) {
+                fail("manifest events intent does not match the report");
+            } else if ((declared.events || declared.state
+                            ? (declared.event_capacity != 0 ? declared.event_capacity : 4096)
+                            : 0) != report.event_capacity) {
+                fail("manifest event_capacity does not match the report");
+            } else if (declared.state != report.state) {
+                fail("manifest state intent does not match the report");
             } else if (declared.program != report.program) {
                 fail("manifest program does not match the report");
             } else if (!report.id.empty() && declared.id != report.id) {
@@ -739,8 +807,8 @@ class CampaignArtifactWriter {
         if (has_existing_artifacts) {
             // Re-exporting the same campaign must not leave stale universe/trace files from a
             // larger previous run: a complete manifest plus leftover rows is a lying artifact.
-            for (const char* name :
-                 {kUniverseDir, kTraceDir, kMinimizationDir, kUniverseIndexFile, kCampaignFile}) {
+            for (const char* name : {kUniverseDir, kTraceDir, kEventDir, kMinimizationDir,
+                                     kUniverseIndexFile, kCampaignFile}) {
                 std::filesystem::remove_all(root / name, error);
                 if (error) {
                     return std::unexpected("remove_all(" + (root / name).string() +
@@ -756,6 +824,11 @@ class CampaignArtifactWriter {
         std::filesystem::create_directories(root / kTraceDir, error);
         if (error) {
             return std::unexpected("create_directories(" + (root / kTraceDir).string() +
+                                   "): " + error.message());
+        }
+        std::filesystem::create_directories(root / kEventDir, error);
+        if (error) {
+            return std::unexpected("create_directories(" + (root / kEventDir).string() +
                                    "): " + error.message());
         }
         std::filesystem::create_directories(root / kMinimizationDir, error);
@@ -788,6 +861,19 @@ class CampaignArtifactWriter {
         if (summary.trace_present) {
             if (auto written = export_detail::write_atomic(options_.root / summary.trace_path,
                                                            outcome.trace_bytes);
+                !written) {
+                fail(written.error());
+                return;
+            }
+        }
+        if (!outcome.events_error.empty()) {
+            fail("universe " + std::to_string(summary.index) +
+                 " event stream: " + outcome.events_error);
+            return;
+        }
+        if (summary.events_present) {
+            if (auto written = export_detail::write_atomic(options_.root / summary.events_path,
+                                                           outcome.event_bytes);
                 !written) {
                 fail(written.error());
                 return;

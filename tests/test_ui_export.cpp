@@ -510,6 +510,55 @@ void test_verify_without_trace_bytes_still_exports_a_hash() {
     std::cout << "[PASS] test_verify_without_trace_bytes_still_exports_a_hash" << std::endl;
 }
 
+void test_events_and_state_artifacts_round_trip() {
+    for (const bool explicit_events : {true, false}) {
+        const std::string name = explicit_events ? "cosmos-ui-events" : "cosmos-ui-state-only";
+        const std::filesystem::path root = test_root(name);
+        cosmos::CampaignConfig config;
+        config.trials = 1;
+        config.base_seed = 11;
+        config.parallel = 1;
+        config.id = name;
+        config.events = explicit_events;
+        config.event_capacity = explicit_events ? 64 : 0;
+        config.state = true;
+
+        auto writer = cosmos::CampaignArtifactWriter::create(artifact_options(root, config));
+        must(writer.has_value());
+        config.on_universe = writer->sink();
+        const cosmos::CampaignReport report = cosmos::Campaign::run(config, run_universe);
+        must(!report.refused);
+        must(report.events);
+        must(report.event_capacity == (explicit_events ? 64 : 4096));
+        must(report.state);
+        must(writer->finish(report).has_value());
+
+        const std::filesystem::path event_path = root / cosmos::kEventDir / "0.bin";
+        must(std::filesystem::exists(event_path));
+        const std::string bytes = read_file(event_path);
+        must(bytes.size() >= cosmos::kEventStreamHeaderBytes);
+        const auto decoded = cosmos::decode_events(bytes);
+        must(decoded.has_value());
+        must(!decoded->entries.empty());
+
+        const std::string manifest = read_file(root / cosmos::kManifestFile);
+        // The manifest keeps the requested launch switch; the report/campaign.json carries the
+        // derived intent (state implies capture), and finish() validates the derivation.
+        must(manifest.find(explicit_events ? "\"events\": true" : "\"events\": false") !=
+             std::string::npos);
+        must(manifest.find("\"state\": true") != std::string::npos);
+        const std::string universe = read_file(root / cosmos::kUniverseDir / "0.json");
+        must(universe.find("\"events\": {\"present\": true") != std::string::npos);
+        must(universe.find("\"state\": {\"schema_version\": 1") != std::string::npos);
+        const std::string row = read_file(root / cosmos::kUniverseIndexFile);
+        must(row.find("\"state_present\": true") != std::string::npos);
+
+        std::error_code ignored;
+        std::filesystem::remove_all(root, ignored);
+    }
+    std::cout << "[PASS] test_events_and_state_artifacts_round_trip" << std::endl;
+}
+
 void test_reexport_removes_stale_universe_and_trace_files() {
     const std::filesystem::path root = test_root("cosmos-ui-reexport");
     write_artifact_campaign(root, 6, "reexport");
@@ -834,6 +883,7 @@ int main() {
     test_artifact_writer_round_trips_one_campaign();
     test_artifact_writer_exports_a_minimization_report();
     test_verify_without_trace_bytes_still_exports_a_hash();
+    test_events_and_state_artifacts_round_trip();
     test_reexport_removes_stale_universe_and_trace_files();
     test_manifest_must_match_the_report_it_describes();
     test_refused_campaign_is_not_a_complete_empty_artifact();
