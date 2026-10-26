@@ -4,10 +4,10 @@ A local, read-only campaign cockpit for the schema-v1 artifacts written by
 `include/cosmos/export.hpp`. It is a separate process from the simulation binary (D4): no
 simulation semantics, canonical trace encoding, or `trace_hash` are touched.
 
-The v2 UI covers the campaign cockpit, universe explorer/detail, finding triage and the canonical
-fault timeline. It does not include a live event stream, playback controls, the finding → failure
-jump, two-universe compare, minimization execution, breakpoints, or snapshots; those are later
-tasks in `docs/ui-design.md`.
+The v2 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
+fault timeline, deterministic replay controls and the finding → failed-check jump. It does not
+include a live event stream, two-universe compare, minimization execution, breakpoints, or
+snapshots; those are later tasks in `docs/ui-design.md`.
 
 ## Run it
 
@@ -55,6 +55,13 @@ All routes are deep-linkable. Explorer filters live in the query string (`status
 `history.replaceState`, so browser navigation still moves between pages rather than filter or
 selection states.
 
+Timeline links may also carry transient `check=<assertion-id>` and `at=<virtual-time>` hints. The
+view resolves them to the nearest recorded event at or before the check/time, then replaces the
+URL with the canonical `event=<seq>` form. A finding or universe check time therefore opens the
+timeline at the failure evidence instead of the timeline start. When the failure precedes the
+first recorded event, the first event is selected and labelled; when it follows the last, the
+last event is selected and labelled.
+
 ## API
 
 The server exposes a small read-only JSON API over one artifact root:
@@ -95,7 +102,7 @@ ui/
   README.md              this file
   web/                   vanilla ES modules, HTML and CSS; no build step
     app.js               shell, theme, router dispatch, view teardown
-    lib/                 DOM, API, formatting, fault metadata, components, trace, timeline
+    lib/                 DOM, API, formatting, fault metadata, components, trace, timeline, playback
     views/               campaign list, cockpit, universes, universe, timeline, finding, errors
   server/serve.py        Python 3 stdlib static + artifact API + canonical trace decoder
   server/test_serve.py   server contract tests, including trace variants
@@ -142,6 +149,19 @@ source/truncated/trailing trace bytes. `just test` runs it after the C++ suite.
 - The table distinguishes a `FIRED` decision with `outcome: None` from an actual injection. The
   canonical trace has no reason, node, task or correlation field; the inspector shows an exact
   ledger match when one exists and labels the rest absent rather than inventing it.
+- Playback is a read-only cursor over recorded entries. It is paced in events per second
+  (`1`, `2`, `4`, `8`, `16`, `32`), never advances virtual time, and never mutates a universe.
+  `Play`/`Pause`, step, next injected fault, next suppressed/skipped decision, next failed check
+  and jump-to-virtual-time all land on canonical event boundaries. `Space`, `.`, `,`, `f`, `d`,
+  `x`, `g` and `/` are the keyboard equivalents; `Esc` pauses playback. Search dims
+  non-matching events rather than hiding them. With no selection, step selects the first event
+  and step back selects the last; playback stops at the last event instead of silently rewinding.
+  During playback the canvas cursor is coalesced to about 10 paints per second while the
+  inspector and table keep up with every event.
+- A failed check has no event in the canonical trace. The timeline draws a dashed red marker at
+  the nearest recorded event at or before `checks[].at_ns`, groups multiple checks that resolve
+  to the same event, and labels `before first recorded event` / `after last recorded event` when
+  the failure falls outside the trace span. It never invents a check event or claims causality.
 - Search dims non-matching events instead of hiding them, so causal context stays visible.
   Supported fields are `site`, `class`, `outcome`, `status`, `seq` (or `#5`), `eligible`,
   `t`/`at`, `drew`/`drew:yes`/`drew:no`, `amount`, free text and a leading `-` for negation.
@@ -151,8 +171,7 @@ source/truncated/trailing trace bytes. `just test` runs it after the C++ suite.
 ## v2 limits
 
 - No live campaign ingestion; the server reads completed artifacts.
-- No playback controls, finding → failed-check jump, compare, minimization execution, snapshots,
-  breakpoints, or interactive control yet.
+- No compare, minimization execution, snapshots, breakpoints, or interactive control yet.
 - The universe and trace tables are paginated at 100 rows and filter client-side. The trace API
   refuses more than 100,000 entries or ~4.3 MB (4.1 MiB) rather than freezing the tab; a paged trace API
   can replace that ceiling without changing the canonical trace format.
