@@ -13,6 +13,7 @@ Full documentation is available in the [`docs/`](docs/) directory:
 - [Design Specification](docs/design.md) – Authoritative public API reference and subsystem designs.
 - [Linker Interposition](docs/linker-interposition.md) – POSIX wrapper interposition mechanics and linker symbol resolution.
 - [Antithesis Study Notes](docs/antithesis-study-notes.md) – DST research and background.
+- [UI/UX Design](docs/ui-design.md) – Artifact contract and campaign/replay UI plan.
 
 ## Quick Start
 
@@ -31,6 +32,12 @@ just test        # or make test (or just t)
 
 # Build all targets (production binaries, simulation examples, and tests)
 just all         # or make all
+
+# Serve the read-only v1 artifact UI on loopback (see ui/README.md)
+just ui
+
+# Run the UI server contract tests
+just ui-test
 
 # Format codebase & check formatting
 just format      # or make format
