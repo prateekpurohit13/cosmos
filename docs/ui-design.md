@@ -1,10 +1,10 @@
 # Cosmos: UI/UX Design for Simulation Control and Inspection
 
-Status: **Phase 1 implemented (v1 browser UI); Phase 2 timeline not yet.** The v1 artifact
-contract, exporter, checked-in fixture and read-only dashboard exist
-(`include/cosmos/export.hpp`, `tools/ui_export.cpp`, `ui/fixtures/demo/`, `ui/web/`,
-`ui/server/serve.py`). This document describes the data a Cosmos UI can expose, the screens worth
-building, and the constraints determinism places on control.
+Status: **Phase 2 implemented (v2 fault timeline, replay, compare and minimization); Phase 3
+not yet.** The v1 artifact contract, exporter, checked-in fixture and read-only dashboard exist
+(`include/cosmos/export.hpp`, `include/cosmos/minimize_json.hpp`, `tools/ui_export.cpp`,
+`ui/fixtures/demo/`, `ui/web/`, `ui/server/serve.py`). This document describes the data a Cosmos UI
+can expose, the screens worth building, and the constraints determinism places on control.
 
 > **Resuming this work?** Read [Appendix A](#appendix-a-multi-session-implementation-context)
 > before writing code. It records the current state, frozen decisions, data-contract gaps,
@@ -666,6 +666,11 @@ Minimization view:
 - Exact `--only-faults=` repro.
 - A prominent note: **1-minimal, not globally minimal.**
 
+> Implementation note (v2): the shipped report-only route is
+> `/campaigns/<campaign-id>/universes/<seed>/minimization` (O17). The finding-side
+> `/findings/<assertion-id>/minimize` action and the `m` shortcut are design intent for a future
+> execution UI, not part of v2.
+
 Verify mismatch view:
 
 - Two runs side by side.
@@ -1156,8 +1161,8 @@ state and must be updated at the end of every implementation session.
 
 ### A.1 Current implementation snapshot
 
-As of **2026-10-26**, baseline `5fb8a66b` (`main`) plus the Phase 2 `U2.3` compare work from
-session 6:
+As of **2026-10-26**, baseline `444fe853` (`main`) plus the Phase 2 `U2.4` minimization work from
+session 7:
 
 | Area | State | Notes |
 |---|---|---|
@@ -1165,22 +1170,25 @@ session 6:
 | Per-universe export | **Available** | `include/cosmos/export.hpp`: `UniverseSummary`, JSON printers, `CampaignArtifactWriter`. |
 | Campaign JSON | **Available, v1** | `print_campaign_json()` and `universes.ndjson` carry `schema_version`, `Finding::at`, all seeds, trace metadata and realized config identity. |
 | Fault trace/ledger | **Exported and decodable** | Canonical trace bytes and structured ledger rows are captured per universe when a sink is attached. The UI trace endpoint decodes `traces/<index>.bin` without re-encoding it. |
-| Minimization | **Available** | `minimize()` and `MinimizeReport` exist; no UI consumes them yet. |
+| Minimization | **Exported and rendered** | `minimize()` and `MinimizeReport` exist; `print_minimize_json()` writes `minimizations/<seed>.json`, and the read-only minimization view renders candidates, kept fires, passes/replays/crashed trials and the exact `--only-faults` repro with the 1-minimal label. |
 | UI stack | **Implemented** | Vanilla ES modules + Python stdlib server; see `O1`/`O2`/`O3`, `O11` and `O13` in A.11. |
 | v1 | **Phase 1 complete** | Campaign cockpit, universe explorer/detail and finding triage render from `ui/fixtures/demo/`. |
-| v2 | **`U2.1`–`U2.3` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. Replay controls play/pause/step, jump to injected/suppressed/failure decisions and virtual time, mark failed checks at the nearest recorded event, and open findings/checks at the failure evidence. The compare view diffs config, report and canonical entries for two seeds in one campaign, labels the first event, virtual-time and report divergences, and keeps missing traces explicit. |
+| v2 | **`U2.1`–`U2.4` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. Replay controls play/pause/step, jump to injected/suppressed/failure decisions and virtual time, mark failed checks at the nearest recorded event, and open findings/checks at the failure evidence. The compare view diffs config, report and canonical entries for two seeds in one campaign, labels the first event, virtual-time and report divergences, and keeps missing traces explicit. The minimization view renders the exported `MinimizeReport`, kept/candidate tables, the exact `--only-faults` repro, refused and missing reports, and the **1-minimal, not globally minimal** label. |
 | Engine tests | **Existing** | Run the baseline before changing engine/export code. |
-| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (61 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, compare selection, same-seed/invalid-seed/empty-seed fallbacks, config diff, missing/seed-mismatched/truncated/drop-count-undeclared trace disable states, deep-link restoration, theme redraw and hash mismatch were checked in a browser. |
+| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (85 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, compare selection, same-seed/invalid-seed/empty-seed fallbacks, config diff, missing/seed-mismatched/truncated/drop-count-undeclared trace disable states, minimization present/absent/refused/empty/error states, deep-link restoration, theme redraw and hash mismatch were checked in a browser. |
 
-**Current phase:** Phase 2 (v2 fault timeline and finding replay); Phase 0, Phase 1 and
-`U2.1`–`U2.3` are complete. **Next task:** `U2.4` — minimize UI with the 1-minimal label.
+**Current phase:** Phase 2 (v2 fault timeline and finding replay) is complete: Phase 0, Phase 1 and
+`U2.1`–`U2.4` are done. **Next task:** record the Phase 3 scope change, then `U3.1` — the event
+sink contract.
 
 The v1 cockpit answers what failed, in which seed, with what ledger, whether the campaign was
 vacuous, and a build-scoped repro identity (or a command when the manifest declares one). The v2
 timeline answers when each post-gate decision happened, whether it injected anything, and where
 the failure sits relative to the recorded decisions. The compare view answers which of two
-universes diverged first and on which axis. None of these views invents engine events or ordering
-the artifact did not record.
+universes diverged first and on which axis. The minimization view answers which recorded fires
+the finding could not do without, while labelling that guarantee 1-minimal rather than global.
+None of these views invents engine events, ordering, causal claims or a minimal set the artifact
+did not record.
 
 ### A.2 Read order for a new session
 
@@ -1205,7 +1213,7 @@ nix develop .#clang -c just test
 
 ### A.3 Scope fence for the current phase
 
-**Target:** Phase 2 (v2 fault timeline and finding replay). Phase 0, Phase 1 and `U2.1`–`U2.3`
+**Target:** Phase 2 (v2 fault timeline and finding replay). Phase 0, Phase 1 and `U2.1`–`U2.4`
 are complete.
 
 We have a local, artifact-driven v1 UI: a campaign cockpit and universe/finding inspector. The
@@ -1288,6 +1296,8 @@ table current; a gap is closed only when a test proves the output.
 | G15 | No schema versioning or artifact retention policy. | **Partially closed.** Every artifact object carries integer `schema_version: 1`; retention is still `O6`. | Stable UI, history | `U0.1` |
 | G16 | Campaign JSON omits trace capacity/dropped counts and per-universe trace status. | **Closed.** Campaign JSON carries `trace`/`trace_capacity`; each universe row carries `trace.dropped` and `trace.present`. | Trustworthy replay | `U0.2` |
 | G17 | Canonical `TraceEntry` has no node, task, correlation id or skip reason. | Open. The v2 timeline shows the frozen fields, an exact ledger match where one exists, and labels the absent fields rather than inventing them. | Causal replay and state tabs | `U3.1` |
+| G18 | No per-seed `MinimizeReport` artifact or UI. | **Closed.** `print_minimize_json()` writes `minimizations/<seed>.json`; the writer exposes `write_minimization()` and rejects a second report for the same seed; the read-only minimization endpoint validates identity and kept/only-faults consistency; the finding, universe, timeline and minimization views render it with the 1-minimal label. Proved by `test_ui_export` and `test_serve`. | Minimize UI, exact repro | `U2.4` |
+| G19 | One minimization report per seed. | Open/accepted for U2.4. If a seed fails several assertions, findings are sorted by assertion id and only the first finding is minimized; the writer rejects a second document for that seed. The finding view labels a report whose `finding_id` differs rather than showing it as that finding. | Per-finding minimization reports for multi-failure seeds | Future |
 
 ### A.5.1 v1 artifact schema (frozen, `schema_version: 1`)
 
@@ -1304,6 +1314,7 @@ version rather than guessing. The implementation lives in `include/cosmos/json.h
 | `universes.ndjson` | NDJSON | One compact row per universe, ascending `index`; drives the universe table. |
 | `universes/<index>.json` | JSON object | Full `UniverseSummary`: checks, coverage, config, structured ledger, counters, trace metadata. |
 | `traces/<index>.bin` | Binary | Canonical `encode_trace()` bytes; `trace.hash` is FNV-1a over exactly these bytes. |
+| `minimizations/<seed>.json` | JSON object | Optional `MinimizeReport` for one seed: candidates, kept 1-minimal fires, exact `--only-faults` repro, passes/replays/crashed trials. |
 
 The writer is `CampaignArtifactWriter` (`include/cosmos/export.hpp`). It creates directories,
 writes through a uniquely named sibling temp file (`mkstemp`, never a fixed `.tmp` path) and
@@ -1347,7 +1358,7 @@ not a whole worker slice.
 | `error` | string | First artifact/write error, empty on success. |
 | `build.id`, `commit`, `dirty`, `binary_hash`, `mode`, `compiler`, `host` | mixed | Build identity (D9). |
 | `config.trials`, `base_seed` (string), `parallel`, `node_count`, `verify`, `trace`, `trace_capacity`, `program` | mixed | Launch config. `base_seed` also has a numeric `parent_seed` for older readers. |
-| `paths` | object | `campaign`, `universes`, `universe_dir`, `trace_dir`. |
+| `paths` | object | `campaign`, `universes`, `universe_dir`, `trace_dir`, `minimization_dir`. |
 
 **`campaign.json`** keeps the existing aggregate fields and adds: `schema_version`, `campaign_id`,
 `name`, `node_count`, `parallel`, `trace`, `trace_capacity`, `base_seed_dec`; each finding adds `at_ns`,
@@ -1368,6 +1379,23 @@ capacity, dropped}`; `hash` is null when `traced` is false.
 not a `{total, failed}` object, and it has no top-level `eligible`/`fired`: derive those totals from
 `checks[]` and `sites`.
 
+**`minimizations/<seed>.json`:** `schema_version`, `seed` (string), `seed_hex`, `finding_id` (non-empty),
+`program`, `refused`, `reason`, `candidates[]`, `kept[]`, `only_faults[]` (the kept seqs in order),
+`repro` (the exact command string; `null` only when refused), `passes`, `replays`,
+`crashed_trials`. Candidate and kept rows use the timeline's entry fields: `seq`,
+`eligible_index`, `at_ns`, `site`, `fault_class`, `outcome`, `amount_ns`, `drew`, `status`.
+Entries are in ascending `seq`; `kept` is a subset of `candidates` and `only_faults` must equal
+`kept[].seq`. An empty `kept` is a completed report meaning the finding reproduces with every
+fault withheld; a refused report has no kept set and no repro. `crashed_trials` counts signal
+terminations only; a trial that exits without reporting a verdict is not counted there but is also
+not treated as reproduction. A document larger than 8 MiB or with more than 100,000 candidates is
+refused rather than materialized. The seed, not the
+universe index, is the report identity; one report per seed is the current layout, so a
+multi-failure seed keeps the first finding's report (G19). The server reads the directory from
+`paths.minimization_dir`, falling back to `minimizations`; a manifest path that leaves the
+campaign root is rejected. The copied command is the harness invocation declared by the report; the
+viewer does not verify that the named program accepts those flags.
+
 **`config` object:** `mode`, `enabled_classes[]`, `activated_sites[]`, `limits`, `warmup_ns`,
 `quiesce_after_ns` (null = never), `rules` keyed by site (`rate`, `skip_first`, `max_injections`
 (null = unbounded), `amount_ns`, `fire_on_eligible_call`, `outcomes[]`), `episodes[]`, `knobs[]`.
@@ -1380,6 +1408,7 @@ not a `{total, failed}` object, and it has no top-level `eligible`/`fired`: deri
 /campaigns/<campaign-id>/universes       universe explorer
 /campaigns/<campaign-id>/universes/<seed>  universe detail
 /campaigns/<campaign-id>/universes/<seed>/timeline  fault timeline (U2.1)
+/campaigns/<campaign-id>/universes/<seed>/minimization  exported MinimizeReport (U2.4)
 /campaigns/<campaign-id>/compare?left=<seed>&right=<seed>  two-universe compare (U2.3)
 /campaigns/<campaign-id>/findings/<assertion-id>  finding triage
 ```
@@ -1422,9 +1451,31 @@ rejected as `artifact_trace_malformed` rather than silently rounded. Entry `seq`
 strictly increasing, because `(universe, seq)` is the event identity. The endpoint never re-encodes
 or rewrites the canonical bytes.
 
+The read-only minimization API is
+`GET /api/campaigns/<campaign-id>/universes/<seed>/minimization`. It resolves the same universe
+identity, reads the directory named by `manifest.paths.minimization_dir` (falling back to
+`minimizations`), and returns the manifest, universe summary and a normalized `minimization`
+object with `present`, `path`, `finding_id`, `program`, `refused`, `reason`, `candidates[]`,
+`kept[]`, `only_faults[]`, `repro`, `passes`, `replays` and `crashed_trials`. Absence is
+`present: false` with empty arrays and a null repro, not an error and not an empty success. A
+manifest path that leaves the campaign root is `artifact_path_escape`; a path that cannot be
+resolved (for example one containing a NUL byte) is `artifact_minimization_malformed`. A report
+whose seed disagrees with the universe is `artifact_minimization_seed_mismatch`; a malformed
+entry, non-monotonic seq, kept seq that is not a candidate, `only_faults` that is not exactly the
+kept set, an empty `finding_id`, or a seed/seed_hex wider than 64 bits is
+`artifact_minimization_malformed`; a refused report carrying a kept set or repro is also
+malformed. A document larger than 8 MiB or with more than 100,000 candidates is
+`artifact_minimization_too_large`. `crashed_trials` counts signal terminations only; a trial that
+exits without reporting a verdict is also not treated as reproduction, so the 1-minimal copy
+qualifies necessity for either case. The endpoint never runs minimization and never writes an
+artifact.
+
 **Fixture:** `ui/fixtures/demo/` is the checked-in artifact. It has four universes, one finding,
-two passes, a vacuous-site set and a 24-entry canonical trace per universe spanning Memory and
-Clock lanes. Regenerate deterministically with `nix develop -c just ui-fixture`: the exporter
+two passes, a vacuous-site set, a 24-entry canonical trace per universe spanning Memory and Clock
+lanes, and one `MinimizeReport` per failing seed. The demo check depends on both the universe
+index and an observed injected OOM, so each report keeps one real OOM fire and drops the clock
+steps; the checked-in seeds retain the same failing set. Regenerate deterministically with
+`nix develop -c just ui-fixture`: the exporter
 writes the artifact, then `tools/normalise_ui_fixture.py` fixes
 `created_unix_ns`/`completed_unix_ns` (so `complete: true` stays consistent with the writer's
 invariant), zeroes `wall_ns` in `universes/*.json` and `universes.ndjson`, and pins the compiler
@@ -1444,6 +1495,7 @@ field. Two regenerations are byte-identical.
 | `include/cosmos/ledger_print.hpp` | Text ledger renderer | Reference for structured UI rows |
 | `include/cosmos/fault_injector.hpp` | Live injector state, counters, replay cursor | Future state inspector |
 | `include/cosmos/minimize.hpp` | 1-minimal reduction report | Minimize UI |
+| `include/cosmos/minimize_json.hpp` | `MinimizeReport` JSON printer and exact repro string | Minimization artifact and view |
 | `include/cosmos/simulator.hpp` | Heap, scheduler, network, storage, nodes | State tabs |
 | `include/cosmos/task.hpp` | Scheduler/task state | Scheduler state tab |
 | `include/cosmos/net.hpp` | Endpoint and packet model | Network state/topology |
@@ -1460,20 +1512,21 @@ field. Two regenerations are byte-identical.
 | `docs/fault-injection.md` | Ledger/trace/vacuity semantics | UI language and invariants |
 | `docs/state-exploration.md` | Coverage guidance, snapshots | Future views |
 | `docs/architecture.md` | `Snapshot` seam | Future time travel |
-| `ui/web/` | Vanilla ES modules, HTML, CSS | Cockpit, explorer, universe, finding, timeline and compare views |
+| `ui/web/` | Vanilla ES modules, HTML, CSS | Cockpit, explorer, universe, finding, timeline, minimization and compare views |
 | `ui/web/lib/trace.js` | Trace classification, search grammar, ledger correlation | Timeline semantics and deterministic search |
 | `ui/web/lib/timeline.js` | Canvas lanes, virtual-time ticks, minimap, selection, failure markers | Fault timeline rendering and keyboard navigation |
 | `ui/web/lib/playback.js` | Event-boundary stepping, virtual-time targets, failure resolution | Deterministic replay controls and finding → failure jumps |
 | `ui/web/lib/compare.js` | Pairwise canonical-entry compare, fixed-order report diff, bounded config JSON diff, seed normalization | Two-universe compare semantics |
+| `ui/web/views/minimization.js` | Kept/candidate tables, exact repro, refused/missing states, 1-minimal label | Minimize view |
 | `ui/web/views/compare.js` | Compare selection, trace/report/config diff rendering, divergence labels | Two-universe compare view |
 | `ui/server/serve.py` | Python stdlib artifact server | Local artifact loading, API, canonical trace decoding, SPA fallback |
-| `ui/server/test_serve.py` | Server contract tests | Path, schema, headers, API shape, trace variants |
+| `ui/server/test_serve.py` | Server contract tests | Path, schema, headers, API shape, trace and minimization variants |
 | `ui/README.md` | Run and data-contract notes | Operator entry point |
 
 `ui/` contains the fixture, the server and the frontend. There is still no npm build, bundler or
 frontend test framework; the browser app is directly reviewable ES modules.
 
-### A.7 Layout (implemented through session 6)
+### A.7 Layout (implemented through session 7)
 
 ```text
 ui/
@@ -1483,11 +1536,11 @@ ui/
     app.js               # shell, theme, router dispatch, view teardown
     styles.css
     lib/                 # DOM, API, formatting, fault metadata, components, trace, timeline, playback, compare
-    views/               # campaigns, campaign, universes, universe, timeline, finding, compare, errors
+    views/               # campaigns, campaign, universes, universe, timeline, finding, compare, minimization, errors
   server/
-    serve.py             # Python stdlib static + artifact API + canonical trace decoder
-    test_serve.py        # server contract tests (including trace variants)
-  fixtures/demo/         # checked-in deterministic artifact with canonical traces
+    serve.py             # Python stdlib static + artifact API + canonical trace + minimization decoders
+    test_serve.py        # server contract tests (including trace and minimization variants)
+  fixtures/demo/         # checked-in deterministic artifact with canonical traces and minimization reports
 tools/
   ui_export.cpp          # demo exporter, builds as cosmos_ui_export
   normalise_ui_fixture.py
@@ -1518,7 +1571,7 @@ verified in one block. Statuses: `Not started`, `In progress`, `Done`, `Blocked`
 | `U2.1` | Fault timeline: trace ingestion, lanes, inspector, search, minimap. | `U0.3`, `U0.4` | A trace fixture renders every entry; dropped/truncated evidence is visible. | Done — read-only trace API, canvas lanes, virtual-time ticks, minimap, search, inspector, paginated entries, warnings; fixture has 24 entries across two lanes; 59 UI tests. |
 | `U2.2` | Replay controls and failure jump: play/step, next fault, failed-check marker. | `U2.1` | Finding → timeline at failure; event sequence and virtual time both shown. | Done — play/pause/step/next injected/next suppressed/next failed, virtual-time jump, dashed failure markers with honest before/after labels, finding and universe check links; browser smoke. |
 | `U2.3` | Compare two universes: config/report/trace diff, first divergence. | `U2.1` | Side-by-side view works on two fixtures. | Done — campaign-scoped compare route, pairwise canonical-entry comparison, fixed-order report diff, bounded config diff, first event/virtual-time divergence, explicit missing/truncated trace handling; browser smoke. |
-| `U2.4` | Minimize UI: display `MinimizeReport`, candidates/kept, `--only-faults` repro. | `U1.3`, `U2.1` | Report renders; 1-minimal label is explicit. Execution UI may follow. | Not started |
+| `U2.4` | Minimize UI: display `MinimizeReport`, candidates/kept, `--only-faults` repro. | `U1.3`, `U2.1` | Report renders; 1-minimal label is explicit. Execution UI may follow. | Done — `print_minimize_json`, `minimizations/<seed>.json`, read-only minimization API, dedicated view, finding/universe/timeline links, refused/empty/missing states, 85 UI tests; execution still out of scope. |
 | `U3.1` | Event sink contract: envelope, sequence, virtual time, gap markers, versioning; bounded ring buffer. | `U0.1` | Contract documented; dropped events are explicit; hot path allocates nothing. | Not started |
 | `U3.2` | Instrument scheduler, network, storage, memory; add state enumerators. | `U3.1` | Events/state cover the tabs; existing tests still pass. | Not started |
 | `U3.3` | State inspector tabs: scheduler, network, storage, memory, nodes, RNG. | `U3.2` | Paused universe shows state from the event/snapshot source. | Not started |
@@ -1545,12 +1598,15 @@ fixture and:
 - operate with no simulation-engine changes and no canonical trace change;
 - pass `nix develop -c just test` (and the clang suite if export code changed).
 
-**G2 — v2 timeline:** **Partially passes as of session 6.** The fault timeline renders canonical
+**G2 — v2 timeline:** **Passes as of session 7.** The fault timeline renders canonical
 entries, the inspector shows frozen fields, search and selection work from artifacts,
 dropped/truncated/absent evidence is explicit, playback operates at deterministic event
-boundaries, a finding or check opens the nearest recorded event at or before the failure, and two
+boundaries, a finding or check opens the nearest recorded event at or before the failure, two
 universes compare config, report and canonical entries with a labelled first event/virtual-time
-divergence. Still open: `MinimizeReport` with the 1-minimal label (`U2.4`).
+divergence, and `MinimizeReport` renders with candidates, kept fires, passes/replays/crashed
+trials, the exact `--only-faults` repro and the explicit **1-minimal, not globally minimal**
+label. Missing, refused and empty-kept reports are distinct states; the UI never runs
+minimization.
 
 **G3 — v3 inspection:** Event sink and state tabs work; breakpoints run in a single-universe
 process; command log is recorded; gaps are visible; telemetry does not block or allocate in the
@@ -1625,6 +1681,7 @@ consequence.
 | O14 | How a finding or check addresses a failure on the timeline | `U2.2` | **Transient `check=<assertion-id>` and `at=<virtual-time>` hints resolve to the last recorded event whose `at_ns` is at or before the target; the URL then canonicalizes to `event=<seq>`.** | `event` stays the only event identity. A failure after the last recorded event selects the last event and says so; one before the first selects the first and says so. The UI never fabricates a check event or claims the marker caused the failure. Rejected: inventing a synthetic check row in the canonical sequence, and leaving `check`/`at` in the canonical URL. | Decided |
 | O15 | How replay advances | `U2.2` | **A client-side cursor over recorded entries, paced in events per second (1/2/4/8/16/32), always landing on a canonical event.** | Play/pause, step, next injected, next suppressed/skipped, next failed check and virtual-time jump are observation only. They never advance virtual time, mutate a universe or add a command-log entry. Playback stops at the last event; manual selection pauses it. Rejected: wall-clock-paced virtual time and timer-driven synthetic events. | Decided |
 | O16 | How two universes are compared | `U2.3` | **One campaign-scoped route `/campaigns/<id>/compare?left=<seed>&right=<seed>`; canonical entries compare pairwise in frozen encoding order; report fields use one fixed documented order; wall time is displayed but never compared; trace hashes are identity, not a divergence signal.** | No new server endpoint: the view composes two universe details and two trace responses. `left`/`right` accept decimal or 0x seeds and canonicalize to the row's decimal string; invalid or unknown seeds fall back with a warning. Trace hash differences across seeds are expected because the canonical header carries the seed. Missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces disable event comparison explicitly instead of treating absent evidence as equal. Rejected: a server-side compare endpoint (duplicates UI logic), treating a differing trace hash as behavioural divergence, and diffing by wall time. | Decided |
+| O17 | Where a `MinimizeReport` lives and how the UI uses it | `U2.4` | **One `minimizations/<seed>.json` document per minimized seed, written after the campaign; the server validates its seed identity, entry shape and kept/`only_faults` consistency; the UI is read-only and renders the report with an explicit 1-minimal label.** | Minimization is per seed, not per campaign or timeline entry, so a separate directory avoids a stale field in `universes/<index>.json` (reports are produced after the universe row is written). Absence is `present: false`, refused stays refused, and an empty kept set remains a completed report meaning the finding reproduces with every fault withheld. The UI never executes minimization (`O5`) and never synthesizes a repro; it copies the report's exact command and shows build identity separately. Rejected: embedding the report in the universe detail (writer ordering and staleness), one campaign aggregate (loses per-seed identity), and a POST/execution endpoint (out of scope and non-deterministic to expose). | Decided |
 
 ### A.12 Risks and guardrails
 
@@ -1636,6 +1693,8 @@ consequence.
 | Data volume explodes | Aggregate by default; trace on findings/verify/pin; full capture only on demand. |
 | Vacuity is mistaken for success | Separate amber/gray group; always show reason and counters. |
 | Findings overclaim causality | Label minimization “1-minimal”; show candidates and kept sets. |
+| A 1-minimal set is read as globally minimal | The view repeats **1-minimal, not globally minimal** in the header and notice, and defines the guarantee as “no single kept fire can be removed”, not “smallest possible”; when a removal trial crashed or exited without a verdict, the view says necessity is unproven for the affected fire instead of claiming the stronger guarantee. |
+| A missing or empty minimization report is read as success | Missing is `present: false`; refused carries its reason; an empty kept set is labelled “reproduces with every fault withheld”. None is merged with the others. |
 | Seed repro is meaningless across builds | Build identity in every link; refuse seed-only repro without it. |
 | A 64-bit seed loses precision in JavaScript | Seeds and hashes are strings in every v1 artifact; the numeric `seed` remains only for old consumers. |
 | An export write failure kills a campaign | The writer records the first error and keeps running; `manifest.complete` is false and names it. |
@@ -1655,23 +1714,23 @@ consequence.
 
 ### A.13 Next action
 
-Start **`U2.4`** (minimize UI):
+Start **`U3.1`** (event sink contract) in a new phase:
 
-1. Check whether the artifact surface already carries a `MinimizeReport`. If it does not, add the
-   smallest additive, versioned artifact document or field; do not change canonical trace bytes or
-   simulation semantics.
-2. Render the candidates, kept fires, passes/replays, crashed trials and the exact
-   `--only-faults=` repro over the existing fault timeline and finding views.
-3. Make the **“1-minimal, not globally minimal”** label prominent. Do not claim global minimality,
-   causality the report does not contain, or a repro that the artifact does not declare.
-4. Keep missing/empty minimization data explicit; a finding without a report is not an empty
-   success state.
+1. Record the Phase 3 scope change first: the current fence ends with `U2.4`, and Phase 3 begins
+   engine instrumentation. The canonical trace encoding and `trace_hash` stay untouched (D5).
+2. Write the event-envelope contract: `universe, seq, virtual_time, wall_time (optional), kind,
+   node, task, correlation_id, payload`, with gap markers, a bounded ring buffer and an explicit
+   dropped-event count.
+3. Keep telemetry off the hot path (§10.2) and separate from the canonical trace (§10.3); no UI
+   call may run inside a wrapper or a live universe.
+4. Keep the minimization view read-only: do not add execution, intervention controls or
+   snapshot/branch UI in this task.
 5. Run `nix develop -c just lint` and `nix develop -c just test`; update A.1/A.5/A.8/A.11/B before
    stopping.
 
-Current first deliverable: `U2.4` over the existing artifact surface. Do not add live control,
-snapshots or a new engine event stream in this phase, and do not change the canonical trace
-format.
+Current first deliverable: `U3.1` (event sink contract). Do not add live control, snapshots or a
+new engine event stream without the recorded Phase 3 scope change, and do not change the canonical
+trace format.
 
 ---
 
@@ -1689,18 +1748,22 @@ Appendix A.
 | 2026-10-26 | 4 | `U2.1` | Added the server-side canonical trace decoder and read-only trace API, timeline view with canvas lanes, virtual-time ticks, minimap, search/matching, inspector, paginated entry table, hash/seed/drop warnings, event deep links, and a multi-lane 24-entry demo fixture. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 59 UI tests); browser checks on timeline rendering, selection, search/match navigation, pagination, theme redraw, missing trace and hash mismatch; no console errors. | `U2.2` |
 | 2026-10-26 | 5 | `U2.2` | Added deterministic replay controls (play/pause, step, next injected/suppressed/failed, event-boundary jump-to-virtual-time), failed-check markers at the nearest recorded event, a failed-checks table, and finding/universe links that open the timeline at the failure. Timeline `check`/`at` hints canonicalize to `event`. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 59 UI tests); browser checks on playback boundaries, keyboard shortcuts, speed changes, failure markers in both themes, finding and seed/check jumps, check/at fallbacks, deep-link restoration, missing trace and no console errors. | `U2.3` |
 | 2026-10-26 | 6 | `U2.3` | Added the campaign-scoped compare route and view, deterministic pairwise canonical-entry comparison, fixed-order report diff, bounded realized-config diff, first event/virtual-time/report divergence labels, seed canonicalization and fallback warnings, same-seed handling, and explicit disable states for missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces. Added compare links from universe/timeline views and a small focus/scroll restoration for query-only renders. No server API or canonical trace change. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 61 UI tests); `nix develop .#clang -c just test`; browser checks on two-universe compare, selector/swap focus/scroll, same seed, invalid/unknown/empty seeds, missing/malformed/seed-mismatched/truncated/undeclared-drop traces, changed config hash, deep links, theme, and no console errors. | `U2.4` |
+| 2026-10-26 | 7 | `U2.4` | Added `print_minimize_json()`, the optional `minimizations/<seed>.json` artifact layout and writer API with stale-report cleanup and duplicate-seed rejection, validated read-only minimization API, the dedicated minimization view, finding/universe/timeline links, and explicit present/refused/empty/missing states. The demo check now depends on an observed injected OOM, so the fixture carries real non-empty kept sets without changing the failing universes or traces; added 24 server contract tests and the C++ JSON/writer tests. The UI never executes minimization and repeats the 1-minimal label. | `nix develop -c just lint`; `nix develop -c just test` (C++ + 85 UI tests); `nix develop .#clang -c just test`; two `just ui-fixture` runs byte-identical; browser checks on finding minimization panel, dedicated report, kept/candidate tables, missing report, timeline-at-kept-event link, theme, and no console errors. | Phase 3 scope change, then `U3.1` |
 
 **Next-session prompt:**
 
 ```text
-Next task: U2.4 — MinimizeReport UI with the explicit 1-minimal label.
-Read: AGENTS.md, docs/ui-design.md Appendix A (A.1, A.3, A.5.1, A.8, A.11, A.13), Appendix B last row.
-Current phase/scope: Phase 2, v2 read-only replay; U2.1–U2.3 are complete and the artifact contract is frozen.
-Decisions: D3 artifact-first, D5 canonical trace untouched, D8 1-minimal label, D10 virtual vs wall time,
-D12 deterministic ordering; O5 report-only minimization, O10 schema versioning, O13–O16.
-Do not: change simulation semantics or the canonical trace, add live control, snapshots, minimization
-execution, or commit generated files.
+Next task: U3.1 — event sink contract (envelope, sequence, virtual time, gap markers, versioning,
+bounded ring buffer).
+Read: AGENTS.md, docs/ui-design.md Appendix A (A.1, A.3, A.5, A.8, A.11, A.13), Appendix B last row.
+Current phase: Phase 2 is complete (U2.1–U2.4); Phase 3 requires a recorded scope change first.
+Decisions: D3 artifact-first, D5 canonical trace untouched, D8 1-minimal label, D10 virtual vs wall
+time, D12 deterministic ordering; O5 report-only minimization, O10 schema versioning, O13–O17.
+Do not: change simulation semantics or the canonical trace, add live control, snapshots,
+minimization execution, or commit generated files.
 First command: nix develop -c just test
-Done when: a MinimizeReport renders candidates and kept fires, passes/replays/crashed trials, the exact
---only-faults repro, and the 1-minimal label is explicit; missing report data stays explicit too.
+Done when: the event-envelope contract is documented and implemented with explicit dropped-event
+counts, the hot path allocates nothing, the canonical trace and trace_hash are unchanged, and the
+
+existing C++ and UI suites pass.
 ```

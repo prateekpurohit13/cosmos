@@ -5,9 +5,9 @@ A local, read-only campaign cockpit for the schema-v1 artifacts written by
 simulation semantics, canonical trace encoding, or `trace_hash` are touched.
 
 The v2 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
-fault timeline, deterministic replay controls, the finding → failed-check jump, and two-universe
-compare. It does not include a live event stream, minimization execution, breakpoints, or
-snapshots; those are later tasks in `docs/ui-design.md`.
+fault timeline, deterministic replay controls, the finding → failed-check jump, two-universe
+compare, and the exported minimization report. It does not include a live event stream,
+minimization execution, breakpoints, or snapshots; those are later tasks in `docs/ui-design.md`.
 
 ## Run it
 
@@ -48,6 +48,7 @@ Two regenerations are byte-identical.
 | `/campaigns/<campaign-id>/universes` | Universe explorer |
 | `/campaigns/<campaign-id>/universes/<seed>` | Universe detail |
 | `/campaigns/<campaign-id>/universes/<seed>/timeline` | Fault timeline |
+| `/campaigns/<campaign-id>/universes/<seed>/minimization` | Exported minimization report |
 | `/campaigns/<campaign-id>/compare?left=<seed>&right=<seed>` | Two-universe compare |
 | `/campaigns/<campaign-id>/findings/<assertion-id>` | Finding triage |
 
@@ -79,6 +80,7 @@ The server exposes a small read-only JSON API over one artifact root:
 | `GET /api/campaigns/<id>/universes` | `{schema_version, campaign_id, manifest, universes[]}` |
 | `GET /api/campaigns/<id>/universes/<seed>` | `{schema_version, campaign_id, manifest, campaign (summary), universe}` |
 | `GET /api/campaigns/<id>/universes/<seed>/trace` | `{schema_version, campaign_id, manifest, universe (summary), trace}` |
+| `GET /api/campaigns/<id>/universes/<seed>/minimization` | `{schema_version, campaign_id, manifest, universe (summary), minimization}` |
 
 The trace response decodes `traces/<index>.bin` into the frozen `TraceEntry` fields and adds
 `count`, `size_bytes`, `computed_hash`, `declared_hash`, `hash_matches`, `seed_matches` and the
@@ -97,6 +99,16 @@ invalid seeds, non-loopback `Host` headers, and paths that resolve outside the a
 Artifacts are validated as `schema_version: 1`; an unsupported or malformed artifact returns a
 structured JSON error rather than guessing or dropping the connection.
 
+The minimization endpoint reads the optional `minimizations/<seed>.json` document after resolving
+the universe row. Absence is `present: false` with empty arrays and a null `repro`, never an error
+and never an empty success. A report whose seed disagrees with the universe is
+`artifact_minimization_seed_mismatch`; a malformed entry, non-monotonic seq, kept seq that is not a
+candidate, or `only_faults` that is not exactly the kept set is
+`artifact_minimization_malformed`; a refused report carrying a kept set or repro is also
+malformed. The endpoint refuses documents larger than 8 MiB or with more than 100,000 candidates
+(`artifact_minimization_too_large`) and never runs minimization or writes an artifact. It reads the
+directory named by `manifest.paths.minimization_dir` and falls back to `minimizations`.
+
 Catalog entries carry `readable: true` for a loadable manifest and `readable: false` plus
 `catalog_error` when the manifest cannot be read. A readable campaign with `complete: false` stays
 openable; the cockpit shows its write error instead of hiding the artifact.
@@ -109,10 +121,10 @@ ui/
   web/                   vanilla ES modules, HTML and CSS; no build step
     app.js               shell, theme, router dispatch, view teardown
     lib/                 DOM, API, formatting, fault metadata, components, trace, timeline, playback, compare
-    views/               campaign list, cockpit, universes, universe, timeline, finding, compare, errors
+    views/               campaign list, cockpit, universes, universe, timeline, finding, minimization, compare, errors
   server/serve.py        Python 3 stdlib static + artifact API + canonical trace decoder
-  server/test_serve.py   server contract tests, including trace variants
-  fixtures/demo/         checked-in deterministic artifact with 24-entry traces
+  server/test_serve.py   server contract tests, including trace and minimization variants
+  fixtures/demo/         checked-in deterministic artifact with 24-entry traces and minimization reports
 ```
 
 The server serves `ui/web` and falls back to `index.html` for `/campaigns/...` client routes. It
@@ -130,8 +142,9 @@ The suite covers the catalog, campaign/universe payloads, decimal and hex seed l
 rejection, Host validation, NUL paths, non-finite/surrogate artifact values, SPA fallback
 (including the compare route), static content types, HEAD behavior, security headers, broken
 artifacts, canonical trace decoding, multi-entry ordering, hash/seed mismatch reporting, missing
-trace files, and malformed source/truncated/trailing trace bytes. `just test` runs it after the
-C++ suite.
+trace files, malformed source/truncated/trailing trace bytes, and minimization
+present/refused/empty/missing/seed-mismatch/only-faults/entry-schema/oversize variants. `just test`
+runs it after the C++ suite.
 
 ## Data rules the UI relies on
 
@@ -180,6 +193,16 @@ C++ suite.
   sorted by id); coverage hits by id; sites (`activated`/`eligible`/`fired`) in slot order; ledger
   row count and the first differing row in the recorded prefix (`ledger_dropped` is shown
   separately). Wall time, `seed` and trace hashes are excluded.
+- Minimization is report-only (O5). The view reads the exported `MinimizeReport`; it never runs
+  the minimizer, changes a universe or rewrites a trace. The guarantee is **1-minimal, not
+  globally minimal**: every kept fire is necessary unless its removal trial crashed or exited
+  without a verdict, and the set is not proven smallest. `crashed_trials` counts signal
+  terminations only. Missing
+  reports (`present: false`), refused reports (with their reason) and empty kept sets (the finding
+  reproduces with every fault withheld) are three distinct states, never merged into success. The
+  repro command is copied from the report; the UI does not synthesize `--only-faults` flags, and
+  the build identity is shown separately. The copied command is the report's harness invocation;
+  the viewer does not verify that the named program accepts those flags.
 - A failed check has no event in the canonical trace. The timeline draws a dashed red marker at
   the nearest recorded event at or before `checks[].at_ns`, groups multiple checks that resolve
   to the same event, and labels `before first recorded event` / `after last recorded event` when
@@ -193,12 +216,18 @@ C++ suite.
 ## v2 limits
 
 - No live campaign ingestion; the server reads completed artifacts.
-- No minimization execution, snapshots, breakpoints, or interactive control yet.
-- The universe and trace tables are paginated at 100 rows and filter client-side. The compare view
+- No minimization execution, snapshots, breakpoints, or interactive control yet. The minimization
+  view renders exported reports only. The artifact layout holds one report per seed: if a seed
+  fails several assertions, the first finding in report order is minimized and the writer rejects
+  a second report for that seed. The finding view labels a report whose `finding_id` differs
+  instead of showing it as that finding.
+- The universe, trace, candidate and kept tables are paginated at 100 rows; the universe and
+  trace filters are client-side. The compare view
   compares the two selected universes only; it does not align more than two traces or build a
   branch tree. The trace API refuses more than 100,000 entries or ~4.3 MB (4.1 MiB) rather than
   freezing the tab; a paged trace API can replace that ceiling without changing the canonical
-  trace format.
+  trace format. The minimization API refuses reports larger than 8 MiB or with more than 100,000
+  candidates.
 - The API is local-only and unauthenticated by design. Add auth only as part of a separate
   deployment decision.
 
