@@ -51,6 +51,8 @@ inline constexpr const char* kCampaignFile = "campaign.json";
 inline constexpr const char* kUniverseIndexFile = "universes.ndjson";
 inline constexpr const char* kUniverseDir = "universes";
 inline constexpr const char* kTraceDir = "traces";
+// Optional per-seed MinimizeReport documents; a campaign may have none.
+inline constexpr const char* kMinimizationDir = "minimizations";
 
 struct BuildInfo {
     // Content address of the build. The caller supplies it; an empty id falls back to the binary
@@ -109,6 +111,10 @@ struct UniverseSummary {
 
 inline std::string trace_relative_path(uint64_t index) {
     return std::string(kTraceDir) + "/" + std::to_string(index) + ".bin";
+}
+
+inline std::string minimization_relative_path(uint64_t seed) {
+    return std::string(kMinimizationDir) + "/" + std::to_string(seed) + ".json";
 }
 
 inline UniverseSummary summarize(const detail::UniverseOutcome& outcome) {
@@ -417,6 +423,8 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     json::string(out, kUniverseDir);
     out << ", \"trace_dir\": ";
     json::string(out, kTraceDir);
+    out << ", \"minimization_dir\": ";
+    json::string(out, kMinimizationDir);
     out << "}\n}\n";
 }
 
@@ -573,6 +581,39 @@ class CampaignArtifactWriter {
         return [this](const detail::UniverseOutcome& outcome) { write_universe(outcome); };
     }
 
+    // Write one schema-v1 MinimizeReport document under minimizations/<seed>.json. Reports are
+    // optional and parent-side: minimization runs after the campaign, so this must be called
+    // after the universe that owns the seed has arrived. The caller renders the document with
+    // print_minimize_json(); an empty body is refused rather than written.
+    std::expected<void, std::string> write_minimization(uint64_t seed, std::string_view json) {
+        if (finished_) return std::unexpected("the artifact writer is already finished");
+        if (!error_.empty()) return std::unexpected(error_);
+        if (json.empty()) {
+            fail("minimization document is empty");
+            return std::unexpected(error_);
+        }
+        if (std::find(seeds_.begin(), seeds_.end(), seed) == seeds_.end()) {
+            fail("minimization seed " + std::to_string(seed) + " was not written by this campaign");
+            return std::unexpected(error_);
+        }
+        // The artifact layout holds one report per seed. A caller that minimizes the same seed
+        // for two findings must not silently replace the first document; the finding identity is
+        // part of the report, not the filename. Per-finding documents are a future addition.
+        if (std::find(minimized_seeds_.begin(), minimized_seeds_.end(), seed) !=
+            minimized_seeds_.end()) {
+            fail("a minimization report for seed " + std::to_string(seed) + " was already written");
+            return std::unexpected(error_);
+        }
+        if (auto written =
+                export_detail::write_atomic(options_.root / minimization_relative_path(seed), json);
+            !written) {
+            fail(written.error());
+            return std::unexpected(error_);
+        }
+        minimized_seeds_.push_back(seed);
+        return {};
+    }
+
     std::expected<void, std::string> finish(const CampaignReport& report) {
         if (finished_) {
             if (error_.empty()) return {};
@@ -698,7 +739,8 @@ class CampaignArtifactWriter {
         if (has_existing_artifacts) {
             // Re-exporting the same campaign must not leave stale universe/trace files from a
             // larger previous run: a complete manifest plus leftover rows is a lying artifact.
-            for (const char* name : {kUniverseDir, kTraceDir, kUniverseIndexFile, kCampaignFile}) {
+            for (const char* name :
+                 {kUniverseDir, kTraceDir, kMinimizationDir, kUniverseIndexFile, kCampaignFile}) {
                 std::filesystem::remove_all(root / name, error);
                 if (error) {
                     return std::unexpected("remove_all(" + (root / name).string() +
@@ -714,6 +756,11 @@ class CampaignArtifactWriter {
         std::filesystem::create_directories(root / kTraceDir, error);
         if (error) {
             return std::unexpected("create_directories(" + (root / kTraceDir).string() +
+                                   "): " + error.message());
+        }
+        std::filesystem::create_directories(root / kMinimizationDir, error);
+        if (error) {
+            return std::unexpected("create_directories(" + (root / kMinimizationDir).string() +
                                    "): " + error.message());
         }
         rows_.open(root / kUniverseIndexFile, std::ios::binary | std::ios::trunc);
@@ -764,6 +811,7 @@ class CampaignArtifactWriter {
             fail("append(" + universe_index_path() + ") failed");
             return;
         }
+        seeds_.push_back(summary.seed);
         ++written_;
     }
 
@@ -772,6 +820,8 @@ class CampaignArtifactWriter {
     int64_t created_unix_ns_ = 0;
     int64_t completed_unix_ns_ = 0;
     uint64_t written_ = 0;
+    std::vector<uint64_t> seeds_;
+    std::vector<uint64_t> minimized_seeds_;
     std::string error_;
     bool finished_ = false;
 };

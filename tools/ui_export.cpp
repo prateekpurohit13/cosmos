@@ -11,14 +11,19 @@
 
 #include "cosmos/campaign.hpp"
 #include "cosmos/export.hpp"
+#include "cosmos/minimize.hpp"
+#include "cosmos/minimize_json.hpp"
 #include "cosmos/scenario.hpp"
 
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <time.h>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -46,6 +51,32 @@ cosmos::FaultConfig demo_plan() {
 // interleaves memory and clock decisions so the exported trace has more than one lane and more
 // than one virtual timestamp. A fired OOM returns null; freeing null is harmless, so the demo
 // application never has to recover from the fault to stay deterministic.
+//
+// The check is a pure function of the universe index *and* whether an injected OOM was observed,
+// which gives the minimizer something real to keep: for a failing odd index the finding needs at
+// least one OOM fire and does not need the clock steps. (The campaign's odd universes all see an
+// OOM, so this is the same failing set the earlier index-only check described.)
+void run_demo_body(cosmos::Scenario& scenario, uint64_t index) {
+    bool injected_oom = false;
+    scenario.run([&injected_oom, &scenario] {
+        for (int step = 0; step < 12; ++step) {
+            void* block = std::malloc(16);
+            if (block == nullptr) injected_oom = true;
+            std::free(block);
+            struct timespec now{};
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            scenario.simulator().advance_time(cosmos::Duration{100'000});
+        }
+    });
+    scenario.quiesce();
+    // A non-zero virtual end makes the artifact's time labels reviewable.
+    scenario.simulator().advance_time(cosmos::Duration{1'000'000});
+    scenario.check(
+        "odd-index-fails", [index, injected_oom] { return index % 2 == 0 || !injected_oom; },
+        "universe " + std::to_string(index) + " was asked to fail");
+    scenario.note_covered("odd-index-seen", index % 2 == 1);
+}
+
 cosmos::ScenarioReport run_demo_universe(cosmos::Simulator& sim, uint64_t index) {
     auto scenario = cosmos::Scenario::on(sim, demo_plan());
     if (!scenario) {
@@ -53,22 +84,7 @@ cosmos::ScenarioReport run_demo_universe(cosmos::Simulator& sim, uint64_t index)
         rejected.no_check_failed = false;
         return rejected;
     }
-    scenario->run([&sim] {
-        for (int step = 0; step < 12; ++step) {
-            void* block = std::malloc(16);
-            std::free(block);
-            struct timespec now{};
-            (void)clock_gettime(CLOCK_MONOTONIC, &now);
-            sim.advance_time(cosmos::Duration{100'000});
-        }
-    });
-    scenario->quiesce();
-    // A non-zero virtual end makes the artifact's time labels reviewable.
-    sim.advance_time(cosmos::Duration{1'000'000});
-    scenario->check(
-        "odd-index-fails", [index] { return index % 2 == 0; },
-        "universe " + std::to_string(index) + " was asked to fail");
-    scenario->note_covered("odd-index-seen", index % 2 == 1);
+    run_demo_body(*scenario, index);
     return scenario->report();
 }
 
@@ -113,16 +129,123 @@ int main(int argc, char** argv) {
         std::cerr << "cosmos_ui_export: " << writer.error() << "\n";
         return 1;
     }
-    campaign.on_universe = writer->sink();
+    // The writer receives every outcome in index order. Keep only the small identity map for all
+    // universes and the canonical bytes for universes that failed a check: a passing trace is not
+    // a minimization candidate, so retaining it would multiply memory for no reason.
+    std::map<uint64_t, uint64_t> index_by_seed;
+    std::map<uint64_t, std::string> trace_by_seed;
+    const auto writer_sink = writer->sink();
+    campaign.on_universe = [&](const cosmos::detail::UniverseOutcome& outcome) {
+        index_by_seed[outcome.seed] = outcome.index;
+        if (!outcome.report.no_check_failed || outcome.died || !outcome.threw.empty()) {
+            trace_by_seed[outcome.seed] = outcome.trace_bytes;
+        }
+        writer_sink(outcome);
+    };
 
     const cosmos::CampaignReport report = cosmos::Campaign::run(campaign, run_demo_universe);
+
+    // Minimization is report-only (O5): the exporter runs it after the campaign over the recorded
+    // traces and writes one document per failing seed. The UI never executes it.
+    //
+    // The artifact layout holds one report per seed. Findings are sorted by assertion id, so if a
+    // seed fails several assertions the first finding wins deterministically; the writer rejects
+    // a second document for the same seed. Per-finding reports are a future addition (G19).
+    std::map<uint64_t, std::string> minimized_findings;
+    uint64_t minimized = 0;
+    uint64_t skipped = 0;
+    auto write_refused = [&](uint64_t seed, const std::string& finding_id, std::string reason) {
+        cosmos::MinimizeReport refused;
+        refused.seed = seed;
+        refused.finding_id = finding_id;
+        refused.program = campaign.program;
+        refused.refused = true;
+        refused.reason = std::move(reason);
+        std::ostringstream json;
+        cosmos::print_minimize_json(json, refused);
+        if (auto written = writer->write_minimization(seed, json.str()); !written) {
+            std::cerr << "cosmos_ui_export: " << written.error() << "\n";
+            return false;
+        }
+        minimized_findings[seed] = finding_id;
+        ++minimized;
+        return true;
+    };
+
+    for (const cosmos::Finding& finding : report.findings) {
+        if (cosmos::is_harness_id(finding.id)) continue;
+        // A report's finding identity is load-bearing; the artifact validator rejects an empty
+        // id rather than accepting a report the UI cannot attribute to an assertion.
+        if (finding.id.empty()) {
+            std::cerr << "cosmos_ui_export: skipping minimization for an empty finding id\n";
+            continue;
+        }
+        for (const uint64_t seed : finding.seeds) {
+            if (minimized_findings.find(seed) != minimized_findings.end()) {
+                ++skipped;
+                continue;
+            }
+            const auto trace_bytes = trace_by_seed.find(seed);
+            if (trace_bytes == trace_by_seed.end() || trace_bytes->second.empty()) {
+                if (!write_refused(seed, finding.id,
+                                   "no canonical trace bytes were exported for this seed")) {
+                    return 1;
+                }
+                continue;
+            }
+            const auto source = cosmos::decode_trace(trace_bytes->second);
+            if (!source) {
+                if (!write_refused(seed, finding.id, "the canonical trace could not be decoded")) {
+                    return 1;
+                }
+                continue;
+            }
+            const auto index = index_by_seed.find(seed);
+            if (index == index_by_seed.end()) {
+                if (!write_refused(seed, finding.id,
+                                   "the universe index was not recorded for this seed")) {
+                    return 1;
+                }
+                continue;
+            }
+
+            // Scenario::on installs this plan directly; the demo does not sample a swarm config,
+            // so the template is the realized config for these universes.
+            cosmos::MinimizeConfig minimize_config;
+            minimize_config.plan = demo_plan();
+            minimize_config.finding_id = finding.id;
+            minimize_config.node_count = campaign.node_count;
+            minimize_config.program = campaign.program;
+            const uint64_t universe_index = index->second;
+            const auto body = [universe_index](cosmos::Scenario& scenario) {
+                run_demo_body(scenario, universe_index);
+            };
+            const cosmos::MinimizeReport minimized_report =
+                cosmos::minimize(*source, minimize_config, body);
+            std::ostringstream json;
+            cosmos::print_minimize_json(json, minimized_report);
+            if (auto written = writer->write_minimization(seed, json.str()); !written) {
+                std::cerr << "cosmos_ui_export: " << written.error() << "\n";
+                return 1;
+            }
+            minimized_findings[seed] = finding.id;
+            ++minimized;
+        }
+    }
+
     if (auto finished = writer->finish(report); !finished) {
         std::cerr << "cosmos_ui_export: " << finished.error() << "\n";
         return 1;
     }
 
     std::cout << "wrote " << root << " (" << report.runs << " universes, " << report.failed_runs
-              << " failed, " << report.findings.size() << " findings)\n";
+              << " failed, " << report.findings.size() << " findings, " << minimized
+              << " minimization reports)\n";
+    if (skipped > 0) {
+        std::cout << "skipped " << skipped
+                  << " finding seed(s) that already had a minimization report "
+                     "(one report per seed)\n";
+    }
     cosmos::print_campaign_report(std::cout, report);
     return 0;
 }

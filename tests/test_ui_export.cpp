@@ -1,6 +1,8 @@
 #include "cosmos/campaign.hpp"
 #include "cosmos/export.hpp"
 #include "cosmos/faults_json.hpp"
+#include "cosmos/minimize.hpp"
+#include "cosmos/minimize_json.hpp"
 #include "cosmos/scenario.hpp"
 #include "cosmos/trace.hpp"
 
@@ -171,6 +173,94 @@ void test_config_fingerprint_is_stable_and_sensitive() {
     std::cout << "[PASS] test_config_fingerprint_is_stable_and_sensitive" << std::endl;
 }
 
+void test_minimize_json_is_versioned_and_explicit() {
+    cosmos::TraceEntry first{};
+    first.seq = 5;
+    first.eligible_index = 3;
+    first.at = cosmos::Time{200'000};
+    first.site = cosmos::SiteId::malloc;
+    first.outcome = cosmos::FaultKind::OutOfMemory;
+    first.drew = true;
+    first.status = cosmos::DecisionStatus::Fired;
+
+    cosmos::TraceEntry second = first;
+    second.seq = 7;
+    second.eligible_index = 4;
+    second.at = cosmos::Time{900'000};
+    second.site = cosmos::SiteId::clock_gettime;
+    second.amount = cosmos::Duration{50'000};
+    second.outcome = cosmos::FaultKind::ClockStep;
+
+    cosmos::TraceEntry third = first;
+    third.seq = 9;
+    third.eligible_index = 5;
+    third.at = cosmos::Time{1'200'000};
+
+    cosmos::MinimizeReport report;
+    report.seed = 0x5CA1AB1E;
+    report.finding_id = "double-oom";
+    report.program = "test_minimize";
+    report.candidates = {first, second, third};
+    report.kept = {second, third};
+    report.passes = 2;
+    report.replays = 6;
+    report.crashed_trials = 1;
+
+    std::ostringstream json;
+    cosmos::print_minimize_json(json, report);
+    const std::string text = json.str();
+    must(text.find("\"schema_version\": 1") != std::string::npos);
+    must(text.find("\"seed\": \"1554098974\"") != std::string::npos);
+    must(text.find("\"seed_hex\": \"0x000000005ca1ab1e\"") != std::string::npos);
+    must(text.find("\"finding_id\": \"double-oom\"") != std::string::npos);
+    must(text.find("\"only_faults\": [7, 9]") != std::string::npos);
+    must(text.find("\"repro\": \"test_minimize --seed 1554098974 --only-faults=7,9\"") !=
+         std::string::npos);
+    must(text.find("\"fault_class\": \"Clock\"") != std::string::npos);
+    must(text.find("\"amount_ns\": 50000") != std::string::npos);
+    must(text.find("\"passes\": 2") != std::string::npos);
+    must(text.find("\"replays\": 6") != std::string::npos);
+    must(text.find("\"crashed_trials\": 1") != std::string::npos);
+    must(is_balanced(text));
+
+    report.refused = true;
+    report.reason = "the trace is truncated";
+    report.kept.clear();
+    std::ostringstream refused_json;
+    cosmos::print_minimize_json(refused_json, report);
+    const std::string refused = refused_json.str();
+    must(refused.find("\"refused\": true") != std::string::npos);
+    must(refused.find("\"reason\": \"the trace is truncated\"") != std::string::npos);
+    must(refused.find("\"repro\": null") != std::string::npos);
+    must(refused.find("\"kept\": []") != std::string::npos);
+    must(refused.find("\"seq\": 5") != std::string::npos);
+    must(refused.find("\"crashed_trials\": 1") != std::string::npos);
+
+    // An empty kept set is a completed report, not a refused one: the exact command is still a
+    // replay (with every fault withheld), so it must not become null.
+    report.refused = false;
+    report.reason.clear();
+    std::ostringstream empty_json;
+    cosmos::print_minimize_json(empty_json, report);
+    const std::string empty = empty_json.str();
+    must(empty.find("\"repro\": \"test_minimize --seed 1554098974 --only-faults=\"") !=
+         std::string::npos);
+    must(empty.find("\"repro\": null") == std::string::npos);
+
+    // Free-form finding ids and program names are JSON text, not shell-safe tokens or raw bytes.
+    report.finding_id = "odd-\"id\n";
+    report.program = "test \"min\"";
+    std::ostringstream escaped_json;
+    cosmos::print_minimize_json(escaped_json, report);
+    const std::string escaped = escaped_json.str();
+    must(escaped.find("\"finding_id\": \"odd-\\\"id\\n\"") != std::string::npos);
+    must(escaped.find("\"repro\": \"test \\\"min\\\" --seed 1554098974 "
+                      "--only-faults=\"") != std::string::npos);
+    must(is_balanced(escaped));
+
+    std::cout << "[PASS] test_minimize_json_is_versioned_and_explicit" << std::endl;
+}
+
 void test_campaign_json_adds_the_v1_fields() {
     cosmos::CampaignConfig config;
     config.trials = 6;
@@ -295,6 +385,96 @@ void test_artifact_writer_round_trips_one_campaign() {
     std::cout << "[PASS] test_artifact_writer_round_trips_one_campaign" << std::endl;
 }
 
+void test_artifact_writer_exports_a_minimization_report() {
+    const std::filesystem::path root = test_root("cosmos-ui-minimization");
+
+    cosmos::CampaignConfig config;
+    config.trials = 4;
+    config.base_seed = 42;
+    config.parallel = 1;
+    config.program = "test_ui_export";
+    config.id = "minimization-test";
+    config.name = "Minimization test";
+    config.trace = true;
+    config.trace_capacity = 4096;
+
+    auto writer = cosmos::CampaignArtifactWriter::create(artifact_options(root, config));
+    must(writer.has_value());
+    config.on_universe = writer->sink();
+    const cosmos::CampaignReport report = cosmos::Campaign::run(config, run_universe);
+    const cosmos::Finding* finding = find_finding(report, "odd-index-fails");
+    must(finding != nullptr);
+    must(!finding->seeds.empty());
+
+    cosmos::MinimizeReport minimization;
+    minimization.seed = finding->seeds.front();
+    minimization.finding_id = finding->id;
+    minimization.program = config.program;
+    cosmos::TraceEntry entry{};
+    entry.seq = 3;
+    entry.eligible_index = 1;
+    entry.site = cosmos::SiteId::malloc;
+    entry.outcome = cosmos::FaultKind::OutOfMemory;
+    entry.drew = true;
+    entry.status = cosmos::DecisionStatus::Fired;
+    minimization.candidates = {entry};
+    minimization.kept = {entry};
+    minimization.passes = 1;
+    minimization.replays = 2;
+
+    std::ostringstream minimization_json;
+    cosmos::print_minimize_json(minimization_json, minimization);
+    must(writer->write_minimization(minimization.seed, minimization_json.str()).has_value());
+    must(writer->finish(report).has_value());
+
+    const std::filesystem::path report_path =
+        root / cosmos::minimization_relative_path(minimization.seed);
+    must(std::filesystem::exists(report_path));
+    const std::string text = read_file(report_path);
+    must(text.find("\"schema_version\": 1") != std::string::npos);
+    must(text.find("\"finding_id\": \"odd-index-fails\"") != std::string::npos);
+    must(text.find("\"only_faults\": [3]") != std::string::npos);
+    must(is_balanced(text));
+    must(read_file(root / cosmos::kManifestFile).find("\"minimization_dir\": \"minimizations\"") !=
+         std::string::npos);
+
+    // A report may only name a seed this campaign actually wrote, a second report for the same
+    // seed must not replace the first, and a finished writer accepts no more documents.
+    must(!writer->write_minimization(minimization.seed, minimization_json.str()).has_value());
+    must(writer->error().empty());
+
+    const std::filesystem::path rejected_root = test_root("cosmos-ui-minimization-reject");
+    auto rejected = cosmos::CampaignArtifactWriter::create(artifact_options(rejected_root, config));
+    must(rejected.has_value());
+    must(!rejected->write_minimization(1234, "{}").has_value());
+    must(rejected->error().find("was not written by this campaign") != std::string::npos);
+
+    const std::filesystem::path duplicate_root = test_root("cosmos-ui-minimization-duplicate");
+    auto duplicate =
+        cosmos::CampaignArtifactWriter::create(artifact_options(duplicate_root, config));
+    must(duplicate.has_value());
+    cosmos::detail::UniverseOutcome outcome;
+    outcome.index = 0;
+    outcome.seed = 42;
+    outcome.report.seed = 42;
+    outcome.report.checks.push_back(cosmos::CheckResult{"passes", "", true, cosmos::Time{}});
+    duplicate->sink()(outcome);
+    must(duplicate->write_minimization(42, "{\"schema_version\": 1, \"first\": true}").has_value());
+    must(!duplicate->write_minimization(42, "{\"schema_version\": 1, \"second\": true}")
+              .has_value());
+    must(duplicate->error().find("already written") != std::string::npos);
+    const std::string duplicate_text =
+        read_file(duplicate_root / cosmos::minimization_relative_path(42));
+    must(duplicate_text.find("\"first\"") != std::string::npos);
+    must(duplicate_text.find("\"second\"") == std::string::npos);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    std::filesystem::remove_all(rejected_root, ignored);
+    std::filesystem::remove_all(duplicate_root, ignored);
+    std::cout << "[PASS] test_artifact_writer_exports_a_minimization_report" << std::endl;
+}
+
 void test_verify_without_trace_bytes_still_exports_a_hash() {
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
@@ -335,10 +515,14 @@ void test_reexport_removes_stale_universe_and_trace_files() {
     write_artifact_campaign(root, 6, "reexport");
     must(count_files(root / cosmos::kUniverseDir) == 6);
     must(count_files(root / cosmos::kTraceDir) == 6);
+    // A stale report must not survive a smaller re-export.
+    std::ofstream(root / cosmos::kMinimizationDir / "stale.json") << "{}";
+    must(count_files(root / cosmos::kMinimizationDir) == 1);
 
     write_artifact_campaign(root, 2, "reexport");
     must(count_files(root / cosmos::kUniverseDir) == 2);
     must(count_files(root / cosmos::kTraceDir) == 2);
+    must(count_files(root / cosmos::kMinimizationDir) == 0);
     must(!std::filesystem::exists(root / cosmos::kUniverseDir / "2.json"));
     must(!std::filesystem::exists(root / cosmos::kTraceDir / "2.bin"));
     must(lines_of(read_file(root / cosmos::kUniverseIndexFile)).size() == 2);
@@ -556,8 +740,18 @@ struct GroupingNumpunct : std::numpunct<char> {
     std::string do_grouping() const override { return "\3"; }
 };
 
+struct GlobalLocaleGuard {
+    explicit GlobalLocaleGuard(const std::locale& value) : previous(std::locale::global(value)) {}
+    ~GlobalLocaleGuard() { std::locale::global(previous); }
+    GlobalLocaleGuard(const GlobalLocaleGuard&) = delete;
+    GlobalLocaleGuard& operator=(const GlobalLocaleGuard&) = delete;
+
+    std::locale previous;
+};
+
 void test_json_printers_ignore_the_global_grouping_locale() {
     const std::locale grouped(std::locale::classic(), new GroupingNumpunct);
+    const GlobalLocaleGuard global(grouped);
 
     cosmos::UniverseSummary summary;
     summary.index = 1000;
@@ -577,6 +771,15 @@ void test_json_printers_ignore_the_global_grouping_locale() {
     cosmos::print_campaign_json(campaign, report);
     must(campaign.str().find("\"runs\": 1000") != std::string::npos);
     must(campaign.str().find("1'000") == std::string::npos);
+
+    // The repro command owns a fresh stream; it must not inherit the process-wide grouping locale.
+    cosmos::MinimizeReport minimization;
+    minimization.seed = 12345678901234567890ULL;
+    minimization.finding_id = "x";
+    std::ostringstream minimize_json;
+    cosmos::print_minimize_json(minimize_json, minimization);
+    must(minimize_json.str().find("--seed 12345678901234567890") != std::string::npos);
+    must(minimize_json.str().find("1'234'567") == std::string::npos);
 
     std::cout << "[PASS] test_json_printers_ignore_the_global_grouping_locale" << std::endl;
 }
@@ -626,8 +829,10 @@ void test_a_zero_capacity_trace_is_refused_before_any_universe() {
 
 int main() {
     test_config_fingerprint_is_stable_and_sensitive();
+    test_minimize_json_is_versioned_and_explicit();
     test_campaign_json_adds_the_v1_fields();
     test_artifact_writer_round_trips_one_campaign();
+    test_artifact_writer_exports_a_minimization_report();
     test_verify_without_trace_bytes_still_exports_a_hash();
     test_reexport_removes_stale_universe_and_trace_files();
     test_manifest_must_match_the_report_it_describes();
