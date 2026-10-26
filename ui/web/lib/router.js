@@ -41,6 +41,11 @@ export function parseLocation(location = window.location) {
     if (seed === null) return { name: "not_found", path };
     return { name: "timeline", campaignId, seed, path };
   }
+  if (parts.length === 5 && parts[2] === "universes" && parts[4] === "state") {
+    const seed = decodeSegment(parts[3]);
+    if (seed === null) return { name: "not_found", path };
+    return { name: "state", campaignId, seed, path };
+  }
   if (parts.length === 5 && parts[2] === "universes" && parts[4] === "minimization") {
     const seed = decodeSegment(parts[3]);
     if (seed === null) return { name: "not_found", path };

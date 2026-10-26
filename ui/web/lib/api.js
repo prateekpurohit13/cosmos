@@ -79,4 +79,11 @@ export const api = {
       signal,
     );
   },
+
+  events(campaignId, seed, signal) {
+    return getJson(
+      `${campaignPath(campaignId)}/universes/${encodeURIComponent(String(seed))}/events`,
+      signal,
+    );
+  },
 };

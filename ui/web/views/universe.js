@@ -490,6 +490,16 @@ export async function universeView({ campaignId, seed, signal }) {
         class: "btn btn--ghost",
         title: "Compare this universe with another universe in this campaign",
       }),
+      link(
+        `/campaigns/${encodeURIComponent(campaignId)}/universes/${encodeURIComponent(
+          seedValue,
+        )}/state`,
+        "State inspector",
+        {
+          class: "btn btn--ghost",
+          title: "Inspect the captured scheduler, network, storage, memory and RNG state",
+        },
+      ),
       link(minimizationHref(campaignId, seedValue), "Minimization", {
         class: "btn btn--ghost",
         title: "Open the exported MinimizeReport, or its explicit absence",

@@ -4,6 +4,7 @@ import { universesView } from "./views/universes.js";
 import { universeView } from "./views/universe.js";
 import { timelineView } from "./views/timeline.js";
 import { minimizationView } from "./views/minimization.js";
+import { stateView } from "./views/state.js";
 import { compareView } from "./views/compare.js";
 import { findingView } from "./views/finding.js";
 import { errorView } from "./views/error.js";
@@ -108,6 +109,8 @@ async function viewFor(route, signal) {
       return timelineView({ campaignId: route.campaignId, seed: route.seed, signal });
     case "minimization":
       return minimizationView({ campaignId: route.campaignId, seed: route.seed, signal });
+    case "state":
+      return stateView({ campaignId: route.campaignId, seed: route.seed, signal });
     case "compare":
       return compareView({ campaignId: route.campaignId, signal });
     case "finding":
