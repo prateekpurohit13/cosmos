@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import struct
 import sys
 import tempfile
 import threading
@@ -24,6 +25,26 @@ FIXTURE_ROOT = UI_DIR / "fixtures"
 WEB_ROOT = UI_DIR / "web"
 DEMO_SEED = "16860738450190168606"
 DEMO_SEED_HEX = "0xe9fd6049d65af21e"
+
+TRACE_HEADER = struct.Struct("<BQQ")
+TRACE_ENTRY = struct.Struct("<QQqQqBBB")
+FNV_OFFSET = 14695981039346656037
+FNV_PRIME = 1099511628211
+
+
+def encode_trace(entries, seed=42, source=1):
+    data = TRACE_HEADER.pack(source, len(entries), seed)
+    for entry in entries:
+        data += TRACE_ENTRY.pack(*entry)
+    return data
+
+
+def trace_hash(data):
+    digest = FNV_OFFSET
+    for byte in data:
+        digest ^= byte
+        digest = (digest * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return f"0x{digest:016x}"
 
 
 class ServerCase(unittest.TestCase):
@@ -118,6 +139,51 @@ class ServerCase(unittest.TestCase):
         status, _, payload = self.json_request(f"/api/campaigns/demo/universes/{DEMO_SEED_HEX}")
         self.assertEqual(status, 200)
         self.assertEqual(payload["universe"]["seed"], DEMO_SEED)
+
+    def test_fixture_trace_decodes_canonical_bytes(self) -> None:
+        status, _, payload = self.json_request(
+            f"/api/campaigns/demo/universes/{DEMO_SEED}/trace"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["campaign_id"], "demo")
+        self.assertEqual(payload["universe"]["index"], 1)
+        trace = payload["trace"]
+        self.assertTrue(trace["present"])
+        self.assertFalse(trace["missing"])
+        self.assertEqual(trace["path"], "traces/1.bin")
+        self.assertEqual(trace["count"], 24)
+        self.assertEqual(trace["size_bytes"], 17 + 24 * 43)
+        self.assertEqual(trace["declared_hash"], "0xb8b48f277dcd5d9d")
+        self.assertEqual(trace["declared_hash"], trace["computed_hash"])
+        self.assertTrue(trace["hash_matches"])
+        self.assertTrue(trace["seed_matches"])
+        self.assertEqual(len(trace["entries"]), 24)
+        entry = trace["entries"][0]
+        self.assertEqual(entry["seq"], 1)
+        self.assertEqual(entry["site"], "malloc")
+        self.assertEqual(entry["site_id"], 1)
+        self.assertEqual(entry["fault_class"], "Memory")
+        self.assertEqual(entry["outcome"], "OutOfMemory")
+        self.assertEqual(entry["status"], "FIRED")
+        self.assertTrue(entry["drew"])
+        self.assertEqual(entry["eligible_index"], 1)
+        injected = [item for item in trace["entries"] if item["outcome"] != "None"]
+        self.assertTrue(injected)
+        self.assertEqual(injected[0]["outcome"], "OutOfMemory")
+        self.assertTrue(any(item["fault_class"] == "Clock" for item in injected))
+        self.assertTrue(any(item["outcome"] == "None" for item in trace["entries"]))
+
+    def test_trace_endpoint_rejects_an_invalid_seed(self) -> None:
+        status, _, payload = self.json_request("/api/campaigns/demo/universes/nope/trace")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_seed")
+
+    def test_huge_seed_is_a_400_not_a_500(self) -> None:
+        status, _, payload = self.json_request(
+            "/api/campaigns/demo/universes/" + "9" * 5000 + "/trace"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_seed")
 
     def test_unknown_campaign_is_404_json(self) -> None:
         status, _, payload = self.json_request("/api/campaigns/not-there")
@@ -228,6 +294,303 @@ class ServerCase(unittest.TestCase):
         for method in ("GET", "HEAD"):
             status, _, _ = self.request("/%ed%a0%80", method=method)
             self.assertEqual(status, 400)
+
+
+class TraceArtifactCase(unittest.TestCase):
+    """A synthetic artifact for trace variants the demo fixture does not exercise."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        campaign = cls.root / "trace"
+        (campaign / "universes").mkdir(parents=True)
+        (campaign / "traces").mkdir()
+        (campaign / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "campaign_id": "trace",
+                    "name": "Trace variants",
+                    "complete": True,
+                    "build": {"id": "trace-build", "mode": "SIM"},
+                    "config": {"trials": 7, "trace": True, "trace_capacity": 4096},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (campaign / "campaign.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "campaign_id": "trace",
+                    "name": "Trace variants",
+                    "runs": 7,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        entries = [
+            (1, 1, 0, 1, 0, 1, 1, 0),
+            (2, 2, 1_000, 12, 500, 16, 1, 0),
+            (3, 3, 2_000, 6, 0, 0, 0, 0),
+            (4, 4, 3_000, 10, 0, 12, 1, 1),
+            (5, 5, 4_000, 1000, 0, 0, 0, 0),
+        ]
+        good = encode_trace(entries, seed=42)
+        wrong_hash = encode_trace(entries, seed=45)
+        seed_mismatch = encode_trace(entries, seed=99)
+        bad_source = encode_trace(entries, seed=46, source=2)
+        truncated = good[:-1]
+        trailing = good + b"\x00"
+        path_mismatch = encode_trace(entries, seed=49)
+        too_large = TRACE_HEADER.pack(1, serve.MAX_TRACE_ENTRIES + 1, 51)
+        bad_site = encode_trace([(1, 1, 0, 9999, 0, 1, 1, 0)], seed=52)
+        bad_outcome = encode_trace([(1, 1, 0, 1, 0, 20, 1, 0)], seed=53)
+        bad_drew = encode_trace([(1, 1, 0, 1, 0, 1, 2, 0)], seed=54)
+        bad_status = encode_trace([(1, 1, 0, 1, 0, 1, 1, 3)], seed=55)
+        padded_seed = encode_trace(entries, seed=99)
+        empty_trace = TRACE_HEADER.pack(1, 0, 57)
+        short_header = b"\x01\x00"
+        unsafe_integer = encode_trace([(2**53, 1, 0, 1, 0, 1, 1, 0)], seed=59)
+        missing_path = encode_trace([(1, 1, 0, 1, 0, 1, 1, 0)], seed=60)
+        duplicate_seq = encode_trace(
+            [(1, 1, 0, 1, 0, 1, 1, 0), (1, 2, 1_000, 1, 0, 0, 1, 0)], seed=61
+        )
+
+        variants = {
+            0: ("42", True, "traces/0.bin", good, trace_hash(good)),
+            1: ("43", True, "traces/1.bin", None, "0x0"),
+            2: ("44", False, "", b"", None),
+            3: ("45", True, "traces/3.bin", wrong_hash, "0xdeadbeefdeadbeef"),
+            4: ("46", True, "traces/4.bin", bad_source, trace_hash(bad_source)),
+            5: ("47", True, "traces/5.bin", truncated, trace_hash(truncated)),
+            6: ("48", True, "traces/6.bin", trailing, trace_hash(trailing)),
+            7: ("49", True, "traces/999.bin", path_mismatch, trace_hash(path_mismatch)),
+            8: ("50", True, "traces/8.bin", seed_mismatch, trace_hash(seed_mismatch)),
+            9: ("51", True, "traces/9.bin", too_large, trace_hash(too_large)),
+            10: ("52", True, "traces/10.bin", bad_site, trace_hash(bad_site)),
+            11: ("53", True, "traces/11.bin", bad_outcome, trace_hash(bad_outcome)),
+            12: ("54", True, "traces/12.bin", bad_drew, trace_hash(bad_drew)),
+            13: ("55", True, "traces/13.bin", bad_status, trace_hash(bad_status)),
+            14: ("00099", True, "traces/14.bin", padded_seed, trace_hash(padded_seed)),
+            15: ("56", True, "traces/15.bin", None, "0x0"),
+            16: ("57", True, "traces/16.bin", empty_trace, trace_hash(empty_trace)),
+            17: ("58", True, "traces/17.bin", short_header, trace_hash(short_header)),
+            18: ("59", True, "traces/18.bin", unsafe_integer, trace_hash(unsafe_integer)),
+            19: ("60", True, "", missing_path, trace_hash(missing_path)),
+            20: ("61", True, "traces/20.bin", duplicate_seq, trace_hash(duplicate_seq)),
+        }
+        rows = []
+        for index, (seed, present, path, data, digest) in variants.items():
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "index": index,
+                    "seed": seed,
+                    "status": "passed",
+                    "trace": {
+                        "present": present,
+                        "traced": present,
+                        "path": path,
+                        "hash": digest,
+                        "capacity": 4096,
+                        "dropped": 3 if index == 0 else 0,
+                    },
+                }
+            )
+            if data is not None:
+                (campaign / "traces" / f"{index}.bin").write_bytes(data)
+            detail = {
+                "schema_version": 1,
+                "index": index,
+                "seed": seed,
+                "seed_hex": f"0x{int(seed):016x}",
+                "status": "passed",
+                "virtual_end_ns": 5_000,
+                "checks": [],
+                "trace": {
+                    "present": present,
+                    "traced": present,
+                    "path": path,
+                    "hash": digest,
+                    "capacity": 4096,
+                    "dropped": 3 if index == 0 else 0,
+                },
+            }
+            (campaign / "universes" / f"{index}.json").write_text(
+                json.dumps(detail), encoding="utf-8"
+            )
+        with (campaign / "universes.ndjson").open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        # Sparse file: the size check must refuse it before read_bytes() materializes it.
+        with (campaign / "traces" / "15.bin").open("wb") as handle:
+            handle.truncate(serve.MAX_TRACE_BYTES + 1)
+
+        cls.server = serve.create_server(cls.root, WEB_ROOT, "127.0.0.1", 0, quiet=True)
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever,
+            kwargs={"poll_interval": 0.02},
+            daemon=True,
+        )
+        cls.thread.start()
+        cls.host, cls.port = cls.server.server_address[:2]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+        cls.temp.cleanup()
+
+    def request_json(self, path: str):
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            body = response.read()
+            return response.status, json.loads(body.decode("utf-8"))
+        finally:
+            connection.close()
+
+    def trace(self, seed: str):
+        return self.request_json(f"/api/campaigns/trace/universes/{seed}/trace")
+
+    def test_decodes_every_entry_in_order(self) -> None:
+        status, payload = self.trace("42")
+        self.assertEqual(status, 200)
+        trace = payload["trace"]
+        self.assertTrue(trace["present"])
+        self.assertTrue(trace["hash_matches"])
+        self.assertTrue(trace["seed_matches"])
+        self.assertEqual(trace["count"], 5)
+        self.assertEqual([entry["seq"] for entry in trace["entries"]], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [entry["fault_class"] for entry in trace["entries"]],
+            ["Memory", "Clock", "Storage", "Network", "Process"],
+        )
+        self.assertEqual(trace["entries"][1]["amount_ns"], 500)
+        self.assertEqual(trace["entries"][2]["outcome"], "None")
+        self.assertEqual(trace["entries"][3]["status"], "SUPPRESSED")
+        self.assertEqual(trace["entries"][4]["site"], "crash_node")
+        self.assertEqual(trace["dropped"], 3)
+
+    def test_hash_mismatch_is_reported_without_hiding_entries(self) -> None:
+        status, payload = self.trace("45")
+        self.assertEqual(status, 200)
+        trace = payload["trace"]
+        self.assertTrue(trace["present"])
+        self.assertFalse(trace["hash_matches"])
+        self.assertEqual(trace["declared_hash"], "0xdeadbeefdeadbeef")
+        self.assertEqual(trace["count"], 5)
+        self.assertEqual(len(trace["entries"]), 5)
+
+    def test_seed_mismatch_is_reported(self) -> None:
+        status, payload = self.trace("50")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["trace"]["seed_matches"])
+        self.assertEqual(payload["trace"]["seed"], "99")
+
+    def test_missing_file_is_explicit(self) -> None:
+        status, payload = self.trace("43")
+        self.assertEqual(status, 200)
+        trace = payload["trace"]
+        self.assertFalse(trace["present"])
+        self.assertTrue(trace["missing"])
+        self.assertEqual(trace["error"], "trace_missing")
+        self.assertEqual(trace["entries"], [])
+
+    def test_untraced_universe_has_no_entries(self) -> None:
+        status, payload = self.trace("44")
+        self.assertEqual(status, 200)
+        trace = payload["trace"]
+        self.assertFalse(trace["present"])
+        self.assertFalse(trace["missing"])
+        self.assertFalse(trace["traced"])
+        self.assertEqual(trace["entries"], [])
+
+    def test_bad_source_is_a_structured_error(self) -> None:
+        status, payload = self.trace("46")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+        self.assertIn("source", payload["error"]["message"])
+
+    def test_truncated_and_trailing_bytes_are_structured_errors(self) -> None:
+        for seed, fragment in (("47", "truncated"), ("48", "trailing")):
+            status, payload = self.trace(seed)
+            self.assertEqual(status, 500)
+            self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+            self.assertIn(fragment, payload["error"]["message"])
+
+    def test_trace_path_mismatch_is_rejected(self) -> None:
+        status, payload = self.trace("49")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "trace_path_mismatch")
+
+    def test_too_large_trace_is_refused(self) -> None:
+        status, payload = self.trace("51")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_too_large")
+        self.assertIn(str(serve.MAX_TRACE_ENTRIES), payload["error"]["message"])
+
+    def test_bad_entry_values_are_structured_errors(self) -> None:
+        for seed, fragment in (
+            ("52", "unknown site"),
+            ("53", "unknown outcome"),
+            ("54", "invalid drew"),
+            ("55", "unknown status"),
+        ):
+            status, payload = self.trace(seed)
+            self.assertEqual(status, 500)
+            self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+            self.assertIn(fragment, payload["error"]["message"])
+
+    def test_equivalent_decimal_seed_does_not_false_alarm(self) -> None:
+        status, payload = self.trace("00099")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["trace"]["seed_matches"])
+        self.assertEqual(payload["trace"]["seed"], "99")
+        self.assertEqual(payload["universe"]["seed"], "00099")
+
+    def test_oversized_file_is_refused_before_read(self) -> None:
+        status, payload = self.trace("56")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_too_large")
+        self.assertIn("exceeds", payload["error"]["message"])
+
+    def test_empty_trace_has_no_entries(self) -> None:
+        status, payload = self.trace("57")
+        self.assertEqual(status, 200)
+        trace = payload["trace"]
+        self.assertTrue(trace["present"])
+        self.assertEqual(trace["count"], 0)
+        self.assertEqual(trace["entries"], [])
+        self.assertTrue(trace["hash_matches"])
+
+    def test_short_header_is_a_structured_error(self) -> None:
+        status, payload = self.trace("58")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+        self.assertIn("header is truncated", payload["error"]["message"])
+
+    def test_unsafe_integer_is_a_structured_error(self) -> None:
+        status, payload = self.trace("59")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+        self.assertIn("safe-integer", payload["error"]["message"])
+
+    def test_missing_trace_path_is_rejected(self) -> None:
+        status, payload = self.trace("60")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "trace_path_mismatch")
+
+    def test_duplicate_seq_is_a_structured_error(self) -> None:
+        status, payload = self.trace("61")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
+        self.assertIn("non-increasing seq", payload["error"]["message"])
 
 
 class BrokenArtifactCase(unittest.TestCase):

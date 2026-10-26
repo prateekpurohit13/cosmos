@@ -1,7 +1,8 @@
 # Demo campaign fixture
 
 A tiny v1 artifact directory (`schema_version: 1`) used by the UI smoke tests. It is deliberately
-small: four universes, one finding, two passes, one trace per universe.
+small: four universes, one finding, two passes, and a 24-entry canonical trace per universe
+spanning Memory and Clock lanes.
 
 Regenerate it deterministically:
 

@@ -1,10 +1,10 @@
 // Writes a v1 UI artifact directory from a tiny deterministic campaign.
 //
-// This is the Phase-0/1 proof that one command can produce a directory the local UI can load
+// This is the Phase-0/1/2 proof that one command can produce a directory the local UI can load
 // (docs/ui-design.md U0.3, G0). It is deliberately a demo application, not the UI itself: the
-// campaign body has one explicit malloc and a check that fails on odd universe indices, so the
-// artifact has a finding, a trace, a passing universe and a vacuous site without needing a
-// separate application fixture.
+// campaign body makes explicit memory and clock calls and a check that fails on odd universe
+// indices, so the artifact has a finding, a multi-entry canonical trace, a passing universe and
+// a vacuous site without needing a separate application fixture.
 //
 //   cosmos_ui_export [output-dir] [campaign-id] [trials]
 //   cosmos_ui_export ui/fixtures/demo demo 4
@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <time.h>
 #include <utility>
 
 namespace {
@@ -24,17 +25,27 @@ namespace {
 cosmos::FaultConfig demo_plan() {
     cosmos::FaultConfig plan;
     plan.enable_class(cosmos::FaultClass::Memory);
+    plan.enable_class(cosmos::FaultClass::Clock);
     (void)plan.activate_site(cosmos::SiteId::malloc);
-    cosmos::FaultRule rule;
-    rule.rate = 1.0;
-    (void)rule.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0);
-    (void)plan.set_rule(cosmos::SiteId::malloc, std::move(rule));
+    (void)plan.activate_site(cosmos::SiteId::clock_gettime);
+
+    cosmos::FaultRule memory;
+    memory.rate = 0.35;
+    (void)memory.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0);
+    (void)plan.set_rule(cosmos::SiteId::malloc, std::move(memory));
+
+    cosmos::FaultRule clock;
+    clock.rate = 0.4;
+    clock.amount = cosmos::Duration{50'000};
+    (void)clock.outcomes.add(cosmos::FaultKind::ClockStep, 1.0);
+    (void)plan.set_rule(cosmos::SiteId::clock_gettime, std::move(clock));
     return plan;
 }
 
-// One explicit allocation is the only wrapped call the fault can fire on. Under the shared
-// libstdc++ link the harness's std::strings and vectors do not reach __wrap_malloc, so the
-// universe stays deterministic and cheap.
+// Explicit wrapped calls are the only place the demo's faults can fire. The loop deliberately
+// interleaves memory and clock decisions so the exported trace has more than one lane and more
+// than one virtual timestamp. A fired OOM returns null; freeing null is harmless, so the demo
+// application never has to recover from the fault to stay deterministic.
 cosmos::ScenarioReport run_demo_universe(cosmos::Simulator& sim, uint64_t index) {
     auto scenario = cosmos::Scenario::on(sim, demo_plan());
     if (!scenario) {
@@ -42,9 +53,14 @@ cosmos::ScenarioReport run_demo_universe(cosmos::Simulator& sim, uint64_t index)
         rejected.no_check_failed = false;
         return rejected;
     }
-    scenario->run([] {
-        void* block = std::malloc(16);
-        std::free(block);
+    scenario->run([&sim] {
+        for (int step = 0; step < 12; ++step) {
+            void* block = std::malloc(16);
+            std::free(block);
+            struct timespec now{};
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+            sim.advance_time(cosmos::Duration{100'000});
+        }
     });
     scenario->quiesce();
     // A non-zero virtual end makes the artifact's time labels reviewable.

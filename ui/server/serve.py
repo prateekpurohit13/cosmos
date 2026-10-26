@@ -5,7 +5,8 @@ The simulation binary never hosts HTTP (docs/ui-design.md D4). This process read
 campaign artifact root written by ``include/cosmos/export.hpp`` and serves:
 
 * ``ui/web`` as the static application,
-* a small JSON API over the schema-v1 artifact layout,
+* a small JSON API over the schema-v1 artifact layout, including a read-only canonical
+  trace decoder for the timeline,
 * SPA fallback for the client routes (``/campaigns/...``).
 
 It binds to loopback by default and has no authentication. Point it at an artifact
@@ -20,6 +21,7 @@ import ipaddress
 import json
 import math
 import re
+import struct
 import sys
 import urllib.parse
 from http import HTTPStatus
@@ -33,6 +35,87 @@ CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SEED_DEC_RE = re.compile(r"^[0-9]+$")
 SEED_HEX_RE = re.compile(r"^0[xX][0-9a-fA-F]+$")
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# Canonical trace codec (include/cosmos/trace.hpp). The server decodes the exact bytes that
+# trace_hash() covers; it never re-encodes or rewrites them.
+TRACE_SOURCE = 1
+TRACE_HEADER = struct.Struct("<BQQ")
+TRACE_ENTRY = struct.Struct("<QQqQqBBB")
+TRACE_HEADER_BYTES = TRACE_HEADER.size
+TRACE_ENTRY_BYTES = TRACE_ENTRY.size
+# The browser keeps every entry in memory and redraws the canvas on resize/theme changes.
+# Refuse an artifact larger than the view's documented ceiling rather than freezing the tab.
+MAX_TRACE_ENTRIES = 100_000
+MAX_TRACE_BYTES = TRACE_HEADER_BYTES + MAX_TRACE_ENTRIES * TRACE_ENTRY_BYTES
+MAX_SAFE_JS_INTEGER = (1 << 53) - 1
+assert TRACE_HEADER_BYTES == 17
+assert TRACE_ENTRY_BYTES == 43
+
+SITE_NAMES = {
+    1: "malloc",
+    2: "calloc",
+    3: "realloc",
+    4: "open",
+    5: "read",
+    6: "write",
+    7: "fsync",
+    8: "connect",
+    9: "accept",
+    10: "send",
+    11: "recv",
+    12: "clock_gettime",
+    13: "nanosleep",
+    14: "getrandom",
+    1000: "crash_node",
+    1001: "partition",
+    1002: "pause_node",
+    1003: "torn_write",
+}
+SITE_CLASSES = {
+    1: "Memory",
+    2: "Memory",
+    3: "Memory",
+    4: "Storage",
+    5: "Storage",
+    6: "Storage",
+    7: "Storage",
+    8: "Network",
+    9: "Network",
+    10: "Network",
+    11: "Network",
+    12: "Clock",
+    13: "Clock",
+    14: "Random",
+    1000: "Process",
+    1001: "Process",
+    1002: "Process",
+    1003: "Storage",
+}
+OUTCOME_NAMES = {
+    0: "None",
+    1: "OutOfMemory",
+    2: "OpenEio",
+    3: "ReadEio",
+    4: "WriteEio",
+    5: "ShortWrite",
+    6: "NoSpace",
+    7: "FsyncEio",
+    8: "ConnRefused",
+    9: "ConnReset",
+    10: "PeerClose",
+    11: "ShortSend",
+    12: "PacketDrop",
+    13: "PacketDelay",
+    14: "PacketReorder",
+    15: "PacketCorrupt",
+    16: "ClockStep",
+    17: "SleepInterrupted",
+    18: "RandomEagain",
+    19: "TornWrite",
+}
+STATUS_NAMES = {0: "FIRED", 1: "SUPPRESSED", 2: "SKIPPED"}
+FNV_OFFSET = 14695981039346656037
+FNV_PRIME = 1099511628211
 
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -117,19 +200,144 @@ def safe_campaign_id(raw: str) -> str:
 def parse_seed(raw: str) -> int:
     if not isinstance(raw, str) or not raw:
         raise ArtifactError(HTTPStatus.BAD_REQUEST, "invalid_seed", "seed is empty")
-    if SEED_HEX_RE.fullmatch(raw):
-        value = int(raw, 16)
-    elif SEED_DEC_RE.fullmatch(raw):
-        value = int(raw, 10)
-    else:
+    try:
+        if SEED_HEX_RE.fullmatch(raw):
+            value = int(raw, 16)
+        elif SEED_DEC_RE.fullmatch(raw):
+            value = int(raw, 10)
+        else:
+            raise ArtifactError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_seed",
+                "seed must be a decimal integer or a 0x-prefixed hexadecimal integer",
+            )
+    except ValueError as exc:
         raise ArtifactError(
             HTTPStatus.BAD_REQUEST,
             "invalid_seed",
-            "seed must be a decimal integer or a 0x-prefixed hexadecimal integer",
-        )
+            "seed is too long to parse as a 64-bit integer",
+        ) from exc
     if value > MAX_SEED:
         raise ArtifactError(HTTPStatus.BAD_REQUEST, "invalid_seed", "seed is wider than 64 bits")
     return value
+
+
+def _fnv1a_64(data: bytes) -> int:
+    digest = FNV_OFFSET
+    for byte in data:
+        digest ^= byte
+        digest = (digest * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return digest
+
+
+def _trace_bad_value(where: str, message: str) -> ArtifactError:
+    return ArtifactError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "artifact_trace_malformed",
+        f"{where}: {message}",
+    )
+
+
+def decode_trace_bytes(data: bytes, where: str) -> dict[str, Any]:
+    """Decode canonical trace bytes into the frozen TraceEntry fields.
+
+    Validation mirrors decode_trace() in include/cosmos/trace.hpp: source byte, count, universe
+    seed, then fixed-width little-endian entries with known site/outcome/status tokens. The
+    declared trace_hash is deliberately not checked here; the caller reports a mismatch without
+    hiding decodable evidence.
+    """
+    if len(data) < TRACE_HEADER_BYTES:
+        raise _trace_bad_value(where, "header is truncated")
+    source, count, seed = TRACE_HEADER.unpack_from(data, 0)
+    if source != TRACE_SOURCE:
+        raise _trace_bad_value(where, f"unsupported trace source {source}")
+    if count > MAX_TRACE_ENTRIES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_trace_too_large",
+            f"{where}: trace declares {count} entries; this UI supports at most "
+            f"{MAX_TRACE_ENTRIES}",
+        )
+    expected = count * TRACE_ENTRY_BYTES
+    remaining = len(data) - TRACE_HEADER_BYTES
+    if remaining < expected:
+        raise _trace_bad_value(
+            where,
+            f"entry payload is truncated (declared {count} entries, found {remaining} bytes)",
+        )
+    if remaining > expected:
+        raise _trace_bad_value(
+            where,
+            f"trailing bytes after {count} entries ({remaining - expected} extra)",
+        )
+
+    entries: list[dict[str, Any]] = []
+    offset = TRACE_HEADER_BYTES
+    previous_seq = 0
+    for index in range(count):
+        (
+            seq,
+            eligible_index,
+            at_ns,
+            site_id,
+            amount_ns,
+            outcome_id,
+            drew,
+            status_id,
+        ) = TRACE_ENTRY.unpack_from(data, offset)
+        offset += TRACE_ENTRY_BYTES
+        if seq <= previous_seq:
+            raise _trace_bad_value(
+                where, f"entry {index} has non-increasing seq {seq} after {previous_seq}"
+            )
+        previous_seq = seq
+        site = SITE_NAMES.get(site_id)
+        if site is None:
+            raise _trace_bad_value(where, f"entry {index} has unknown site id {site_id}")
+        outcome = OUTCOME_NAMES.get(outcome_id)
+        if outcome is None:
+            raise _trace_bad_value(where, f"entry {index} has unknown outcome id {outcome_id}")
+        if drew > 1:
+            raise _trace_bad_value(where, f"entry {index} has invalid drew flag {drew}")
+        if (
+            seq > MAX_SAFE_JS_INTEGER
+            or eligible_index > MAX_SAFE_JS_INTEGER
+            or abs(at_ns) > MAX_SAFE_JS_INTEGER
+            or abs(amount_ns) > MAX_SAFE_JS_INTEGER
+        ):
+            raise _trace_bad_value(
+                where,
+                f"entry {index} has a field outside the safe-integer display range",
+            )
+        status = STATUS_NAMES.get(status_id)
+        if status is None:
+            raise _trace_bad_value(where, f"entry {index} has unknown status id {status_id}")
+        entries.append(
+            {
+                "seq": seq,
+                "eligible_index": eligible_index,
+                "at_ns": at_ns,
+                "site": site,
+                "site_id": site_id,
+                "fault_class": SITE_CLASSES[site_id],
+                "amount_ns": amount_ns,
+                "outcome": outcome,
+                "outcome_id": outcome_id,
+                "drew": drew == 1,
+                "status": status,
+                "status_id": status_id,
+            }
+        )
+
+    return {
+        "source": source,
+        "seed": str(seed),
+        "seed_hex": f"0x{seed:016x}",
+        "count": count,
+        "size_bytes": len(data),
+        "computed_hash": f"0x{_fnv1a_64(data):016x}",
+        "entries": entries,
+    }
 
 
 def _artifact_file(root: Path, *parts: str) -> Path:
@@ -454,7 +662,6 @@ def _universes_payload(root: Path, campaign_id: str) -> dict[str, Any]:
 
 
 def _universe_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
-    seed = parse_seed(seed_text)
     campaign_dir = _campaign_dir(root, campaign_id)
     manifest = _read_manifest(campaign_dir, campaign_id)
     campaign_doc = _read_campaign_required(campaign_dir, campaign_id)
@@ -468,6 +675,19 @@ def _universe_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str,
             if isinstance(item, dict)
         ],
     }
+    row = _find_universe_row(campaign_dir, seed_text)
+    detail = _read_universe_detail(campaign_dir, row)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "manifest": manifest,
+        "campaign": campaign,
+        "universe": detail,
+    }
+
+
+def _find_universe_row(campaign_dir: Path, seed_text: str) -> dict[str, Any]:
+    seed = parse_seed(seed_text)
     rows = _read_universe_rows_required(campaign_dir)
     row = next((item for item in rows if int(item["seed"]) == seed), None)
     if row is None:
@@ -476,21 +696,137 @@ def _universe_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str,
             "universe_not_found",
             f"universe with seed {seed_text!r} not found",
         )
+    return row
+
+
+def _read_universe_detail(campaign_dir: Path, row: dict[str, Any]) -> dict[str, Any]:
     detail_path = _artifact_file(campaign_dir, "universes", f"{row['index']}.json")
     detail = _read_json_object(detail_path, f"universes/{row['index']}.json")
-    if detail.get("index") != row["index"] or detail.get("seed") != row["seed"]:
+    try:
+        same_seed = int(detail.get("seed")) == int(row["seed"])
+    except (TypeError, ValueError):
+        same_seed = False
+    if detail.get("index") != row["index"] or not same_seed:
         raise ArtifactError(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             "universe_identity_mismatch",
             f"universes/{row['index']}.json does not match its index row",
         )
+    return detail
+
+
+def _universe_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    """The identity fields a timeline needs, without copying the whole universe document."""
     return {
+        "index": detail.get("index"),
+        "seed": detail.get("seed"),
+        "seed_hex": detail.get("seed_hex", ""),
+        "status": detail.get("status"),
+        "virtual_end_ns": detail.get("virtual_end_ns"),
+        "checks": detail.get("checks", []),
+        "trace": detail.get("trace", {}),
+    }
+
+
+def _trace_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
+    campaign_dir = _campaign_dir(root, campaign_id)
+    manifest = _read_manifest(campaign_dir, campaign_id)
+    row = _find_universe_row(campaign_dir, seed_text)
+    detail = _read_universe_detail(campaign_dir, row)
+    meta = detail.get("trace")
+    if not isinstance(meta, dict):
+        meta = {}
+
+    base: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "campaign_id": campaign_id,
         "manifest": manifest,
-        "campaign": campaign,
-        "universe": detail,
+        "universe": _universe_summary(detail),
+        "trace": {
+            "present": False,
+            "traced": bool(meta.get("traced")),
+            "missing": False,
+            "path": meta.get("path") if isinstance(meta.get("path"), str) else "",
+            "capacity": meta.get("capacity"),
+            "dropped": meta.get("dropped", 0),
+            "declared_hash": meta.get("hash"),
+            "entries": [],
+        },
     }
+    if not meta.get("present"):
+        return base
+
+    expected_relative = f"traces/{row['index']}.bin"
+    declared_relative = meta.get("path")
+    if declared_relative != expected_relative:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "trace_path_mismatch",
+            f"trace path {declared_relative!r} does not match {expected_relative!r}",
+        )
+    trace_path = _artifact_file(campaign_dir, "traces", f"{row['index']}.bin")
+    try:
+        file_size = trace_path.stat().st_size
+    except FileNotFoundError:
+        base["trace"].update(
+            {
+                "missing": True,
+                "error": "trace_missing",
+                "message": "trace metadata says the file is present, but it is not on disk",
+            }
+        )
+        return base
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_unreadable",
+            f"trace file could not be read: {exc.strerror or exc}",
+        ) from exc
+    if file_size > MAX_TRACE_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_trace_too_large",
+            f"{expected_relative}: {file_size} bytes exceeds the {MAX_TRACE_BYTES}-byte "
+            "timeline limit",
+        )
+    try:
+        data = trace_path.read_bytes()
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_unreadable",
+            f"trace file could not be read: {exc.strerror or exc}",
+        ) from exc
+    if len(data) > MAX_TRACE_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_trace_too_large",
+            f"{expected_relative}: {len(data)} bytes exceeds the {MAX_TRACE_BYTES}-byte "
+            "timeline limit",
+        )
+
+    decoded = decode_trace_bytes(data, expected_relative)
+    declared_hash = meta.get("hash")
+    hash_matches = None
+    if isinstance(declared_hash, str) and declared_hash:
+        hash_matches = declared_hash.lower() == decoded["computed_hash"]
+    base["trace"].update(
+        {
+            "present": True,
+            "missing": False,
+            "path": expected_relative,
+            "source": decoded["source"],
+            "seed": decoded["seed"],
+            "seed_hex": decoded["seed_hex"],
+            "seed_matches": int(decoded["seed"]) == int(row["seed"]),
+            "count": decoded["count"],
+            "size_bytes": decoded["size_bytes"],
+            "computed_hash": decoded["computed_hash"],
+            "hash_matches": hash_matches,
+            "entries": decoded["entries"],
+        }
+    )
+    return base
 
 
 def _is_client_route(path: str) -> bool:
@@ -615,6 +951,14 @@ class UIRequestHandler(SimpleHTTPRequestHandler):
                     payload = _universes_payload(self.server.artifact_root, campaign_id)
                 elif len(segments) == 5 and segments[3] == "universes":
                     payload = _universe_payload(
+                        self.server.artifact_root, campaign_id, segments[4]
+                    )
+                elif (
+                    len(segments) == 6
+                    and segments[3] == "universes"
+                    and segments[5] == "trace"
+                ):
+                    payload = _trace_payload(
                         self.server.artifact_root, campaign_id, segments[4]
                     )
                 else:
