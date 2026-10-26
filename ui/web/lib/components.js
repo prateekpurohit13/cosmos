@@ -174,6 +174,23 @@ export function seedLink(campaignId, seed, props = {}) {
   );
 }
 
+export function timelineHref(campaignId, seed, { checkId = null, atNs = null } = {}) {
+  const params = new URLSearchParams();
+  if (checkId !== null && checkId !== undefined && String(checkId) !== "") {
+    params.set("check", String(checkId));
+  }
+  const rawAt = typeof atNs === "number" ? atNs : typeof atNs === "string" ? atNs.trim() : null;
+  if (rawAt !== null && (typeof rawAt === "number" || /^[+-]?\d+$/.test(rawAt))) {
+    const value = Number(rawAt);
+    if (Number.isSafeInteger(value)) params.set("at", String(value));
+  }
+  const query = params.toString();
+  return (
+    `/campaigns/${encodeURIComponent(String(campaignId))}/universes/` +
+    `${encodeURIComponent(String(seed))}/timeline${query ? `?${query}` : ""}`
+  );
+}
+
 export function findingLink(campaignId, findingId, label = findingId, props = {}) {
   return link(
     `/campaigns/${encodeURIComponent(String(campaignId))}/findings/${encodeURIComponent(String(findingId))}`,

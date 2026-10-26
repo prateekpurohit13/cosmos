@@ -16,6 +16,7 @@ import {
   reproInvocation,
   statGrid,
   statusBadge,
+  timelineHref,
 } from "../lib/components.js";
 import { el, link } from "../lib/dom.js";
 import {
@@ -26,6 +27,7 @@ import {
   shortId,
 } from "../lib/format.js";
 import { compareSites, siteClass, siteStatus } from "../lib/faults.js";
+import { finiteTimeNs } from "../lib/trace.js";
 import { setBuildContext } from "../lib/shell.js";
 
 const LEDGER_UI_LIMIT = 500;
@@ -162,7 +164,7 @@ function rawDetails(universe) {
   );
 }
 
-function checksBody(universe, campaignId, findingIds) {
+function checksBody(universe, campaignId, seedValue, findingIds) {
   const checks = Array.isArray(universe.checks) ? universe.checks : [];
   if (checks.length === 0) {
     return emptyState({
@@ -192,8 +194,12 @@ function checksBody(universe, campaignId, findingIds) {
       el(
         "tbody",
         {},
-        ...checks.map((check) =>
-          el(
+        ...checks.map((check) => {
+          const checkAt = finiteTimeNs(check.at_ns);
+          const failed = check.passed === false;
+          const result = check.passed === true ? "passed" : failed ? "failed" : "unknown";
+          const tone = check.passed === true ? "ok" : failed ? "bad" : "neutral";
+          return el(
             "tr",
             {},
             el(
@@ -206,14 +212,30 @@ function checksBody(universe, campaignId, findingIds) {
             el(
               "td",
               {},
-              check.passed
-                ? el("span", { class: "status status--ok" }, "passed")
-                : el("span", { class: "status status--bad" }, "failed"),
+              el("span", { class: `status status--${tone}` }, result),
             ),
-            el("td", { class: "num" }, formatAt(check.at_ns)),
+            el(
+              "td",
+              { class: "num" },
+              checkAt !== null
+                ? link(
+                    timelineHref(campaignId, seedValue, {
+                      checkId: failed ? check.id : null,
+                      atNs: checkAt,
+                    }),
+                    formatAt(checkAt),
+                    {
+                      class: "mono link--subtle",
+                      title: failed
+                        ? "Open the timeline at this failed check"
+                        : "Open the timeline at this check time",
+                    },
+                  )
+                : formatAt(check.at_ns),
+            ),
             el("td", { class: "text-soft" }, check.detail || "—"),
-          ),
-        ),
+          );
+        }),
       ),
     ),
   );
@@ -346,7 +368,9 @@ export async function universeView({ campaignId, seed, signal }) {
   const checks = (Array.isArray(universe.checks) ? universe.checks : []).filter(
     (check) => check && typeof check === "object",
   );
-  const failedChecks = checks.filter((check) => !check.passed);
+  const failedChecks = checks.filter((check) => check.passed === false);
+  const firstFailedCheck =
+    failedChecks.find((check) => finiteTimeNs(check.at_ns) !== null) ?? failedChecks[0];
   const eligible = sumSiteCounters(universe.sites, "eligible");
   const fired = sumSiteCounters(universe.sites, "fired");
   const trace = universe.trace ?? {};
@@ -450,8 +474,11 @@ export async function universeView({ campaignId, seed, signal }) {
     badges,
     actions: [
       link(
-        `/campaigns/${encodeURIComponent(campaignId)}/universes/${encodeURIComponent(seedValue)}/timeline`,
-        "Open timeline",
+        timelineHref(campaignId, seedValue, {
+          checkId: firstFailedCheck ? firstFailedCheck.id : null,
+          atNs: firstFailedCheck ? firstFailedCheck.at_ns : null,
+        }),
+        firstFailedCheck ? "Open timeline at failure" : "Open timeline",
         { class: "btn btn--primary" },
       ),
       link(`/campaigns/${encodeURIComponent(campaignId)}/universes`, "Back to universes", {
@@ -609,7 +636,7 @@ export async function universeView({ campaignId, seed, signal }) {
           title: "Checks",
           subtitle: "Assertions evaluated in this universe",
           count: checks.length,
-          body: checksBody(universe, campaignId, findingIds),
+          body: checksBody(universe, campaignId, seedValue, findingIds),
         }),
         panel({
           title: "Coverage",

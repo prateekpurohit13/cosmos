@@ -16,6 +16,7 @@ import {
   reproInvocation,
   seedLink,
   statGrid,
+  timelineHref,
 } from "../lib/components.js";
 import { el, link } from "../lib/dom.js";
 import {
@@ -241,6 +242,16 @@ function findingsBody(campaign, campaignId, manifest, seedIndex) {
             : identity
               ? copyButton(identity, "Copy repro identity", { title: identity })
               : null,
+          first && firstIndex !== undefined
+            ? link(
+                timelineHref(campaignId, first, {
+                  checkId: finding.id ?? null,
+                  atNs: finding.at_ns,
+                }),
+                "Timeline at failure",
+                { class: "btn btn--ghost btn--sm" },
+              )
+            : null,
           first && firstIndex !== undefined
             ? link(
                 `/campaigns/${encodeURIComponent(campaignId)}/universes/${encodeURIComponent(first)}`,

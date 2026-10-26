@@ -14,6 +14,7 @@ import {
   seedLink,
   statGrid,
   statusBadge,
+  timelineHref,
 } from "../lib/components.js";
 import { el, link } from "../lib/dom.js";
 import {
@@ -85,6 +86,7 @@ function seedTable(finding, campaignId, indexes, manifest, page = 1) {
           el("th", { scope: "col" }, "Status"),
           el("th", { scope: "col", class: "num" }, "Checks"),
           el("th", { scope: "col" }, "Trace"),
+          el("th", { scope: "col" }, "Replay"),
           el("th", { scope: "col" }, "Identity"),
         ),
       ),
@@ -125,6 +127,16 @@ function seedTable(finding, campaignId, indexes, manifest, page = 1) {
                     { class: "faint" },
                     !row ? "not listed" : row.trace?.traced ? "missing" : "not traced",
                   ),
+            ),
+            el(
+              "td",
+              {},
+              row
+                ? link(timelineHref(campaignId, seed, { checkId: finding.id, atNs: finding.at_ns }), "timeline", {
+                    class: "btn btn--ghost btn--sm",
+                    title: `Open the timeline at ${finding.id}`,
+                  })
+                : el("span", { class: "faint" }, "—"),
             ),
             el(
               "td",
@@ -240,10 +252,20 @@ export async function findingView({ campaignId, findingId, signal }) {
         class: "btn btn--ghost",
       }),
       firstSeed
+        ? link(
+            timelineHref(campaignId, firstSeed, {
+              checkId: finding.id,
+              atNs: finding.at_ns,
+            }),
+            "Timeline at failure",
+            { class: "btn btn--primary" },
+          )
+        : null,
+      firstSeed
         ? copyButton(
             firstInvocation ?? firstIdentity,
             firstInvocation ? "Copy first repro" : "Copy repro identity",
-            { class: "btn btn--primary", title: firstInvocation ?? firstIdentity },
+            { class: "btn btn--ghost", title: firstInvocation ?? firstIdentity },
           )
         : null,
     ].filter(Boolean),
@@ -327,7 +349,7 @@ export async function findingView({ campaignId, findingId, signal }) {
       notice(
         "info",
         "Causality is not claimed",
-        "Findings are deduplicated by assertion id. A 1-minimal fault set is not shown here; minimization and the timeline arrive with the v2 artifact surface.",
+        "Findings are deduplicated by assertion id. The timeline opens at the nearest recorded event at or before a failed check; it does not claim that event caused the failure. Minimization (U2.4) and its 1-minimal label are not available yet.",
       ),
     ),
   });
