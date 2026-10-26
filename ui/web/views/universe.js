@@ -138,7 +138,7 @@ function ledgerBody(universe) {
       "info",
       "Ledger truncated by the UI",
       `Showing the first ${formatCount(LEDGER_UI_LIMIT)} of ${formatCount(ledger.length)} entries. ` +
-        "The artifact still contains all rows; the v2 timeline will page them.",
+        "The artifact still contains all rows; the trace timeline pages canonical decisions separately.",
     ),
   );
 }
@@ -449,13 +449,18 @@ export async function universeView({ campaignId, seed, signal }) {
     ],
     badges,
     actions: [
+      link(
+        `/campaigns/${encodeURIComponent(campaignId)}/universes/${encodeURIComponent(seedValue)}/timeline`,
+        "Open timeline",
+        { class: "btn btn--primary" },
+      ),
       link(`/campaigns/${encodeURIComponent(campaignId)}/universes`, "Back to universes", {
         class: "btn btn--ghost",
       }),
       copyButton(
         invocation ?? identity,
         invocation ? "Copy repro" : "Copy repro identity",
-        { class: "btn btn--primary", title: invocation ?? identity },
+        { class: "btn btn--ghost", title: invocation ?? identity },
       ),
     ],
   });

@@ -33,6 +33,11 @@ export function parseLocation(location = window.location) {
     if (seed === null) return { name: "not_found", path };
     return { name: "universe", campaignId, seed, path };
   }
+  if (parts.length === 5 && parts[2] === "universes" && parts[4] === "timeline") {
+    const seed = decodeSegment(parts[3]);
+    if (seed === null) return { name: "not_found", path };
+    return { name: "timeline", campaignId, seed, path };
+  }
   if (parts.length === 4 && parts[2] === "findings") {
     const findingId = decodeSegment(parts[3]);
     if (findingId === null) return { name: "not_found", path };

@@ -114,7 +114,8 @@ export function copyButton(value, label = "Copy", props = {}) {
     label,
   );
   node.addEventListener("click", async () => {
-    const copied = await copyText(value);
+    const resolved = typeof value === "function" ? value() : value;
+    const copied = await copyText(resolved);
     node.textContent = copied ? "Copied" : "Copy failed";
     toast(copied ? "Copied to clipboard" : "Could not copy to the clipboard");
     clearTimeout(resetTimer);

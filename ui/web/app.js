@@ -2,6 +2,7 @@ import { campaignsView } from "./views/campaigns.js";
 import { campaignView } from "./views/campaign.js";
 import { universesView } from "./views/universes.js";
 import { universeView } from "./views/universe.js";
+import { timelineView } from "./views/timeline.js";
 import { findingView } from "./views/finding.js";
 import { errorView } from "./views/error.js";
 import { notFoundView } from "./views/not-found.js";
@@ -82,6 +83,8 @@ async function viewFor(route, signal) {
       return universesView({ campaignId: route.campaignId, signal });
     case "universe":
       return universeView({ campaignId: route.campaignId, seed: route.seed, signal });
+    case "timeline":
+      return timelineView({ campaignId: route.campaignId, seed: route.seed, signal });
     case "finding":
       return findingView({
         campaignId: route.campaignId,
@@ -95,6 +98,17 @@ async function viewFor(route, signal) {
 
 let renderToken = 0;
 let activeController = null;
+let activeView = null;
+
+function disposeView() {
+  if (!activeView) return;
+  try {
+    activeView.destroy?.();
+  } catch {
+    // A view teardown must never stop the next route from rendering.
+  }
+  activeView = null;
+}
 
 async function render() {
   const token = ++renderToken;
@@ -104,6 +118,7 @@ async function render() {
   const route = parseLocation();
   updateNav(route);
 
+  disposeView();
   main.setAttribute("aria-busy", "true");
   main.replaceChildren(loadingView());
   setBuildContext();
@@ -111,12 +126,17 @@ async function render() {
 
   try {
     const view = await viewFor(route, signal);
-    if (token !== renderToken || signal.aborted) return;
+    if (token !== renderToken || signal.aborted) {
+      view.destroy?.();
+      return;
+    }
+    activeView = view;
     main.replaceChildren(view.node);
     document.title = view.title;
     focusMain();
   } catch (error) {
     if (token !== renderToken || signal.aborted || error?.name === "AbortError") return;
+    activeView = null;
     const view =
       Number(error?.status) === 404
         ? notFoundView({ message: error?.message })

@@ -65,4 +65,11 @@ export const api = {
       signal,
     );
   },
+
+  trace(campaignId, seed, signal) {
+    return getJson(
+      `${campaignPath(campaignId)}/universes/${encodeURIComponent(String(seed))}/trace`,
+      signal,
+    );
+  },
 };

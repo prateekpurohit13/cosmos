@@ -21,12 +21,14 @@ export function formatCount(value) {
 export function formatNs(value) {
   if (value === null || value === undefined || value === "") return "—";
   const ns = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(ns) || ns < 0) return "—";
+  if (!Number.isFinite(ns)) return "—";
   if (ns === 0) return "0ns";
-  if (ns < 1_000) return `${Math.trunc(ns)}ns`;
-  if (ns < 1_000_000) return `${trimFixed(ns / 1_000, 2)}µs`;
-  if (ns < 1_000_000_000) return `${trimFixed(ns / 1_000_000, 2)}ms`;
-  return `${trimFixed(ns / 1_000_000_000, 2)}s`;
+  const sign = ns < 0 ? "-" : "";
+  const magnitude = Math.abs(ns);
+  if (magnitude < 1_000) return `${sign}${Math.trunc(magnitude)}ns`;
+  if (magnitude < 1_000_000) return `${sign}${trimFixed(magnitude / 1_000, 2)}µs`;
+  if (magnitude < 1_000_000_000) return `${sign}${trimFixed(magnitude / 1_000_000, 2)}ms`;
+  return `${sign}${trimFixed(magnitude / 1_000_000_000, 2)}s`;
 }
 
 export function formatAt(value) {
