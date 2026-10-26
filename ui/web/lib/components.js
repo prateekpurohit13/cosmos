@@ -195,6 +195,13 @@ export function timelineHref(campaignId, seed, { checkId = null, atNs = null, ev
   );
 }
 
+export function minimizationHref(campaignId, seed) {
+  return (
+    `/campaigns/${encodeURIComponent(String(campaignId))}/universes/` +
+    `${encodeURIComponent(String(seed))}/minimization`
+  );
+}
+
 export function compareHref(campaignId, leftSeed, rightSeed) {
   const params = new URLSearchParams();
   if (leftSeed !== null && leftSeed !== undefined && String(leftSeed) !== "") {

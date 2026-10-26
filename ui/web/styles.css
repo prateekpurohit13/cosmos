@@ -1774,6 +1774,20 @@ pre {
   min-width: 940px;
 }
 
+.data--minimization {
+  min-width: 940px;
+}
+
+.data--minimization tbody tr.is-dim {
+  opacity: 0.42;
+}
+
+.data--minimization tbody tr.is-kept,
+.data--minimization tbody tr.is-kept:hover {
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  box-shadow: inset 2px 0 0 var(--green);
+}
+
 .data--trace tbody tr {
   cursor: pointer;
 }

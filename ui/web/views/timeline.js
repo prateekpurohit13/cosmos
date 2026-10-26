@@ -10,6 +10,7 @@ import {
   emptyState,
   findingLink,
   kvList,
+  minimizationHref,
   notice,
   pageHeader,
   panel,
@@ -773,6 +774,10 @@ export async function timelineView({ campaignId, seed, signal }) {
       link(compareHref(campaignId, seedValue), "Compare", {
         class: "btn btn--ghost",
         title: "Compare this universe with another universe in this campaign",
+      }),
+      link(minimizationHref(campaignId, seedValue), "Minimization", {
+        class: "btn btn--ghost",
+        title: "Open the exported MinimizeReport, or its explicit absence",
       }),
       copyButton(invocation ?? identity, invocation ? "Copy repro" : "Copy repro identity", {
         class: "btn btn--primary",

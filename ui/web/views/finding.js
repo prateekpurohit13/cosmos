@@ -6,6 +6,7 @@ import {
   copyButton,
   emptyState,
   kvList,
+  minimizationHref,
   notice,
   pageHeader,
   panel,
@@ -87,6 +88,7 @@ function seedTable(finding, campaignId, indexes, manifest, page = 1) {
           el("th", { scope: "col", class: "num" }, "Checks"),
           el("th", { scope: "col" }, "Trace"),
           el("th", { scope: "col" }, "Replay"),
+          el("th", { scope: "col" }, "Minimization"),
           el("th", { scope: "col" }, "Identity"),
         ),
       ),
@@ -141,6 +143,14 @@ function seedTable(finding, campaignId, indexes, manifest, page = 1) {
             el(
               "td",
               {},
+              link(minimizationHref(campaignId, seed), "report", {
+                class: "btn btn--ghost btn--sm",
+                title: "Open the exported minimization report for this seed",
+              }),
+            ),
+            el(
+              "td",
+              {},
               copyButton(invocation ?? identity, invocation ? "Copy" : "Copy id", {
                 title: invocation ?? identity,
               }),
@@ -191,6 +201,110 @@ function seedTable(finding, campaignId, indexes, manifest, page = 1) {
   );
 }
 
+function minimizationSummary(campaignId, seed, findingId, payload, error) {
+  if (error) {
+    return notice(
+      "warn",
+      "Could not load minimization",
+      error.message || "The artifact server did not return the minimization report.",
+    );
+  }
+  const report = payload?.minimization;
+  if (!report || report.present !== true) {
+    return el(
+      "div",
+      {},
+      emptyState({
+        title: "No minimization report",
+        body:
+          "The artifact carries no report for this seed. Absence is not an empty fault set: " +
+          "minimization is report-only and the UI never runs it.",
+        action: link(minimizationHref(campaignId, seed), "Open minimization view", {
+          class: "btn btn--ghost btn--sm",
+        }),
+      }),
+    );
+  }
+  if (report.finding_id && String(report.finding_id) !== String(findingId)) {
+    return el(
+      "div",
+      {},
+      notice(
+        "warn",
+        "Report belongs to another finding",
+        `The exported report for this seed is for ${report.finding_id}. This artifact stores ` +
+          "one report per seed; open that finding or the universe view for the report.",
+      ),
+      el(
+        "p",
+        { class: "section-gap" },
+        link(minimizationHref(campaignId, seed), "Open the minimization view"),
+        " to see the full report and its finding identity.",
+      ),
+    );
+  }
+  if (report.refused) {
+    return el(
+      "div",
+      {},
+      notice("bad", "Minimization refused", report.reason || "The harness refused this trace."),
+      el(
+        "p",
+        { class: "section-gap" },
+        link(minimizationHref(campaignId, seed), "Open the minimization view"),
+        " for the report details and replay context.",
+      ),
+    );
+  }
+  const kept = Array.isArray(report.kept) ? report.kept : [];
+  const candidates = Array.isArray(report.candidates) ? report.candidates : [];
+  return el(
+    "div",
+    {},
+    notice(
+      "warn",
+      "1-minimal, not globally minimal",
+      kept.length === 0
+        ? "The kept set is empty: the finding reproduces with every fault withheld. The report " +
+            "does not claim an injected fault caused it, or that a smaller set is impossible."
+        : "Every kept fire is necessary: removing any single one makes the finding stop " +
+            "reproducing. The report does not prove the set is globally smallest or explain a " +
+            "cause outside the recorded trace." +
+            " A removal trial that crashed or exited without a verdict is not counted as " +
+            "reproduction, so necessity is unproven for the affected fires.",
+    ),
+    kvList([
+      ["Kept / candidates", `${formatCount(kept.length)} / ${formatCount(candidates.length)}`],
+      ["Only faults", report.only_faults?.length ? report.only_faults.join(", ") : "none"],
+      ["Passes", formatCount(report.passes)],
+      ["Replays", formatCount(report.replays)],
+      ["Crashed trials", formatCount(report.crashed_trials)],
+    ]),
+    report.repro
+      ? el(
+          "div",
+          { class: "cluster section-gap" },
+          el("code", { class: "inline-code repro-identity" }, report.repro),
+          copyButton(report.repro, "Copy command"),
+        )
+      : null,
+    report.repro
+      ? el(
+          "p",
+          { class: "faint" },
+          "Harness invocation recorded by the report; the viewer does not verify that the program " +
+            "accepts these flags.",
+        )
+      : null,
+    el(
+      "p",
+      { class: "section-gap" },
+      link(minimizationHref(campaignId, seed), "Open the full minimization report"),
+      " for every candidate, the kept rows and the exact --only-faults repro.",
+    ),
+  );
+}
+
 export async function findingView({ campaignId, findingId, signal }) {
   const data = await api.campaign(campaignId, signal);
   const campaign = data.campaign ?? {};
@@ -224,6 +338,17 @@ export async function findingView({ campaignId, findingId, signal }) {
   const build = manifest.build ?? {};
   const firstInvocation = firstSeed ? reproInvocation(manifest, firstSeed) : null;
   const firstIdentity = firstSeed ? reproIdentity(manifest, firstSeed) : null;
+
+  let minimization = null;
+  let minimizationError = null;
+  if (firstSeed) {
+    try {
+      minimization = await api.minimization(campaignId, firstSeed, signal);
+    } catch (error) {
+      if (error?.name === "AbortError" || signal?.aborted) throw error;
+      minimizationError = error;
+    }
+  }
 
   const header = pageHeader({
     eyebrow: `Campaign / ${campaignId} / finding`,
@@ -349,10 +474,25 @@ export async function findingView({ campaignId, findingId, signal }) {
       notice(
         "info",
         "Causality is not claimed",
-        "Findings are deduplicated by assertion id. The timeline opens at the nearest recorded event at or before a failed check; it does not claim that event caused the failure. Minimization (U2.4) and its 1-minimal label are not available yet.",
+        "Findings are deduplicated by assertion id. The timeline opens at the nearest recorded event at or before a failed check; it does not claim that event caused the failure. Minimization is shown separately with its 1-minimal label.",
       ),
     ),
   });
+
+  const minimizationPanel = firstSeed
+    ? panel({
+        title: "Minimization",
+        subtitle:
+          "Exported report for the first failing seed; 1-minimal does not mean globally minimal",
+        body: minimizationSummary(
+          campaignId,
+          firstSeed,
+          finding.id,
+          minimization,
+          minimizationError,
+        ),
+      })
+    : null;
 
   return {
     title: `${finding.id || "Finding"} · ${campaign.name || campaignId} · Cosmos`,
@@ -362,6 +502,7 @@ export async function findingView({ campaignId, findingId, signal }) {
       header,
       stats,
       el("div", { class: "grid-2" }, ledger, reproPanel),
+      minimizationPanel ? el("div", { class: "section-gap" }, minimizationPanel) : null,
       el("div", { class: "section-gap" }, seedsPanel),
     ),
   };

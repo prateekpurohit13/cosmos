@@ -72,4 +72,11 @@ export const api = {
       signal,
     );
   },
+
+  minimization(campaignId, seed, signal) {
+    return getJson(
+      `${campaignPath(campaignId)}/universes/${encodeURIComponent(String(seed))}/minimization`,
+      signal,
+    );
+  },
 };
