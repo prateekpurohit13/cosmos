@@ -748,7 +748,7 @@ def _trace_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, An
             "missing": False,
             "path": meta.get("path") if isinstance(meta.get("path"), str) else "",
             "capacity": meta.get("capacity"),
-            "dropped": meta.get("dropped", 0),
+            "dropped": meta.get("dropped"),
             "declared_hash": meta.get("hash"),
             "entries": [],
         },
