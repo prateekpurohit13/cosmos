@@ -9,28 +9,37 @@
 // and its returned ScenarioReport is the only channel back.
 
 #include "cosmos/assert.hpp"
+#include "cosmos/faults_json.hpp"
 #include "cosmos/ledger_print.hpp"
 #include "cosmos/scenario.hpp"
 #include "cosmos/simulator.hpp"
 
 #include <algorithm>
 #include <bitset>
+#include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
 namespace cosmos {
+
+namespace detail {
+struct UniverseOutcome;
+}
 
 // Reserved ids: the harness's own findings, never an application's (scenario.hpp's convention).
 inline constexpr const char* kCrashedUniverseId = "cosmos.campaign.crash";
@@ -57,8 +66,20 @@ struct CampaignConfig {
     bool verify = false;
     // Trace buffer per run while verifying; overflow is reported, never hashed as if complete.
     uint64_t trace_capacity = kDefaultTraceCapacity;
+    // Records the decision trace for every universe and keeps its canonical bytes for artifact
+    // export. verify implies tracing but does not keep the bytes. Off by default because a trace
+    // is ~48 MB per universe at the default capacity (docs/ui-design.md §7.3).
+    bool trace = false;
     // Named in the repro line so a finding can be re-run verbatim, e.g. "myapp_test".
     std::string program;
+    // Artifact identity (docs/ui-design.md Appendix A). Optional for callers that only print a
+    // report; the artifact writer requires an id.
+    std::string id;
+    std::string name;
+    // Parent-side observer for every universe, called in ascending index order. The campaign still
+    // owns the report; this is the artifact/UI seam and must never be called from a wrapper or a
+    // running universe. The worker channel carries the trace bytes and realized config when asked.
+    std::function<void(const detail::UniverseOutcome&)> on_universe;
 };
 
 // One violated assertion, deduplicated by id -- never by fault set, which is not globally minimal
@@ -72,6 +93,9 @@ struct Finding {
     uint64_t universes_failed = 0;
     bool rare = false;  // reproduces in under a third of the runs
     std::string ledger; // rendered ledger of the first universe that failed this id
+    // Every universe that failed this id, in ascending universe-index order. `seed` above is the
+    // first one; this is what lets the UI list all repro seeds without re-scanning the campaign.
+    std::vector<uint64_t> seeds;
 };
 
 // Why a site the configuration armed was never exercised (§11.4). Never a finding: a finding is a
@@ -122,11 +146,22 @@ struct CampaignReport {
 
     // Echoed from the config so a report prints its own repro line without the caller's help.
     uint64_t base_seed = 0;
+    uint32_t node_count = 0;
+    unsigned parallel = 0;
     std::string program;
     bool verify = false;
+    // Artifact identity and trace intent. `trace` is true when the run recorded decision traces
+    // (verify implies it); `trace_capacity` is the buffer each universe was given.
+    std::string id;
+    std::string name;
+    bool trace = false;
+    uint64_t trace_capacity = 0;
 };
 
 namespace detail {
+
+// The worker channel carries the activation set in one u64 (serialize_outcome below).
+static_assert(kSiteCount <= 64, "activation set must fit the worker channel's u64 field");
 
 // One universe's result, in the form a parent process can fold after the universe is gone.
 struct UniverseOutcome {
@@ -136,10 +171,27 @@ struct UniverseOutcome {
     int signal = 0;    // WTERMSIG when it died on a signal
     std::string threw; // nonempty when the universe's body threw instead of reporting
     uint64_t out_of_scope = 0;
+    // Virtual time when the universe body returned. This is not a wall-clock duration, and the
+    // UI must label it as virtual time (D10); wall_ns is the separate host measurement.
+    Time ended_at{};
+    uint64_t wall_ns = 0;
     bool traced = false;         // the injector recorded a trace for this universe
     uint64_t trace_hash = 0;     // canonical trace hash, valid only when traced
     uint64_t trace_dropped = 0;  // entries the trace buffer could not hold
+    uint64_t trace_capacity = 0; // the buffer this universe was given
     std::string verify_mismatch; // verify's first difference, empty on a deterministic run
+    // Realized config and its identity. The config can differ per universe because
+    // FaultConfig::sample() draws from the Swarm stream (D14).
+    bool has_config = false;
+    std::string config_json;
+    std::string config_hash;
+    // Structured ledger and its rendered form. The entries are the UI's filterable rows; the
+    // rendered dump is kept because it is the existing human-readable explanation.
+    std::vector<LedgerEntry> ledger_entries{};
+    uint64_t ledger_dropped = 0;
+    // Canonical fault-trace bytes, present only when the run was asked to keep them. They are the
+    // same bytes trace_hash() covers, so an artifact can be verified without re-running.
+    std::string trace_bytes;
     ScenarioReport report{};
 };
 
@@ -147,6 +199,12 @@ struct UniverseOutcome {
 struct UniverseOptions {
     TraceOptions trace{};
     bool verify = false;
+    // Keeps encode_trace() bytes on the outcome for artifact export. A campaign that only verifies
+    // does not need a second copy of a potentially 48 MB trace.
+    bool keep_trace_bytes = false;
+    // Keeps the realized config JSON and structured ledger entries. Only an artifact sink needs
+    // them; a report-only campaign should not pay to copy them through the worker channel.
+    bool capture_metadata = false;
 };
 
 // Runs one universe in this process: the Simulator is per universe, so no state crosses between
@@ -160,12 +218,31 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
     {
         Simulator sim(seed);
         sim.set_default_trace_options(options.trace);
+        const auto wall_start = std::chrono::steady_clock::now();
         try {
             outcome.report = build_fn(sim, index);
         } catch (const std::exception& error) {
             outcome.threw = error.what();
         } catch (...) {
             outcome.threw = "unknown exception";
+        }
+        outcome.wall_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - wall_start)
+                                      .count());
+        // Read while the universe still exists, and before the report is escaped or rendered: the
+        // end time and the injector state die with the Simulator.
+        outcome.ended_at = sim.now();
+        if (const auto* injector = sim.injector_or_null()) {
+            if (options.capture_metadata) {
+                outcome.has_config = true;
+                outcome.config_json = config_json(injector->config());
+                outcome.config_hash = config_fingerprint(injector->config());
+                for (const LedgerEntry& entry : injector->ledger()) {
+                    outcome.ledger_entries.push_back(entry);
+                }
+                outcome.ledger_dropped = injector->ledger().dropped();
+            }
         }
         // Rendered here because the injector dies with the Simulator, and a finding needs its
         // ledger.
@@ -181,8 +258,14 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
             const FaultTrace& trace = injector->trace();
             outcome.traced = trace.enabled();
             if (outcome.traced) {
-                outcome.trace_hash = trace_hash(trace);
+                outcome.trace_capacity = trace.capacity();
                 outcome.trace_dropped = trace.dropped();
+                if (options.keep_trace_bytes) {
+                    outcome.trace_bytes = encode_trace(trace);
+                    outcome.trace_hash = detail::fnv1a_64(outcome.trace_bytes);
+                } else {
+                    outcome.trace_hash = trace_hash(trace);
+                }
             }
         }
     }
@@ -272,20 +355,18 @@ class CampaignAccumulator {
         if (outcome.died) {
             ++report_.crashed_runs;
             ++report_.failed_runs;
-            Finding& finding = find_or_add(kCrashedUniverseId, outcome);
-            if (finding.universes_failed == 0) {
+            Finding& finding = record_failure(kCrashedUniverseId, outcome);
+            if (finding.universes_failed == 1) {
                 finding.detail = outcome.signal != 0
                                      ? "killed by signal " + std::to_string(outcome.signal)
                                      : "exited without reporting";
             }
-            ++finding.universes_failed;
             return;
         }
         if (!outcome.threw.empty()) {
             ++report_.failed_runs;
-            Finding& finding = find_or_add(kThrewUniverseId, outcome);
-            if (finding.universes_failed == 0) finding.detail = outcome.threw;
-            ++finding.universes_failed;
+            Finding& finding = record_failure(kThrewUniverseId, outcome);
+            if (finding.universes_failed == 1) finding.detail = outcome.threw;
             return;
         }
 
@@ -293,19 +374,17 @@ class CampaignAccumulator {
         const bool verify_failed = !outcome.verify_mismatch.empty();
         if (!universe.no_check_failed || verify_failed) ++report_.failed_runs;
         if (verify_failed) {
-            Finding& finding = find_or_add(kVerifyFailedId, outcome);
-            if (finding.universes_failed == 0) finding.detail = outcome.verify_mismatch;
-            ++finding.universes_failed;
+            Finding& finding = record_failure(kVerifyFailedId, outcome);
+            if (finding.universes_failed == 1) finding.detail = outcome.verify_mismatch;
         }
         for (const CheckResult& check : universe.checks) {
             if (check.passed) continue;
-            Finding& finding = find_or_add(check.id, outcome);
-            if (finding.universes_failed == 0) {
+            Finding& finding = record_failure(check.id, outcome);
+            if (finding.universes_failed == 1) {
                 finding.detail = check.detail;
                 finding.at = check.at;
                 finding.ledger = universe.ledger_dump;
             }
-            ++finding.universes_failed;
         }
         // Coalesced by id, because a hit anywhere outweighs a miss everywhere.
         for (const CoverageNote& note : universe.coverage) {
@@ -360,6 +439,18 @@ class CampaignAccumulator {
     }
 
   private:
+    // One place for the seed list, so a finding's first seed and its full list cannot disagree.
+    Finding& record_failure(const std::string& id, const UniverseOutcome& outcome) {
+        Finding& finding = find_or_add(id, outcome);
+        // Crash, throw and verify findings are harness ids but still belong to one universe, so
+        // they get a seed list too. add_harness_finding() bypasses this for ids with no universe.
+        if (finding.seeds.empty() || finding.seeds.back() != outcome.seed) {
+            finding.seeds.push_back(outcome.seed);
+        }
+        ++finding.universes_failed;
+        return finding;
+    }
+
     Finding& find_or_add(const std::string& id, const UniverseOutcome& outcome) {
         auto [position, inserted] = findings_.try_emplace(id);
         if (inserted) {
@@ -426,17 +517,75 @@ inline std::string serialize_outcome(const UniverseOutcome& outcome) {
     put_field(bytes, static_cast<uint8_t>(outcome.traced ? 1 : 0));
     put_field(bytes, outcome.trace_hash);
     put_field(bytes, outcome.trace_dropped);
+    put_field(bytes, outcome.trace_capacity);
     put_text(bytes, outcome.verify_mismatch);
+    put_field(bytes, outcome.ended_at.ns);
+    put_field(bytes, outcome.wall_ns);
+    put_field(bytes, static_cast<uint8_t>(outcome.has_config ? 1 : 0));
+    put_text(bytes, outcome.config_json);
+    put_text(bytes, outcome.config_hash);
+    put_field(bytes, static_cast<uint64_t>(outcome.ledger_entries.size()));
+    for (const LedgerEntry& entry : outcome.ledger_entries) {
+        put_field(bytes, entry.fire_index);
+        put_field(bytes, entry.at.ns);
+        put_field(bytes, static_cast<uint64_t>(entry.site));
+        put_field(bytes, entry.eligible_index);
+        put_field(bytes, static_cast<uint8_t>(entry.fault_class));
+        put_field(bytes, static_cast<uint8_t>(entry.outcome));
+        put_field(bytes, static_cast<uint8_t>(entry.drew ? 1 : 0));
+        put_field(bytes, static_cast<uint8_t>(entry.status));
+        put_field(bytes, static_cast<uint8_t>(entry.reason));
+        put_field(bytes, static_cast<uint8_t>(entry.persistent ? 1 : 0));
+    }
+    put_field(bytes, outcome.ledger_dropped);
+    put_text(bytes, outcome.trace_bytes);
     return bytes;
 }
 
-// Walks a worker's bytes, stopping at a clean end or a half-written record.
+// Walks length-prefixed records read from a worker's scratch fd, one at a time. The length prefix
+// is deliberately outside serialize_outcome(): the parent must be able to skip a record it cannot
+// hold without first allocating the whole slice. A partial record stops the walk at the last good
+// boundary, which is what recover_slice() re-runs.
 class OutcomeReader {
   public:
-    explicit OutcomeReader(std::string bytes) : bytes_(std::move(bytes)) {}
+    explicit OutcomeReader(int fd) : fd_(fd) {
+        const off_t end = ::lseek(fd_, 0, SEEK_END);
+        file_size_ = end > 0 ? static_cast<uint64_t>(end) : 0;
+        (void)::lseek(fd_, 0, SEEK_SET);
+    }
 
     bool next(UniverseOutcome& outcome) {
-        if (offset_ >= bytes_.size()) return false;
+        uint64_t length = 0;
+        if (!read_exact(&length, sizeof(length))) return false;
+        file_offset_ += sizeof(length);
+        if (file_offset_ > file_size_ || length > file_size_ - file_offset_ || length == 0) {
+            return false;
+        }
+        if (length > std::numeric_limits<size_t>::max()) return false;
+        std::string record(static_cast<size_t>(length), '\0');
+        if (!read_exact(record.data(), record.size())) return false;
+        file_offset_ += length;
+        bytes_ = std::move(record);
+        parse_offset_ = 0;
+        return parse(outcome);
+    }
+
+  private:
+    bool read_exact(void* data, size_t count) {
+        size_t done = 0;
+        while (done < count) {
+            const ssize_t got = ::read(fd_, static_cast<char*>(data) + done, count - done);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (got == 0) return false;
+            done += static_cast<size_t>(got);
+        }
+        return true;
+    }
+
+    bool parse(UniverseOutcome& outcome) {
         UniverseOutcome parsed;
         uint8_t flag = 0;
         int32_t signal = 0;
@@ -472,38 +621,83 @@ class OutcomeReader {
         uint64_t activation_mask = 0;
         if (!take(activation_mask)) return false;
         parsed.report.activated_sites = std::bitset<kSiteCount>(activation_mask);
-        if (!take(parsed.report.active_allocations)) return false;
+        uint64_t active_allocations = 0;
+        if (!take(active_allocations)) return false;
+        if (active_allocations > std::numeric_limits<size_t>::max()) return false;
+        parsed.report.active_allocations = static_cast<size_t>(active_allocations);
         if (!take_text(parsed.report.ledger_dump)) return false;
         uint8_t traced = 0;
         if (!take(traced) || !take(parsed.trace_hash) || !take(parsed.trace_dropped) ||
-            !take_text(parsed.verify_mismatch)) {
+            !take(parsed.trace_capacity) || !take_text(parsed.verify_mismatch)) {
             return false;
         }
         parsed.traced = traced != 0;
+        if (!take(parsed.ended_at.ns) || !take(parsed.wall_ns)) return false;
+        uint8_t has_config = 0;
+        if (!take(has_config) || !take_text(parsed.config_json) || !take_text(parsed.config_hash)) {
+            return false;
+        }
+        parsed.has_config = has_config != 0;
+        uint64_t ledger_count = 0;
+        if (!take(ledger_count)) return false;
+        // The channel is written by this binary, but a half-written record must not be read as a
+        // gigantic vector request.
+        if (ledger_count > kLedgerCapacity) return false;
+        for (uint64_t index = 0; index < ledger_count; ++index) {
+            LedgerEntry entry{};
+            uint8_t fault_class = 0;
+            uint8_t outcome = 0;
+            uint8_t drew = 0;
+            uint8_t status = 0;
+            uint8_t reason = 0;
+            uint8_t persistent = 0;
+            if (!take(entry.fire_index) || !take(entry.at.ns) || !take(entry.site) ||
+                !take(entry.eligible_index) || !take(fault_class) || !take(outcome) ||
+                !take(drew) || !take(status) || !take(reason) || !take(persistent)) {
+                return false;
+            }
+            if (fault_class >= static_cast<uint8_t>(FaultClass::_Count) ||
+                outcome >= static_cast<uint8_t>(FaultKind::_Count) ||
+                status > static_cast<uint8_t>(DecisionStatus::Skipped) ||
+                reason >= static_cast<uint8_t>(SkipReason::_Count) ||
+                !is_known_site(static_cast<SiteId>(entry.site))) {
+                return false;
+            }
+            entry.fault_class = static_cast<FaultClass>(fault_class);
+            entry.outcome = static_cast<FaultKind>(outcome);
+            entry.drew = drew != 0;
+            entry.status = static_cast<DecisionStatus>(status);
+            entry.reason = static_cast<SkipReason>(reason);
+            entry.persistent = persistent != 0;
+            parsed.ledger_entries.push_back(entry);
+        }
+        if (!take(parsed.ledger_dropped) || !take_text(parsed.trace_bytes)) return false;
 
         outcome = std::move(parsed);
         return true;
     }
 
-  private:
     template <typename T> bool take(T& value) {
-        if (offset_ + sizeof(T) > bytes_.size()) return false;
-        std::memcpy(&value, bytes_.data() + offset_, sizeof(T));
-        offset_ += sizeof(T);
+        if (sizeof(T) > bytes_.size() - parse_offset_) return false;
+        std::memcpy(&value, bytes_.data() + parse_offset_, sizeof(T));
+        parse_offset_ += sizeof(T);
         return true;
     }
 
     bool take_text(std::string& text) {
         uint64_t length = 0;
         if (!take(length)) return false;
-        if (offset_ + length > bytes_.size()) return false;
-        text.assign(bytes_, offset_, static_cast<size_t>(length));
-        offset_ += static_cast<size_t>(length);
+        if (length > bytes_.size() - parse_offset_) return false;
+        text.assign(bytes_.data() + parse_offset_, static_cast<size_t>(length));
+        parse_offset_ += static_cast<size_t>(length);
         return true;
     }
 
+    int fd_ = -1;
+    uint64_t file_size_ = 0;
+    uint64_t file_offset_ = 0;
     std::string bytes_;
-    size_t offset_ = 0;
+    size_t parse_offset_ = 0;
 };
 
 // Unlinked on creation: the worker's death leaves nothing behind, and no reader can be blocked.
@@ -539,55 +733,83 @@ inline Slice slice_for(uint64_t trials, unsigned workers, unsigned worker) {
 }
 
 inline void run_slice_into(const Slice& slice, uint64_t base_seed, const UniverseFn& build_fn,
-                           const UniverseOptions& options, CampaignAccumulator& accumulator) {
+                           const UniverseOptions& options, CampaignAccumulator& accumulator,
+                           const std::function<void(const UniverseOutcome&)>& sink = {}) {
     for (uint64_t index = slice.begin; index < slice.end; ++index) {
-        accumulator.add(run_universe(index, universe_seed(base_seed, index), build_fn, options));
+        const UniverseOutcome outcome =
+            run_universe(index, universe_seed(base_seed, index), build_fn, options);
+        accumulator.add(outcome);
+        if (sink) sink(outcome);
     }
 }
 
-// The child's whole job. Nothing here may touch the parent's memory and expect it to survive.
-inline void run_slice_to_file(const Slice& slice, uint64_t base_seed, const UniverseFn& build_fn,
-                              const UniverseOptions& options, int fd) {
-    std::string bytes;
-    for (uint64_t index = slice.begin; index < slice.end; ++index) {
-        bytes += serialize_outcome(
-            run_universe(index, universe_seed(base_seed, index), build_fn, options));
-        if (bytes.size() >= 1u << 20) {
-            const ssize_t written = ::write(fd, bytes.data(), bytes.size());
-            if (written != static_cast<ssize_t>(bytes.size())) return;
-            bytes.clear();
-        }
-    }
+inline bool write_all(int fd, std::string_view bytes) {
     size_t done = 0;
     while (done < bytes.size()) {
         const ssize_t written = ::write(fd, bytes.data() + done, bytes.size() - done);
-        if (written <= 0) return;
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (written == 0) return false;
         done += static_cast<size_t>(written);
     }
+    return true;
+}
+
+// The child's whole job. Nothing here may touch the parent's memory and expect it to survive.
+// Each record is length-prefixed so the parent can read one outcome at a time instead of the whole
+// slice; a trace is large enough that the difference is the campaign's peak RSS.
+inline bool run_slice_to_file(const Slice& slice, uint64_t base_seed, const UniverseFn& build_fn,
+                              const UniverseOptions& options, int fd) {
+    std::string bytes;
+    for (uint64_t index = slice.begin; index < slice.end; ++index) {
+        const std::string record = serialize_outcome(
+            run_universe(index, universe_seed(base_seed, index), build_fn, options));
+        put_field(bytes, static_cast<uint64_t>(record.size()));
+        bytes += record;
+        if (bytes.size() >= 1u << 20) {
+            if (!write_all(fd, bytes)) return false;
+            bytes.clear();
+        }
+    }
+    return write_all(fd, bytes);
 }
 
 // One universe per worker for the tail of a slice whose worker died. A universe that dies again is
 // attributed to its own seed, which is the whole point of paying for a second fork.
 inline void recover_slice(uint64_t from, uint64_t to, uint64_t base_seed,
                           const UniverseFn& build_fn, const UniverseOptions& options,
-                          CampaignAccumulator& accumulator) {
+                          CampaignAccumulator& accumulator,
+                          const std::function<void(const UniverseOutcome&)>& sink = {}) {
     for (uint64_t index = from; index < to; ++index) {
         UniverseOutcome outcome;
         const int fd = open_scratch_file();
         const pid_t pid = fd < 0 ? -1 : ::fork();
         if (pid == 0) {
-            run_slice_to_file(Slice{index, index + 1}, base_seed, build_fn, options, fd);
+            try {
+                if (!run_slice_to_file(Slice{index, index + 1}, base_seed, build_fn, options, fd)) {
+                    ::_exit(1);
+                }
+            } catch (...) {
+                ::_exit(1);
+            }
             ::_exit(0);
         }
         if (pid < 0) {
             if (fd >= 0) ::close(fd);
-            accumulator.add(
-                run_universe(index, universe_seed(base_seed, index), build_fn, options));
+            accumulator.add_harness_finding(
+                kForkFailedId,
+                "fork() failed during recovery; that universe ran in-process and is not "
+                "crash-contained");
+            outcome = run_universe(index, universe_seed(base_seed, index), build_fn, options);
+            accumulator.add(outcome);
+            if (sink) sink(outcome);
             continue;
         }
         int status = 0;
         ::waitpid(pid, &status, 0);
-        OutcomeReader reader(read_scratch_file(fd));
+        OutcomeReader reader(fd);
         if (!reader.next(outcome)) {
             outcome.index = index;
             outcome.seed = universe_seed(base_seed, index);
@@ -596,6 +818,7 @@ inline void recover_slice(uint64_t from, uint64_t to, uint64_t base_seed,
         }
         ::close(fd);
         accumulator.add(outcome);
+        if (sink) sink(outcome);
     }
 }
 
@@ -607,8 +830,14 @@ inline CampaignReport refused_report(const CampaignConfig& config, const char* d
     CampaignReport report;
     report.refused = true;
     report.base_seed = config.base_seed;
+    report.node_count = config.node_count;
+    report.parallel = config.parallel;
     report.program = config.program;
     report.verify = config.verify;
+    report.id = config.id;
+    report.name = config.name;
+    report.trace = config.verify || config.trace;
+    report.trace_capacity = config.trace_capacity;
     Finding finding;
     finding.id = kVerifyFailedId;
     finding.detail = detail;
@@ -672,38 +901,7 @@ inline void print_campaign_report(std::ostream& out, const CampaignReport& repor
 
 namespace detail {
 
-inline void json_escape(std::ostream& out, const std::string& text) {
-    out << '"';
-    for (const char raw : text) {
-        const unsigned char byte = static_cast<unsigned char>(raw);
-        switch (byte) {
-        case '"':
-            out << "\\\"";
-            break;
-        case '\\':
-            out << "\\\\";
-            break;
-        case '\n':
-            out << "\\n";
-            break;
-        case '\r':
-            out << "\\r";
-            break;
-        case '\t':
-            out << "\\t";
-            break;
-        default:
-            if (byte < 0x20) {
-                char escaped[8];
-                std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
-                out << escaped;
-            } else {
-                out << raw;
-            }
-        }
-    }
-    out << '"';
-}
+inline void json_escape(std::ostream& out, const std::string& text) { json::string(out, text); }
 
 // A site's counts only mean something together: activated but never reached is §11.4's vacuity,
 // reached but never fired is a rate that never got its chance.
@@ -724,26 +922,52 @@ inline void json_sites(std::ostream& out, const CampaignReport& report) {
 // The dashboard's input (plan §P4): findings, never_hit kept in its own section, per-site counters
 // and the repro seeds. Written to a stream, so the caller decides what to do with it.
 inline void print_campaign_json(std::ostream& out, const CampaignReport& report) {
+    const json::classic_locale_guard locale(out);
     out << "{\n";
+    out << "  \"schema_version\": " << kArtifactSchemaVersion << ",\n";
+    out << "  \"campaign_id\": ";
+    detail::json_escape(out, report.id);
+    out << ",\n  \"name\": ";
+    detail::json_escape(out, report.name);
+    out << ",\n";
     out << "  \"runs\": " << report.runs << ",\n";
     out << "  \"failed_runs\": " << report.failed_runs << ",\n";
     out << "  \"crashed_runs\": " << report.crashed_runs << ",\n";
     out << "  \"refused\": " << (report.refused ? "true" : "false") << ",\n";
     out << "  \"verify\": " << (report.verify ? "true" : "false") << ",\n";
+    out << "  \"trace\": " << (report.trace ? "true" : "false") << ",\n";
+    out << "  \"trace_capacity\": " << report.trace_capacity << ",\n";
     out << "  \"base_seed\": " << report.base_seed << ",\n";
+    out << "  \"node_count\": " << report.node_count << ",\n";
+    out << "  \"parallel\": " << report.parallel << ",\n";
+    out << "  \"base_seed_dec\": ";
+    detail::json_escape(out, json::decimal(report.base_seed));
+    out << ",\n";
     out << "  \"findings\": [";
     for (size_t i = 0; i < report.findings.size(); ++i) {
         const Finding& finding = report.findings[i];
         out << (i == 0 ? "\n    " : ",\n    ");
         out << "{\"id\": ";
         detail::json_escape(out, finding.id);
+        // `seed` stays a number for existing consumers; `seed_dec` is the precision-safe form the
+        // UI must use, and `seeds` lists every universe that failed this id.
         out << ", \"index\": " << finding.index << ", \"seed\": " << finding.seed
+            << ", \"seed_dec\": ";
+        detail::json_escape(out, json::decimal(finding.seed));
+        out << ", \"seed_hex\": ";
+        detail::json_escape(out, json::hex(finding.seed));
+        out << ", \"at_ns\": " << finding.at.ns
             << ", \"universes_failed\": " << finding.universes_failed
             << ", \"rare\": " << (finding.rare ? "true" : "false") << ", \"detail\": ";
         detail::json_escape(out, finding.detail);
         out << ", \"ledger\": ";
         detail::json_escape(out, finding.ledger);
-        out << '}';
+        out << ", \"seeds\": [";
+        for (size_t seed_index = 0; seed_index < finding.seeds.size(); ++seed_index) {
+            if (seed_index != 0) out << ", ";
+            detail::json_escape(out, json::decimal(finding.seeds[seed_index]));
+        }
+        out << "]}";
     }
     out << (report.findings.empty() ? "],\n" : "\n  ],\n");
 
@@ -786,10 +1010,16 @@ class Campaign {
         if (config.verify && config.trace_capacity == 0) {
             return refused_report(config, "CampaignConfig::verify needs trace_capacity > 0");
         }
+        if (config.trace && config.trace_capacity == 0) {
+            return refused_report(config, "CampaignConfig::trace needs trace_capacity > 0");
+        }
         const detail::UniverseOptions options{
-            .trace = {.enabled = config.verify, .capacity = config.trace_capacity},
+            .trace = {.enabled = config.verify || config.trace, .capacity = config.trace_capacity},
             .verify = config.verify,
+            .keep_trace_bytes = config.trace && static_cast<bool>(config.on_universe),
+            .capture_metadata = static_cast<bool>(config.on_universe),
         };
+        const auto& sink = config.on_universe;
 
         const unsigned workers = std::max(1u, config.parallel);
         struct LaunchedWorker {
@@ -805,7 +1035,14 @@ class Campaign {
             const pid_t pid = fd < 0 ? -1 : ::fork();
             // The child runs its slice and leaves; _exit skips inherited stdio and atexit handlers.
             if (pid == 0) {
-                detail::run_slice_to_file(slice, config.base_seed, build_fn, options, fd);
+                try {
+                    if (!detail::run_slice_to_file(slice, config.base_seed, build_fn, options,
+                                                   fd)) {
+                        ::_exit(1);
+                    }
+                } catch (...) {
+                    ::_exit(1);
+                }
                 ::_exit(0);
             }
             launched.push_back(LaunchedWorker{slice, fd, pid});
@@ -816,32 +1053,39 @@ class Campaign {
             if (worker.pid > 0) {
                 int status = 0;
                 ::waitpid(worker.pid, &status, 0);
-                detail::OutcomeReader reader(detail::read_scratch_file(worker.fd));
+                detail::OutcomeReader reader(worker.fd);
                 uint64_t next = worker.slice.begin;
                 detail::UniverseOutcome outcome;
                 while (reader.next(outcome)) {
                     accumulator.add(outcome);
+                    if (sink) sink(outcome);
                     ++next;
                 }
                 // Shorter than the slice means the worker died or wrote short: recover the rest.
                 if (next < worker.slice.end) {
                     detail::recover_slice(next, worker.slice.end, config.base_seed, build_fn,
-                                          options, accumulator);
+                                          options, accumulator, sink);
                 }
             } else {
                 accumulator.add_harness_finding(
                     kForkFailedId,
                     "fork() failed; that slice ran in-process and is not crash-contained");
                 detail::run_slice_into(worker.slice, config.base_seed, build_fn, options,
-                                       accumulator);
+                                       accumulator, sink);
             }
             if (worker.fd >= 0) ::close(worker.fd);
         }
 
         CampaignReport report = accumulator.finish();
         report.base_seed = config.base_seed;
+        report.node_count = config.node_count;
+        report.parallel = config.parallel;
         report.program = config.program;
         report.verify = config.verify;
+        report.id = config.id;
+        report.name = config.name;
+        report.trace = config.verify || config.trace;
+        report.trace_capacity = config.trace_capacity;
         return report;
     }
 };

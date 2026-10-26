@@ -497,6 +497,7 @@ bool same_findings(const cosmos::CampaignReport& first, const cosmos::CampaignRe
         if (a.id != b.id || a.index != b.index || a.seed != b.seed) return false;
         if (a.detail != b.detail || a.rare != b.rare) return false;
         if (a.universes_failed != b.universes_failed || a.ledger != b.ledger) return false;
+        if (a.seeds != b.seeds) return false;
     }
     if (first.never_hit != second.never_hit) return false;
     if (first.eligible_calls != second.eligible_calls) return false;
@@ -542,6 +543,10 @@ void test_crashing_universe_fails_only_itself(unsigned parallel) {
     must(finding != nullptr);
     must(finding->index == 5);
     must(finding->seed == cosmos::universe_seed(kBaseSeed, 5));
+    // A harness id can still belong to one universe; the artifact needs every crashed seed, not
+    // only the first one.
+    must(finding->seeds.size() == 1);
+    must(finding->seeds[0] == cosmos::universe_seed(kBaseSeed, 5));
 
     std::cout << "[PASS] test_crashing_universe_fails_only_itself(parallel=" << parallel << ")"
               << std::endl;
