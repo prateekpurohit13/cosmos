@@ -583,6 +583,53 @@ endif()
 
 add_test(NAME test_trace COMMAND test_trace)
 
+# The event sink records into a preallocated ring; the wrapped allocator channel proves that a
+# record is not an application allocation and that a full ring counts the eviction.
+add_executable(test_event_sink test_event_sink.cpp)
+target_link_libraries(test_event_sink PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_event_sink PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_event_sink PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+
+add_test(NAME test_event_sink COMMAND test_event_sink)
+
+# operator new only reaches the wrappers under a static libstdc++, so the no-allocation claim is
+# only measurable in this second link.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_event_sink_static test_event_sink.cpp)
+    target_link_libraries(test_event_sink_static PRIVATE cosmos)
+    target_compile_options(test_event_sink_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_event_sink_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+    add_test(NAME test_event_sink_static COMMAND test_event_sink_static)
+else()
+    message(STATUS "test_event_sink_static skipped: no static libstdc++ for this toolchain")
+endif()
+
 # The replay engine drives the same wrapped allocator channel the trace does, and needs calloc for
 # the two-site fixture that makes divergence observable.
 add_executable(test_replay test_replay.cpp)
