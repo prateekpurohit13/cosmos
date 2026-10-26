@@ -356,6 +356,30 @@ class ServerCase(unittest.TestCase):
             self.assertEqual(status, 400)
 
 
+    def test_fixture_events_decode(self) -> None:
+        status, _, payload = self.json_request(
+            f"/api/campaigns/demo/universes/{DEMO_SEED}/events"
+        )
+        self.assertEqual(status, 200)
+        events = payload["events"]
+        self.assertTrue(events["present"])
+        self.assertEqual(events["path"], "events/1.bin")
+        self.assertEqual(events["source"], 3)
+        self.assertEqual(events["version"], 1)
+        self.assertGreater(events["count"], 10)
+        self.assertEqual(events["dropped"], 0)
+        self.assertIsNone(events["gap"])
+        kinds = {entry["kind"] for entry in events["entries"]}
+        self.assertIn("scheduler.spawn", kinds)
+        self.assertIn("network.send", kinds)
+        self.assertIn("memory.alloc", kinds)
+        self.assertIn("clock.gettime", kinds)
+        self.assertIn("application.counter", kinds)
+        self.assertEqual(
+            [entry["seq"] for entry in events["entries"]],
+            list(range(events["first_seq"], events["next_seq"])),
+        )
+
 class TraceArtifactCase(unittest.TestCase):
     """A synthetic artifact for trace variants the demo fixture does not exercise."""
 
@@ -1327,6 +1351,237 @@ class MinimizationArtifactCase(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "artifact_minimization_malformed")
 
 
+
+
+EVENT_HEADER = struct.Struct("<BBQQQQ")
+EVENT_ENTRY = struct.Struct("<QqBqHIQQQQQQq")
+
+
+def encode_events(entries, seed=42, dropped=0, rejected=0, source=3, version=1):
+    data = EVENT_HEADER.pack(source, version, seed, dropped, rejected, len(entries))
+    for entry in entries:
+        data += EVENT_ENTRY.pack(*entry)
+    return data
+
+
+def event_entry(seq, at=0, kind=1, node=0xFFFFFFFF, task=0, correlation=0, subject=0,
+                related=0, value=0, extra=0, amount=0, has_wall=0, wall=0):
+    return (seq, at, has_wall, wall, kind, node, task, correlation, subject, related, value,
+            extra, amount)
+
+
+class EventArtifactCase(unittest.TestCase):
+    """Synthetic event streams for the v1 codec's accepted and rejected shapes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        campaign = cls.root / "events"
+        (campaign / "universes").mkdir(parents=True)
+        (campaign / "events").mkdir()
+        (campaign / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "campaign_id": "events",
+                    "name": "Event variants",
+                    "complete": True,
+                    "build": {"id": "event-build", "mode": "SIM"},
+                    "config": {"trials": 12, "events": True, "event_capacity": 4096},
+                    "paths": {"event_dir": "events"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (campaign / "campaign.json").write_text(
+            json.dumps(
+                {"schema_version": 1, "campaign_id": "events", "name": "Event variants",
+                 "runs": 12}
+            ),
+            encoding="utf-8",
+        )
+
+        good = encode_events(
+            [
+                event_entry(0, at=0, kind=1, node=0, task=1, value=4),
+                event_entry(1, at=100, kind=61, node=0, task=1, subject=2, value=1),
+                event_entry(2, at=200, kind=26, node=0, task=1, correlation=7, subject=1000,
+                            value=4, extra=4),
+            ],
+            seed=42,
+        )
+        gap = encode_events(
+            [event_entry(2, at=200, kind=1), event_entry(3, at=300, kind=2)],
+            seed=57,
+            dropped=2,
+            rejected=1,
+        )
+        variants = {
+            0: ("42", True, "events/0.bin", good, None),
+            1: ("43", True, "events/1.bin", None, None),
+            2: ("44", False, "", b"", None),
+            3: ("45", True, "events/3.bin", good, None),
+            4: ("46", True, "events/4.bin",
+                encode_events([event_entry(0, kind=1)], seed=46, source=2), None),
+            5: ("47", True, "events/5.bin",
+                encode_events([event_entry(0, kind=1)], seed=47, version=2), None),
+            6: ("48", True, "events/6.bin", good[:-1], None),
+            7: ("49", True, "events/7.bin", good + b"\x00", None),
+            8: ("50", True, "events/8.bin",
+                encode_events([], seed=50, dropped=1), None),
+            9: ("51", True, "events/9.bin",
+                encode_events([event_entry(1, kind=1), event_entry(3, kind=2)], seed=51), None),
+            10: ("52", True, "events/10.bin",
+                 encode_events([event_entry(0, kind=999)], seed=52), None),
+            11: ("53", True, "events/11.bin",
+                 encode_events([event_entry(0, kind=1, has_wall=2)], seed=53), None),
+            12: ("54", True, "events/12.bin",
+                 encode_events([event_entry(0, kind=1, has_wall=0, wall=5)], seed=54), None),
+            13: ("55", True, "events/13.bin", good, None),
+            14: ("56", True, "events/14.bin",
+                 EVENT_HEADER.pack(3, 1, 56, 0, 0, serve.MAX_EVENT_ENTRIES + 1), None),
+            15: ("57", True, "events/15.bin", gap, None),
+            16: ("58", True, "events/16.bin", good, None),
+        }
+        # Variant 1 declares present but has no file; 3 has a mismatched path; 13/16 have a
+        # mismatched seed in the stream header.
+        path_by_index = {
+            0: "events/0.bin", 1: "events/1.bin", 2: "",
+            3: "events/999.bin", 4: "events/4.bin", 5: "events/5.bin", 6: "events/6.bin",
+            7: "events/7.bin", 8: "events/8.bin", 9: "events/9.bin", 10: "events/10.bin",
+            11: "events/11.bin", 12: "events/12.bin", 13: "events/13.bin",
+            14: "events/14.bin", 15: "events/15.bin", 16: "events/16.bin",
+        }
+        if 3 in variants:
+            variants[3] = ("45", True, "events/999.bin", good, None)
+        if 13 in variants:
+            variants[13] = ("55", True, "events/13.bin",
+                            encode_events([event_entry(0, kind=1)], seed=99), None)
+        if 16 in variants:
+            variants[16] = ("58", True, "events/16.bin",
+                            encode_events([event_entry(0, kind=1, task=2**64 - 1)],
+                                          seed=58), None)
+
+        rows = []
+        for index, (seed, present, _declared, data, _unused) in variants.items():
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "index": index,
+                    "seed": seed,
+                    "status": "passed",
+                    "events": {
+                        "present": present,
+                        "attached": present,
+                        "path": path_by_index[index],
+                        "version": 1,
+                        "capacity": 4096,
+                        "dropped": 2 if index == 15 else 0,
+                        "rejected": 1 if index == 15 else 0,
+                    },
+                }
+            )
+            if data:
+                (campaign / "events" / f"{index}.bin").write_bytes(data)
+            (campaign / "universes" / f"{index}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "index": index,
+                        "seed": seed,
+                        "status": "passed",
+                        "checks": [],
+                        "events": rows[-1]["events"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        (campaign / "universes.ndjson").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+        )
+
+        cls.server = serve.create_server(cls.root, WEB_ROOT, "127.0.0.1", 0, quiet=True)
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+        )
+        cls.thread.start()
+        cls.host, cls.port = cls.server.server_address[:2]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+        cls.temp.cleanup()
+
+    def request(self, path: str):
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    def test_gap_and_rejected_are_explicit(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/57/events")
+        self.assertEqual(status, 200)
+        events = payload["events"]
+        self.assertEqual(events["dropped"], 2)
+        self.assertEqual(events["rejected"], 1)
+        self.assertEqual(events["gap"], {"count": 2, "first_seq": 2, "universe": "57"})
+        self.assertEqual(events["first_seq"], 2)
+
+    def test_missing_file_is_not_an_empty_success(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/43/events")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["events"]["missing"])
+        self.assertEqual(payload["events"]["error"], "events_missing")
+        self.assertEqual(payload["events"]["entries"], [])
+
+    def test_absent_metadata_is_present_false(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/44/events")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["events"]["present"])
+        self.assertEqual(payload["events"]["entries"], [])
+
+    def test_path_mismatch_is_rejected(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/45/events")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_events_path_mismatch")
+
+    def test_seed_mismatch_is_rejected(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/55/events")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_events_seed_mismatch")
+
+    def test_malformed_streams_are_rejected(self) -> None:
+        for seed, code in [
+            ("46", "artifact_events_malformed"),
+            ("47", "artifact_events_malformed"),
+            ("48", "artifact_events_malformed"),
+            ("49", "artifact_events_malformed"),
+            ("50", "artifact_events_malformed"),
+            ("51", "artifact_events_malformed"),
+            ("52", "artifact_events_malformed"),
+            ("53", "artifact_events_malformed"),
+            ("54", "artifact_events_malformed"),
+        ]:
+            with self.subTest(seed=seed):
+                status, payload = self.request(f"/api/campaigns/events/universes/{seed}/events")
+                self.assertEqual(status, 500)
+                self.assertEqual(payload["error"]["code"], code)
+
+    def test_too_large_is_refused(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/56/events")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["code"], "artifact_events_too_large")
+
+    def test_wide_reference_is_a_string(self) -> None:
+        status, payload = self.request("/api/campaigns/events/universes/58/events")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["events"]["entries"][0]["task"], "18446744073709551615")
 
 if __name__ == "__main__":
     unittest.main()

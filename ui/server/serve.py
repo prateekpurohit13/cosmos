@@ -56,6 +56,43 @@ MAX_MINIMIZATION_ENTRIES = 100_000
 assert TRACE_HEADER_BYTES == 17
 assert TRACE_ENTRY_BYTES == 43
 
+# Version-1 inspection stream (include/cosmos/event_sink.hpp, docs/event-stream.md). It is
+# deliberately a different source byte from the canonical trace and is never fed back into replay.
+EVENT_SOURCE = 3
+EVENT_VERSION = 1
+EVENT_HEADER = struct.Struct("<BBQQQQ")
+EVENT_ENTRY = struct.Struct("<QqBqHIQQQQQQq")
+EVENT_HEADER_BYTES = EVENT_HEADER.size
+EVENT_ENTRY_BYTES = EVENT_ENTRY.size
+MAX_EVENT_ENTRIES = 100_000
+MAX_EVENT_BYTES = EVENT_HEADER_BYTES + MAX_EVENT_ENTRIES * EVENT_ENTRY_BYTES
+assert EVENT_HEADER_BYTES == 34
+assert EVENT_ENTRY_BYTES == 87
+# Append-only order, mirroring kEventKinds. A new kind is appended here and in the C++ table in the
+# same change; tests pin the count and the domain prefix.
+EVENT_KIND_NAMES = (
+    "scheduler.spawn", "scheduler.run", "scheduler.block", "scheduler.wake",
+    "scheduler.exit", "scheduler.yield", "scheduler.mutex_lock", "scheduler.mutex_unlock",
+    "scheduler.mutex_contend", "scheduler.cond_wait", "scheduler.cond_signal",
+    "scheduler.cond_broadcast", "scheduler.join", "scheduler.detach", "scheduler.timer_arm",
+    "scheduler.timer_fire", "scheduler.timer_cancel", "scheduler.deadlock", "scheduler.choice",
+    "network.socket", "network.bind", "network.listen", "network.connect", "network.accept",
+    "network.close", "network.send", "network.recv", "network.enqueue", "network.deliver",
+    "network.drop", "network.delay", "network.reorder", "network.corrupt",
+    "network.endpoint_state", "network.partition", "network.heal", "storage.open",
+    "storage.read", "storage.write", "storage.fsync", "storage.fdatasync", "storage.pwrite",
+    "storage.writev", "storage.ftruncate", "storage.dirty", "storage.durable",
+    "storage.torn", "storage.rollback", "storage.degraded", "memory.alloc", "memory.free",
+    "memory.realloc", "memory.canary", "memory.leak", "clock.gettime", "clock.gettimeofday",
+    "clock.sleep", "clock.step", "random.draw", "application.always", "application.sometimes",
+    "application.reachable", "application.request", "application.response",
+    "application.counter", "application.gauge", "application.span", "application.annotation",
+    "operator.command", "operator.breakpoint_hit", "node.crash", "node.reboot",
+    "node.pause", "node.resume",
+)
+EVENT_DOMAIN_NAMES = tuple(sorted({token.split(".", 1)[0] for token in EVENT_KIND_NAMES}))
+assert len(EVENT_KIND_NAMES) == 74
+
 SITE_NAMES = {
     1: "malloc",
     2: "calloc",
@@ -736,6 +773,228 @@ def _universe_summary(detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _event_bad_value(where: str, message: str) -> ArtifactError:
+    return ArtifactError(
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        "artifact_events_malformed",
+        f"{where}: {message}",
+    )
+
+
+def _event_unsigned(value: int, where: str, field: str) -> int:
+    if value < 0 or value > MAX_SAFE_JS_INTEGER:
+        raise _event_bad_value(where, f"{field} is outside JavaScript's safe integer range")
+    return value
+
+
+def _event_signed(value: int, where: str, field: str) -> int:
+    if value < -MAX_SAFE_JS_INTEGER or value > MAX_SAFE_JS_INTEGER:
+        raise _event_bad_value(where, f"{field} is outside JavaScript's safe integer range")
+    return value
+
+
+def _event_reference(value: int) -> str | None:
+    # References and payload slots are opaque 64-bit identities. Decimal strings keep them exact in
+    # JavaScript; zero is the documented "absent" sentinel.
+    return None if value == 0 else str(value)
+
+
+def decode_event_bytes(data: bytes, where: str) -> dict[str, Any]:
+    """Decode version-1 inspection bytes into the frozen envelope and payload fields.
+
+    Validation mirrors decode_events() in include/cosmos/event_sink.hpp: source and version,
+    exact entry count, contiguous sequence, known kind, wall-presence consistency and the explicit
+    drop/reject prefix. The decoder never re-encodes and never feeds the canonical trace.
+    """
+    if len(data) < EVENT_HEADER_BYTES:
+        raise _event_bad_value(where, "header is truncated")
+    source, version, universe, dropped, rejected, count = EVENT_HEADER.unpack_from(data, 0)
+    if source != EVENT_SOURCE:
+        raise _event_bad_value(where, f"unsupported event source {source}")
+    if version != EVENT_VERSION:
+        raise _event_bad_value(where, f"unsupported event version {version}")
+    if count > MAX_EVENT_ENTRIES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_events_too_large",
+            f"{where}: event stream declares {count} entries; this UI supports at most "
+            f"{MAX_EVENT_ENTRIES}",
+        )
+    remaining = len(data) - EVENT_HEADER_BYTES
+    if count > remaining // EVENT_ENTRY_BYTES:
+        raise _event_bad_value(where, "entry table is truncated")
+    if remaining != count * EVENT_ENTRY_BYTES:
+        raise _event_bad_value(where, "trailing bytes after the entry table")
+    if count == 0 and dropped != 0:
+        raise _event_bad_value(where, "zero entries with a non-zero gap cannot be a v1 capture")
+    if dropped > MAX_SEED - count:
+        raise _event_bad_value(where, "dropped + count overflows uint64_t")
+    # The universe is a 64-bit seed and is emitted as a decimal string; dropped/rejected/count
+    # are array or gap sizes and must fit JavaScript's safe integer range.
+    for field, value in (("dropped", dropped), ("rejected", rejected), ("count", count)):
+        _event_unsigned(value, where, field)
+
+    entries: list[dict[str, Any]] = []
+    for index in range(count):
+        offset = EVENT_HEADER_BYTES + index * EVENT_ENTRY_BYTES
+        (seq, at_ns, has_wall, wall_ns, kind_id, node, task, correlation, subject, related,
+         value, extra, amount_ns) = EVENT_ENTRY.unpack_from(data, offset)
+        if seq != dropped + index:
+            raise _event_bad_value(where, f"entry {index} has non-contiguous sequence {seq}")
+        if has_wall not in (0, 1):
+            raise _event_bad_value(where, f"entry {index} has invalid wall flag {has_wall}")
+        if has_wall == 0 and wall_ns != 0:
+            raise _event_bad_value(where, f"entry {index} has a wall time without a wall flag")
+        if kind_id < 1 or kind_id > len(EVENT_KIND_NAMES):
+            raise _event_bad_value(where, f"entry {index} has unknown kind id {kind_id}")
+        _event_unsigned(seq, where, f"entry {index} seq")
+        _event_signed(at_ns, where, f"entry {index} at_ns")
+        if has_wall:
+            _event_signed(wall_ns, where, f"entry {index} wall_ns")
+        token = EVENT_KIND_NAMES[kind_id - 1]
+        entries.append(
+            {
+                "seq": seq,
+                "at_ns": at_ns,
+                "wall_ns": wall_ns if has_wall else None,
+                "kind": token,
+                "domain": token.split(".", 1)[0],
+                "node": None if node == 0xFFFFFFFF else node,
+                "task": _event_reference(task),
+                "correlation_id": _event_reference(correlation),
+                "payload": {
+                    "subject": str(subject),
+                    "related": str(related),
+                    "value": str(value),
+                    "extra": str(extra),
+                    "amount_ns": str(amount_ns),
+                },
+            }
+        )
+    return {
+        "universe": str(universe),
+        "dropped": dropped,
+        "rejected": rejected,
+        "count": count,
+        "first_seq": dropped,
+        "next_seq": dropped + count,
+        "entries": entries,
+    }
+
+
+def _events_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
+    campaign_dir = _campaign_dir(root, campaign_id)
+    manifest = _read_manifest(campaign_dir, campaign_id)
+    row = _find_universe_row(campaign_dir, seed_text)
+    detail = _read_universe_detail(campaign_dir, row)
+    meta = detail.get("events")
+    if not isinstance(meta, dict):
+        meta = {}
+
+    base: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "manifest": manifest,
+        "universe": _universe_summary(detail),
+        "events": {
+            "present": False,
+            "attached": bool(meta.get("attached")),
+            "missing": False,
+            "path": meta.get("path") if isinstance(meta.get("path"), str) else "",
+            "version": meta.get("version"),
+            "capacity": meta.get("capacity"),
+            "dropped": meta.get("dropped"),
+            "rejected": meta.get("rejected"),
+            "error": meta.get("error"),
+            "entries": [],
+        },
+    }
+    if not meta.get("present"):
+        return base
+
+    expected_relative = f"events/{row['index']}.bin"
+    declared_relative = meta.get("path")
+    if declared_relative != expected_relative:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_events_path_mismatch",
+            f"event path {declared_relative!r} does not match {expected_relative!r}",
+        )
+    event_path = _artifact_file(campaign_dir, "events", f"{row['index']}.bin")
+    try:
+        file_size = event_path.stat().st_size
+    except FileNotFoundError:
+        base["events"].update(
+            {
+                "missing": True,
+                "error": "events_missing",
+                "message": "event metadata says the file is present, but it is not on disk",
+            }
+        )
+        return base
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_unreadable",
+            f"event file could not be read: {exc.strerror or exc}",
+        ) from exc
+    if file_size > MAX_EVENT_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_events_too_large",
+            f"{expected_relative}: {file_size} bytes exceeds the {MAX_EVENT_BYTES}-byte limit",
+        )
+    try:
+        data = event_path.read_bytes()
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_unreadable",
+            f"event file could not be read: {exc.strerror or exc}",
+        ) from exc
+    if len(data) > MAX_EVENT_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_events_too_large",
+            f"{expected_relative}: {len(data)} bytes exceeds the {MAX_EVENT_BYTES}-byte limit",
+        )
+
+    decoded = decode_event_bytes(data, expected_relative)
+    if int(decoded["universe"]) != int(row["seed"]):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_events_seed_mismatch",
+            f"{expected_relative}: stream universe {decoded['universe']} does not match "
+            f"universe seed {row['seed']}",
+        )
+    gap = None
+    if decoded["dropped"] > 0:
+        gap = {
+            "count": decoded["dropped"],
+            "first_seq": decoded["first_seq"],
+            "universe": decoded["universe"],
+        }
+    base["events"].update(
+        {
+            "present": True,
+            "missing": False,
+            "path": expected_relative,
+            "source": EVENT_SOURCE,
+            "version": EVENT_VERSION,
+            "universe": decoded["universe"],
+            "count": decoded["count"],
+            "size_bytes": len(data),
+            "first_seq": decoded["first_seq"],
+            "next_seq": decoded["next_seq"],
+            "dropped": decoded["dropped"],
+            "rejected": decoded["rejected"],
+            "gap": gap,
+            "entries": decoded["entries"],
+        }
+    )
+    return base
+
+
 def _trace_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
     campaign_dir = _campaign_dir(root, campaign_id)
     manifest = _read_manifest(campaign_dir, campaign_id)
@@ -1305,6 +1564,14 @@ class UIRequestHandler(SimpleHTTPRequestHandler):
                     and segments[5] == "minimization"
                 ):
                     payload = _minimization_payload(
+                        self.server.artifact_root, campaign_id, segments[4]
+                    )
+                elif (
+                    len(segments) == 6
+                    and segments[3] == "universes"
+                    and segments[5] == "events"
+                ):
+                    payload = _events_payload(
                         self.server.artifact_root, campaign_id, segments[4]
                     )
                 else:
