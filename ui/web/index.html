@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta
+      name="description"
+      content="Read-only Cosmos campaign cockpit for deterministic simulation artifacts."
+    />
+    <title>Cosmos · Campaigns</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Cosmos campaigns">
+        <span class="brand__mark" aria-hidden="true"></span>
+        <span class="brand__text">
+          <span class="brand__name">COSMOS</span>
+          <span class="brand__sub">simulation console</span>
+        </span>
+      </a>
+      <nav class="topnav" aria-label="Primary">
+        <a href="/" aria-current="page">Campaigns</a>
+      </nav>
+      <div id="build-context" class="build-context"></div>
+      <button id="theme-toggle" class="btn btn--ghost btn--sm" type="button">
+        Light
+      </button>
+    </header>
+    <main id="main" tabindex="-1"></main>
+    <footer class="footer">
+      <span>Read-only v1 artifact UI</span>
+      <span class="footer__sep" aria-hidden="true">·</span>
+      <span>schema 1</span>
+      <span class="footer__sep" aria-hidden="true">·</span>
+      <span>no simulation changes</span>
+    </footer>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <noscript>
+      <p class="noscript">
+        The Cosmos UI needs JavaScript. This is a local, read-only artifact viewer.
+      </p>
+    </noscript>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
