@@ -73,6 +73,20 @@ export function entryClass(entry) {
   return String(entry?.fault_class ?? "Unknown");
 }
 
+// Artifact times are numbers, but a hostile or malformed document can carry null, "" or a
+// boolean. Number(null) is 0, so a plain Number() coercion would invent a virtual time at t=0.
+// Only a finite number or a non-empty numeric string is a usable time.
+export function finiteTimeNs(value) {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!/^[+-]?\d+$/.test(trimmed)) return null;
+    const number = Number(trimmed);
+    return Number.isSafeInteger(number) ? number : null;
+  }
+  return null;
+}
+
 export function traceStatusTone(status) {
   switch (String(status ?? "").toUpperCase()) {
     case "FIRED":
@@ -124,8 +138,8 @@ export function traceCounts(entries) {
     counts.classes.set(faultClass, (counts.classes.get(faultClass) ?? 0) + 1);
     counts.outcomes.set(outcome, (counts.outcomes.get(outcome) ?? 0) + 1);
 
-    const at = Number(entry?.at_ns);
-    if (Number.isFinite(at)) {
+    const at = finiteTimeNs(entry?.at_ns);
+    if (at !== null) {
       counts.minAt = counts.minAt === null ? at : Math.min(counts.minAt, at);
       counts.maxAt = counts.maxAt === null ? at : Math.max(counts.maxAt, at);
     }
