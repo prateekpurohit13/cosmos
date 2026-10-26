@@ -1,7 +1,8 @@
 # Cosmos Event Stream (contract v1)
 
-Status: **U3.1 implemented; engine instrumentation is U3.2.** The header is
-`include/cosmos/event_sink.hpp`; the contract tests are `tests/test_event_sink.cpp`.
+Status: **U3.1 contract and U3.2–U3.5 producers implemented.** The header is
+`include/cosmos/event_sink.hpp`; the contract tests are `tests/test_event_sink.cpp` and the
+producer/state/telemetry tests are `tests/test_inspection.cpp`.
 
 This document is the contract for the inspection event stream described in
 [`ui-design.md`](ui-design.md) §3.4, §10.2 and §10.3. The stream is deliberately **not** the
@@ -10,8 +11,11 @@ only (D5). The event stream exists to explain what a universe did across the sch
 storage, memory, clock, randomness, application and operator domains. Recording an event never
 changes simulation semantics.
 
-Nothing in the engine produces these events yet. U3.1 freezes the envelope, sequence, gap and
-wire format so U3.2 can add producers without redesigning the contract.
+U3.1 froze the envelope, sequence, gap and wire format. U3.2 attached scheduler, network, storage,
+memory, clock and randomness producers; U3.3 reads the final state from the artifact; U3.4 adds a
+breakpoint observer and a recorded operator command log; U3.5 adds application counters, gauges,
+spans and annotations. Fault decisions remain in the canonical `FaultTrace` and are joined through
+`correlation_id`.
 
 ## 1. Boundaries
 
@@ -38,7 +42,7 @@ Every event carries:
 | `has_wall` | `bool` | Whether `wall_ns` was captured. Encoded as one byte. |
 | `kind` | `EventKind` (`uint16_t`) | One of the append-only kinds in §5. `none` is not recordable. |
 | `node` | `NodeId` (`uint32_t`) | Node the event belongs to, or `kNoNode` (`0xFFFFFFFF`). Node `0` is valid. |
-| `task` | `uint64_t` | Scheduler task, or `kNoTask` (`0`). |
+| `task` | `uint64_t` | Scheduler task. `kNoTask` (`0`) means absent, `kMainTask` (`1`) is the main fiber (whose `pthread_self()` is 0), and spawned fibers are numbered from 2. |
 | `correlation_id` | `uint64_t` | Opaque correlation identity, or `kNoCorrelation` (`0`). A fault-related event may carry the canonical trace decision `seq` here, but the two sequence namespaces are distinct. |
 | `payload` | `EventPayload` | Five fixed-width slots; meaning is fixed by `kind` (§6). |
 
@@ -182,8 +186,9 @@ returns the token; `domain_of()` returns the lane.
 
 Fault decisions are deliberately not mirrored here. They remain in the canonical `FaultTrace` and
 are joined to this stream by the UI through the `correlation_id` convention in §6. Node lifecycle
-(crash/reboot/pause/resume) is also not in v1; U3.2 appends those kinds before recording node
-state, following the same append-only rule.
+is the appended `node` domain: `node.crash`, `node.reboot`, `node.pause`, `node.resume`.
+`operator.command` records a scheduled intervention, and `operator.breakpoint_hit` is reserved for
+a future live channel; the current inspector pauses through the sink observer instead.
 
 `name_of(EventKind)` returns `"?"` and `domain_of()` returns `EventDomain::_Count` for a value that
 is not a declared kind (`none`, `_Count` or an out-of-range cast). A UI must treat both as unknown
@@ -201,40 +206,127 @@ rather than as a lane.
 | `extra` | `uint64_t` | Kind-specific second scalar: a length when `value` is an offset, a transferred count when `value` is requested, and so on. |
 | `amount_ns` | `int64_t` | Duration, deadline or offset. |
 
-The exact slot meaning is fixed by `kind`. U3.1 fixes the slots and the envelope; U3.2 records the
-per-kind meaning alongside each producer and extends this section with the concrete producer
-table. Producers must not overload a slot with a different meaning for the same kind. A kind that
-carries a state, errno or outcome in `value` must publish an append-only code enum with the kind;
-the UI maps an unknown code to a visible "unknown code" label rather than guessing. The fifth slot
-exists so a kind needing two scalars (offset+length, requested+transferred, old+new position) does
-not have to overload one.
+The exact slot meaning is fixed by `kind`. Producers must not overload a slot with a different
+meaning for the same kind. A kind that carries a state, errno or outcome in `value` must publish an
+append-only code enum with the kind; the UI maps an unknown code to a visible "unknown code" label
+rather than guessing. The fifth slot exists so a kind needing two scalars (offset+length,
+requested+transferred, old+new position) does not have to overload one.
+
+### 6.1 Producer table (v1)
+
+`subject`/`related` are opaque numeric identities. `0` means absent unless the row says otherwise;
+`node` and `task` come from the envelope. `amount_ns` is a duration or a virtual offset, never wall
+time. A row with `correlation` shares one id across the causal chain.
+
+| Kind | subject | related | value | extra | amount_ns | correlation |
+|---|---|---|---|---|---|---|
+| `scheduler.spawn` | — (task is in the envelope) | — | task count before spawn | stack bytes | — | — |
+| `scheduler.run` | — (task is in the envelope) | — | ready count after selection | — | — | — |
+| `scheduler.block` | mutex/cond id, or — for join | target task for join, otherwise — | `Task::State` code | — | — | — |
+| `scheduler.wake` | — (task is in the envelope) | — | parked flag | — | — | — |
+| `scheduler.exit` | — (task is in the envelope) | — | joiner count | — | — | — |
+| `scheduler.yield` | — (task is in the envelope) | — | — | — | — | — |
+| `scheduler.mutex_lock` | mutex id | owner task | — | — | — | — |
+| `scheduler.mutex_unlock` | mutex id | next owner | — | — | — | — |
+| `scheduler.mutex_contend` | mutex id | owner task | waiter count | — | — | — |
+| `scheduler.cond_wait` | cond id | mutex id | — | — | — | — |
+| `scheduler.cond_signal` | cond id | woken task | 1, or 0 when none | — | — | — |
+| `scheduler.cond_broadcast` | cond id | — | woken count | — | — | — |
+| `scheduler.join` | — (joining task is in the envelope) | target task | — | — | — | — |
+| `scheduler.detach` | — (calling task is in the envelope) | target task | — | — | — | — |
+| `scheduler.timer_arm` | — (task is in the envelope) | — | timer seq | — | deadline | — |
+| `scheduler.timer_fire` | timer seq/deadline id | — | — | — | deadline | — |
+| `scheduler.timer_cancel` | deadline id | — | — | — | — | — |
+| `scheduler.deadlock` | — | — | task count | — | — | — |
+| `scheduler.choice` | ready-queue index | — | ready count after pop | — | — | — |
+| `network.socket` | fd | peer fd (pair) | socket type | protocol | — | — |
+| `network.bind` | fd | — | port | — | — | — |
+| `network.listen` | fd | — | backlog | — | — | — |
+| `network.connect` | client fd | server fd | port | — | — | — |
+| `network.accept` | listener fd | accepted fd | peer port | — | — | — |
+| `network.close` | fd | — | reason (`NetworkDropReason`), 0 for close | — | — | — |
+| `network.send` | fd | peer fd | requested bytes | transferred bytes | — | send id |
+| `network.recv` | fd | — | requested bytes | transferred bytes | — | packet id |
+| `network.enqueue` | peer fd | — | bytes | queue depth | — | packet id |
+| `network.drop` | fd | peer fd | bytes | `NetworkDropReason` | — | send id |
+| `network.delay` | peer fd | — | bytes | — | delay | packet id |
+| `network.reorder` | peer fd | — | bytes | — | — | packet id |
+| `network.corrupt` | peer fd | — | bytes | — | — | packet id |
+| `network.endpoint_state` | fd | — | shutdown `how` | peer-closed flag | — | — |
+| `network.partition`/`heal` | — | — | group 0/1 | — | — | partition id |
+| `storage.open` | fd | — | open flags | — | — | — |
+| `storage.read` | fd | — | requested bytes | transferred bytes, or errno on an injected failure | — | — |
+| `storage.write`/`pwrite`/`writev` | fd | — | requested bytes | transferred bytes, or errno on an injected failure | offset for positional forms | — |
+| `storage.fsync`/`fdatasync` | fd | — | — | result, or errno on an injected failure | — | — |
+| `storage.ftruncate` | fd | — | requested size | result | — | — |
+| `storage.dirty` | file id | fd | written bytes | tracked bytes | offset | — |
+| `storage.durable` | file id | fd | durable size | committed records | — | — |
+| `storage.torn` | file id | — | torn bytes | — | tear offset | — |
+| `storage.rollback` | file id | — | unsynced records | durable size | — | — |
+| `storage.degraded` | file id | — | tracked bytes, or 0 | — | — | — |
+| `memory.alloc` | allocation id | — | requested bytes | active allocations | — | — |
+| `memory.free` | allocation id | — | requested bytes | active allocations | — | — |
+| `memory.realloc` | new allocation id | old allocation id | new size | old size | — | — |
+| `memory.canary` | allocation id | — | observed magic | expected magic | — | — |
+| `memory.leak` | — | — | active allocations | active bytes | — | — |
+| `clock.gettime` | clock id | — | virtual now | realtime now | — | — |
+| `clock.gettimeofday` | — | — | virtual now | realtime now | — | — |
+| `clock.sleep` | — | — | requested/remaining ns | flags | requested ns | — |
+| `clock.step` | clock id | — | virtual now | — | step amount | — |
+| `random.draw` | — | — | requested bytes/value | stream domain | — | — |
+| `application.always` | label id | — | 0 | — | — | — |
+| `application.sometimes` | label id | — | 1 (only hits are recorded) | — | — | — |
+| `application.reachable` | label id | — | hit flag | — | — | — |
+| `application.counter` | series id | — | delta | — | — | — |
+| `application.gauge` | series id | — | — | — | value | — |
+| `application.span` | span id | series id | 1 on end | — | duration on end | `kApplicationCorrelationBase + span id` |
+| `application.annotation` | series id | — | — | — | value | — |
+| `operator.command` | `OperatorCommandKind` | node or side-A size | command virtual time | — | — | `kOperatorCorrelationBase + command id` |
+| `node.crash`/`reboot`/`pause`/`resume` | — | — | — | — | — | — |
+
+Application names never enter an event. `application_labels` and the typed telemetry series are
+declared in the universe state document and referenced by id; the API accepts no payload bytes, so
+network and storage bodies are redacted by construction.
 
 Correlation is what makes a causal story visible. A `network.send` with `correlation_id = C`
-should be followed by the `network.drop`, `network.deliver` or receiving task event with the same
-`C`. The stream does not claim causality the producer did not record.
+should be followed by the `network.drop` or receiving `network.recv` event with the same `C`. The
+stream does not claim causality the producer did not record.
 
-## 7. Artifact placement (planned for U3.2)
+Correlation ids are **namespaced by producer**: network send/partition chains use
+`kNetworkCorrelationBase + n`, operator commands use `kOperatorCorrelationBase + command_id`, and
+application spans use `kApplicationCorrelationBase + span_id`. A consumer groups by
+`(domain, correlation_id)` rather than the numeric id alone, so an unrelated network chain,
+operator command and span cannot collide.
 
-U3.1 does not write an artifact; it freezes the shape U3.2 will use:
+## 7. Artifact placement
 
 - `events/<index>.bin` holds the version-1 bytes for one universe, alongside `traces/<index>.bin`.
-- `universes/<index>.json` and the `universes.ndjson` row gain an additive `events` object:
-  `present` (bool), `path` (relative path or empty), `version`, `dropped`, `rejected`, `seeded`.
+- `universes/<index>.json` and the `universes.ndjson` row carry an additive `events` object:
+  `present`, `attached`, `path`, `version`, `capacity`, `dropped`, `rejected`, `error`. A non-empty
+  `error` is a writer failure: the artifact is marked incomplete rather than silently dropping the
+  capture.
+- `universes/<index>.json` also carries `state` (the final state document, or `null`); the compact
+  row carries `state_present`.
 - Absence is `present: false`, never an empty success. A present file with a gap or rejected calls
   carries those counts in the metadata so a view can label it without decoding first.
-- The artifact writer must not write an empty header for a sink that was never attached. An
-  attached, seeded sink with zero accepted events may write an empty stream; `present` still
-  distinguishes it from no instrumentation.
+- The writer does not write an empty header for a sink that was never attached. An attached,
+  seeded sink with zero accepted events may write an empty stream; `present` still distinguishes it
+  from no instrumentation.
+- The read-only server endpoint is
+  `GET /api/campaigns/<id>/universes/<seed>/events`. It validates the source/version, contiguous
+  sequence, kind ids, wall flag, path and universe seed, and returns `gap`/`rejected` explicitly.
 
-This is a planned additive extension to schema v1 (D11); no reader may infer presence from a
-missing file alone.
+This is an additive extension to schema v1 (D11); no reader may infer presence from a missing file
+alone.
 
 ## 8. Non-goals for v1
 
-- No live event streaming from a running universe.
-- No scheduler/network/storage/memory instrumentation until U3.2.
-- No state snapshots, breakpoints or interactive control.
-- No application strings, names or payload hexdumps until U3.5; redaction is part of that API.
+- No live event streaming from a running universe to the UI.
+- No state snapshots or arbitrary memory/state mutation. Breakpoint inspection is a separate
+  single-universe process; pause/resume is observation, while a crash/partition command is
+  recorded.
+- No application payload bytes, hexdumps or arbitrary strings; U3.5 accepts declared names and
+  numeric values only.
 - No change to the canonical trace, `trace_hash`, replay or minimization.
 - No wall-clock ordering and no synthetic events to hide a gap.
 
@@ -251,3 +343,6 @@ missing file alone.
 | Wall time leaks onto the simulation axis | `wall_ns` is optional metadata and is documented as never an ordering key. |
 | Version drift | One source byte and one version byte; unknown versions are rejected rather than guessed. |
 | Recording blocks a universe | No I/O, no locks and no UI call from `record()`; instrumentation must preserve that property in U3.2. |
+| A breakpoint allocates or mutates on the record path | The observer is a numeric predicate; it returns a boolean and only asks the scheduler to pause at the next boundary. It never edits an event or calls the UI. |
+| A paused universe changes its schedule on resume | Pausing does not pop a ready task; the drain owner loops without touching the ready queue, so resuming observes the same order. |
+| A command is mistaken for observation | Commands are scheduled at virtual time and recorded as `operator.command`; an unapplied command is reported, not silently dropped. |

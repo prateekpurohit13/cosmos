@@ -4,10 +4,12 @@ A local, read-only campaign cockpit for the schema-v1 artifacts written by
 `include/cosmos/export.hpp`. It is a separate process from the simulation binary (D4): no
 simulation semantics, canonical trace encoding, or `trace_hash` are touched.
 
-The v2 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
+The v3 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
 fault timeline, deterministic replay controls, the finding → failed-check jump, two-universe
-compare, and the exported minimization report. It does not include a live event stream,
-minimization execution, breakpoints, or snapshots; those are later tasks in `docs/ui-design.md`.
+compare, the exported minimization report, and the read-only state inspector over the versioned
+inspection stream. It does not include live streaming from a running campaign, minimization
+execution, snapshots or arbitrary state mutation. Breakpoint inspection runs in the separate
+single-universe `cosmos_inspect` process, not in the browser.
 
 ## Run it
 
@@ -49,6 +51,7 @@ Two regenerations are byte-identical.
 | `/campaigns/<campaign-id>/universes/<seed>` | Universe detail |
 | `/campaigns/<campaign-id>/universes/<seed>/timeline` | Fault timeline |
 | `/campaigns/<campaign-id>/universes/<seed>/minimization` | Exported minimization report |
+| `/campaigns/<campaign-id>/universes/<seed>/state` | State inspector and inspection event stream |
 | `/campaigns/<campaign-id>/compare?left=<seed>&right=<seed>` | Two-universe compare |
 | `/campaigns/<campaign-id>/findings/<assertion-id>` | Finding triage |
 
@@ -81,6 +84,7 @@ The server exposes a small read-only JSON API over one artifact root:
 | `GET /api/campaigns/<id>/universes/<seed>` | `{schema_version, campaign_id, manifest, campaign (summary), universe}` |
 | `GET /api/campaigns/<id>/universes/<seed>/trace` | `{schema_version, campaign_id, manifest, universe (summary), trace}` |
 | `GET /api/campaigns/<id>/universes/<seed>/minimization` | `{schema_version, campaign_id, manifest, universe (summary), minimization}` |
+| `GET /api/campaigns/<id>/universes/<seed>/events` | `{schema_version, campaign_id, manifest, universe (summary), events}` |
 
 The trace response decodes `traces/<index>.bin` into the frozen `TraceEntry` fields and adds
 `count`, `size_bytes`, `computed_hash`, `declared_hash`, `hash_matches`, `seed_matches` and the
@@ -98,6 +102,18 @@ strictly increasing because `(universe, seq)` is the event identity.
 invalid seeds, non-loopback `Host` headers, and paths that resolve outside the artifact root.
 Artifacts are validated as `schema_version: 1`; an unsupported or malformed artifact returns a
 structured JSON error rather than guessing or dropping the connection.
+
+The events endpoint decodes `events/<index>.bin` (source 3, version 1). It validates the source
+and version, the declared/actual entry count, contiguous `seq` values, known kind ids, the wall
+presence flag, the path and the stream universe. `entries[]` carries the decoded envelope plus
+`kind`/`domain` tokens and string-valued payload fields so 64-bit identities survive JSON. The
+response reports `present`, `attached`, `missing`, `capacity`, `dropped`, `rejected`, `gap`,
+`first_seq` and `next_seq`. A malformed stream is `artifact_events_malformed`; a stream that
+declares more than 100,000 entries is `artifact_events_too_large`; a path that disagrees with the
+universe index is `artifact_events_path_mismatch`; a header universe that disagrees with the row is
+`artifact_events_seed_mismatch`. A missing file is `present: false, missing: true` with an
+`events_missing` code, so the view can distinguish lost evidence from an absent capture. A mutant
+event stream never feeds replay.
 
 The minimization endpoint reads the optional `minimizations/<seed>.json` document after resolving
 the universe row. Absence is `present: false` with empty arrays and a null `repro`, never an error
@@ -121,10 +137,11 @@ ui/
   web/                   vanilla ES modules, HTML and CSS; no build step
     app.js               shell, theme, router dispatch, view teardown
     lib/                 DOM, API, formatting, fault metadata, components, trace, timeline, playback, compare
-    views/               campaign list, cockpit, universes, universe, timeline, finding, minimization, compare, errors
-  server/serve.py        Python 3 stdlib static + artifact API + canonical trace decoder
-  server/test_serve.py   server contract tests, including trace and minimization variants
-  fixtures/demo/         checked-in deterministic artifact with 24-entry traces and minimization reports
+    views/               campaign list, cockpit, universes, universe, timeline, finding, minimization, state, compare, errors
+  server/serve.py        Python 3 stdlib static + artifact API + canonical trace and event decoders
+  server/test_serve.py   server contract tests, including trace, event and minimization variants
+  fixtures/demo/         checked-in deterministic artifact with 24-entry traces, events and state
+  ../tools/cosmos_inspect.cpp  interactive single-universe breakpoint inspector
 ```
 
 The server serves `ui/web` and falls back to `index.html` for `/campaigns/...` client routes. It
@@ -142,7 +159,8 @@ The suite covers the catalog, campaign/universe payloads, decimal and hex seed l
 rejection, Host validation, NUL paths, non-finite/surrogate artifact values, SPA fallback
 (including the compare route), static content types, HEAD behavior, security headers, broken
 artifacts, canonical trace decoding, multi-entry ordering, hash/seed mismatch reporting, missing
-trace files, malformed source/truncated/trailing trace bytes, and minimization
+trace files, malformed source/truncated/trailing trace bytes, event source/version/count/
+sequence/kind/wall/gap/seed/path/oversize variants, and minimization
 present/refused/empty/missing/seed-mismatch/only-faults/entry-schema/oversize variants. `just test`
 runs it after the C++ suite.
 
@@ -207,20 +225,30 @@ runs it after the C++ suite.
   the nearest recorded event at or before `checks[].at_ns`, groups multiple checks that resolve
   to the same event, and labels `before first recorded event` / `after last recorded event` when
   the failure falls outside the trace span. It never invents a check event or claims causality.
+- Inspection events are a separate versioned stream. The UI renders the explicit `dropped` gap
+  and `rejected` count before the retained window; it never presents a truncated capture as the
+  whole universe. Payloads are numeric and by-reference only; application names come from the
+  state document. The stream is never used for replay, minimization or `trace_hash`.
+- Breakpoints and commands belong to the single-universe inspector. A pause does not pop a ready
+  task, so resuming observes the same scheduler order. A crash/reboot/pause/resume or partition
+  command is applied at its recorded virtual time and emitted as `operator.command`; the command
+  log is the reproducible record, and an unapplied command is reported rather than hidden.
 - Search dims non-matching events instead of hiding them, so causal context stays visible.
   Supported fields are `site`, `class`, `outcome`, `status`, `seq` (or `#5`), `eligible`,
   `t`/`at`, `drew`/`drew:yes`/`drew:no`, `amount`, free text and a leading `-` for negation.
   Numeric field matches are exact (`t:0` is exactly zero virtual time), while free text is a
   case-insensitive substring.
 
-## v2 limits
+## v3 limits
 
 - No live campaign ingestion; the server reads completed artifacts.
-- No minimization execution, snapshots, breakpoints, or interactive control yet. The minimization
-  view renders exported reports only. The artifact layout holds one report per seed: if a seed
-  fails several assertions, the first finding in report order is minimized and the writer rejects
-  a second report for that seed. The finding view labels a report whose `finding_id` differs
-  instead of showing it as that finding.
+- No minimization execution, snapshots, branching or arbitrary state mutation. Browser playback
+  and the state inspector are read-only. The separate `cosmos_inspect` tool can pause at a
+  scheduler boundary and records operator commands; it is not a browser control channel.
+- The artifact layout holds one minimization report per seed: if a seed fails several assertions,
+  the first finding in report order is minimized and the writer rejects a second report for that
+  seed. The finding view labels a report whose `finding_id` differs instead of showing it as that
+  finding.
 - The universe, trace, candidate and kept tables are paginated at 100 rows; the universe and
   trace filters are client-side. The compare view
   compares the two selected universes only; it does not align more than two traces or build a

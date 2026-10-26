@@ -1,13 +1,13 @@
 # Cosmos: UI/UX Design for Simulation Control and Inspection
 
-Status: **Phases 1–2 implemented (v2 fault timeline, replay, compare and minimization); Phase 3
-started with the U3.1 event-stream contract.** The v1 artifact contract, exporter, checked-in
-fixture and read-only dashboard exist (`include/cosmos/export.hpp`,
-`include/cosmos/minimize_json.hpp`, `tools/ui_export.cpp`, `ui/fixtures/demo/`, `ui/web/`,
-`ui/server/serve.py`). The v3 inspection stream is frozen in `docs/event-stream.md` and
-`include/cosmos/event_sink.hpp`; engine producers are still U3.2. This document describes the data
-a Cosmos UI can expose, the screens worth building, and the constraints determinism places on
-control.
+Status: **Phases 1–3 implemented.** The v1 artifact contract, exporter, checked-in fixture and
+read-only dashboard exist (`include/cosmos/export.hpp`, `include/cosmos/minimize_json.hpp`,
+`tools/ui_export.cpp`, `ui/fixtures/demo/`, `ui/web/`, `ui/server/serve.py`). The v3 inspection
+stream is frozen in `docs/event-stream.md` and `include/cosmos/event_sink.hpp`, with scheduler,
+network, storage, memory, clock, random, application and node producers attached (U3.2), a
+read-only state inspector (U3.3), a single-universe breakpoint inspector with a recorded command
+log (U3.4), and an application telemetry API (U3.5). This document describes the data a Cosmos UI
+can expose, the screens worth building, and the constraints determinism places on control.
 
 > **Resuming this work?** Read [Appendix A](#appendix-a-multi-session-implementation-context)
 > before writing code. It records the current state, frozen decisions, data-contract gaps,
@@ -1172,8 +1172,7 @@ state and must be updated at the end of every implementation session.
 
 ### A.1 Current implementation snapshot
 
-As of **2026-10-26**, baseline `b7ac2669` (`main`) plus the Phase 3 `U3.1` event-stream contract
-from session 8:
+As of **2026-10-26**, baseline `b7ac2669` (`main`) plus the Phase 3 work from session 9:
 
 | Area | State | Notes |
 |---|---|---|
@@ -1182,17 +1181,17 @@ from session 8:
 | Campaign JSON | **Available, v1** | `print_campaign_json()` and `universes.ndjson` carry `schema_version`, `Finding::at`, all seeds, trace metadata and realized config identity. |
 | Fault trace/ledger | **Exported and decodable** | Canonical trace bytes and structured ledger rows are captured per universe when a sink is attached. The UI trace endpoint decodes `traces/<index>.bin` without re-encoding it. |
 | Minimization | **Exported and rendered** | `minimize()` and `MinimizeReport` exist; `print_minimize_json()` writes `minimizations/<seed>.json`, and the read-only minimization view renders candidates, kept fires, passes/replays/crashed trials and the exact `--only-faults` repro with the 1-minimal label. |
-| Event stream | **Contract implemented, no producers** | `include/cosmos/event_sink.hpp` freezes the envelope, append-only kind taxonomy, bounded drop-oldest ring, explicit gap/reject counts and version-1 codec; `docs/event-stream.md` documents the contract. `test_event_sink` and its static-libstdc++ twin prove sequence, eviction, malformed-input and no-allocation behaviour (cumulative heap counters). U3.2 attaches the first producers. |
+| Event stream | **Producers attached** | `include/cosmos/event_sink.hpp` freezes the envelope, append-only kind taxonomy, bounded drop-oldest ring, explicit gap/reject counts and version-1 codec; `docs/event-stream.md` documents the contract and producer table. Scheduler, network, storage, memory, clock, random, application and node producers are attached. `test_event_sink` proves the codec; `test_inspection` proves producer coverage, state, breakpoint pause/resume, command log and telemetry. |
 | UI stack | **Implemented** | Vanilla ES modules + Python stdlib server; see `O1`/`O2`/`O3`, `O11` and `O13` in A.11. |
 | v1 | **Phase 1 complete** | Campaign cockpit, universe explorer/detail and finding triage render from `ui/fixtures/demo/`. |
 | v2 | **`U2.1`–`U2.4` complete** | The fault timeline renders canonical entries, lanes, virtual-time ticks, search, minimap, inspector, hash/seed/drop warnings and a paginated entry table. Replay controls play/pause/step, jump to injected/suppressed/failure decisions and virtual time, mark failed checks at the nearest recorded event, and open findings/checks at the failure evidence. The compare view diffs config, report and canonical entries for two seeds in one campaign, labels the first event, virtual-time and report divergences, and keeps missing traces explicit. The minimization view renders the exported `MinimizeReport`, kept/candidate tables, the exact `--only-faults` repro, refused and missing reports, and the **1-minimal, not globally minimal** label. |
-| Engine tests | **Existing** | Run the baseline before changing engine/export code. The new event-stream suite is `test_event_sink` (regular and static-libstdc++ links). |
-| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (85 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, compare selection, same-seed/invalid-seed/empty-seed fallbacks, config diff, missing/seed-mismatched/truncated/drop-count-undeclared trace disable states, minimization present/absent/refused/empty/error states, deep-link restoration, theme redraw and hash mismatch were checked in a browser. |
+| v3 | **`U3.1`–`U3.5` complete** | The inspection stream writes `events/<index>.bin` and an additive `events` metadata object; the universe detail carries a final `state` document. The read-only server decodes the stream and the `/state` view renders scheduler, network, storage, memory, nodes, RNG, telemetry and event tabs with explicit gap/rejected warnings. `cosmos_inspect` runs one universe in a separate process, pauses at a numeric breakpoint, resumes without rewriting ready order, and records scheduled operator commands. The telemetry API declares typed series and records numeric values; names live in the state document, so payload bytes are redacted by construction. |
+| Engine tests | **Existing** | Run the baseline before changing engine/export code. The event-stream suites are `test_event_sink` (regular and static-libstdc++ links) and `test_inspection` (producers, state, breakpoint, command log, telemetry). |
+| UI tests | **Server contract + browser smoke** | `ui/server/test_serve.py` (94 tests) runs in `just test`; the timeline, search, match navigation, keyboard selection, table pagination, playback boundaries, check/failure jump, compare selection, same-seed/invalid-seed/empty-seed fallbacks, config diff, missing/seed-mismatched/truncated/drop-count-undeclared trace disable states, event gap/rejected/seed/path/oversize states, minimization present/absent/refused/empty/error states, deep-link restoration, theme redraw and hash mismatch were checked in a browser. |
 
-**Current phase:** Phase 3 (v3 event instrumentation and state inspection) has started. Phase 0,
-Phase 1, Phase 2 and `U2.1`–`U2.4` are complete; `U3.1` (event-stream contract) is done.
-**Next task:** `U3.2` — attach the first scheduler, network, storage and memory producers and add
-state enumerators.
+**Current phase:** Phase 3 is complete: `U3.1`–`U3.5` are implemented and the G3 gate passes.
+**Next task:** Phase 4 requires an explicit scope change; start with `U4.1` (snapshots and
+reconstructed-state cache) only after recording that change.
 
 The v1 cockpit answers what failed, in which seed, with what ledger, whether the campaign was
 vacuous, and a build-scoped repro identity (or a command when the manifest declares one). The v2
@@ -1226,8 +1225,8 @@ nix develop .#clang -c just test
 
 ### A.3 Scope fence for the current phase
 
-**Target:** Phase 3 (v3 event instrumentation and state inspection). Phase 0, Phase 1, Phase 2 and
-`U2.1`–`U2.4` are complete; `U3.1` is done and `U3.2` is next.
+**Target:** Phase 3 is complete. Phase 0, Phase 1, Phase 2 and `U2.1`–`U2.4` are complete, and
+`U3.1`–`U3.5` are implemented. The next phase (`U4.x`) needs a recorded scope change.
 
 The v1/v2 UI remains a local, artifact-driven, read-only dashboard. Phase 3 adds a separate,
 versioned inspection event stream and the state views built on it. It does not change replay
@@ -1235,7 +1234,7 @@ identity or simulation semantics. We are not implementing snapshots, multiverse 
 coverage-guided exploration, a real-time “watch every universe” renderer, arbitrary memory or
 state editing, or a UI server inside the wrapped simulation binary.
 
-In scope now:
+Phase 3 delivered:
 
 - The U3.1 event-stream contract: envelope, append-only taxonomy, sequence, explicit gaps,
   bounded ring and versioned wire format (`docs/event-stream.md`).
@@ -1246,7 +1245,7 @@ In scope now:
 - Fixture-driven tests for event capture, decoding, gaps, deterministic ordering and no hot-path
   allocation.
 
-Out of scope for this phase (do not start without a recorded scope change):
+Out of scope until a recorded scope change:
 
 - Snapshot/restore, multiverse branching, coverage-guided exploration (v4).
 - Any change to the canonical trace format or `trace_hash` (D5).
@@ -1296,15 +1295,15 @@ table current; a gap is closed only when a test proves the output.
 | G6 | Ledger is text inside a finding. | **Closed for v1 and v2.** `UniverseOutcome` copies structured `LedgerEntry` rows; the universe JSON carries both `ledger` and `ledger_text`. The timeline correlates an exact ledger row when site, eligible call and virtual time match, and labels reason/correlation absence otherwise. | Timeline, filtering, inspection | `U0.2`, `U2.1` |
 | G7 | Fault traces are not exported per universe. | **Closed.** `CampaignConfig::trace` keeps canonical `encode_trace()` bytes; the writer saves `traces/<index>.bin`; the read-only trace API decodes them for the timeline. | Fault timeline, compare, minimize | `U0.2`, `U2.1` |
 | G8 | No campaign ID, timestamps or manifest. | **Closed.** `CampaignReport` carries `id`/`name`; `manifest.json` carries build, config, timestamps and completeness. | History, deep links, retention | `U0.1` |
-| G9 | No scheduler/network/storage/memory event stream. | **Partially closed.** `include/cosmos/event_sink.hpp` and `docs/event-stream.md` freeze the envelope, sequence, gap and version-1 codec; no engine producer is attached yet, so only fault decisions are recorded. | Full timeline, state inspector | `U3.1`, `U3.2` |
-| G10 | No public enumeration of tasks, endpoints, files or allocations. | Open. `Scheduler`, `Net`, `StorageModel`, `TrackedHeap` expose counts/aggregates only. | State tabs | `U3.2` |
+| G9 | No scheduler/network/storage/memory event stream. | **Closed.** `include/cosmos/event_sink.hpp` and `docs/event-stream.md` freeze the envelope, sequence, gap and version-1 codec; `events/<index>.bin` carries the retained stream and `test_inspection` exercises scheduler, network, storage, memory, clock, random, application, node and operator producers. Fault decisions stay in the canonical trace. | Full timeline, state inspector | `U3.1`, `U3.2` |
+| G10 | No public enumeration of tasks, endpoints, files or allocations. | **Closed for scheduler/network/storage/nodes/RNG.** `task_infos()`, `endpoint_infos()`, `file_infos()`, `node_infos()` and RNG draw counters feed the state document. The heap exposes active counts/bytes; a per-allocation table is not retained (the stream carries alloc/free/realloc events). | State tabs | `U3.2` |
 | G11 | Snapshots are not implemented. | Open. `Snapshot` is an architecture proposal only. | Time travel, branching | `U4.1` |
-| G12 | No application telemetry API. | Open. Only `always`, `sometimes`, `reachable`, checks and coverage notes exist. | App-level views | `U3.5` |
+| G12 | No application telemetry API. | **Closed.** `telemetry.hpp` declares typed counters, gauges, spans and annotations; events carry numeric ids and values, names live in the state document, and the API accepts no payload bytes. | App-level views | `U3.5` |
 | G13 | No coverage bitmap/corpus. | Open. `CoverageNote` is just `id` + `hit`; guidance is planned. | Coverage-guided UI | `U4.3` |
-| G14 | No interactive control channel. | Open. Campaign forks slice workers; no per-universe command socket. | Breakpoints, pause/step | `U3.4` |
+| G14 | No interactive control channel. | **Closed for a separate single-universe process.** `cosmos_inspect` pauses at a numeric breakpoint, resumes without rewriting ready order, and records scheduled operator commands. The browser remains read-only; no in-process UI server. | Breakpoints, pause/step | `U3.4` |
 | G15 | No schema versioning or artifact retention policy. | **Partially closed.** Every artifact object carries integer `schema_version: 1`; retention is still `O6`. | Stable UI, history | `U0.1` |
 | G16 | Campaign JSON omits trace capacity/dropped counts and per-universe trace status. | **Closed.** Campaign JSON carries `trace`/`trace_capacity`; each universe row carries `trace.dropped` and `trace.present`. | Trustworthy replay | `U0.2` |
-| G17 | Canonical `TraceEntry` has no node, task, correlation id or skip reason. | **Partially closed.** The U3.1 event stream freezes `node`, `task` and `correlation_id` in a separate envelope; the canonical trace stays unchanged and U3.2 populates the new fields. The v2 timeline still shows only the frozen fields and labels the absent ones. | Causal replay and state tabs | `U3.1`, `U3.2` |
+| G17 | Canonical `TraceEntry` has no node, task, correlation id or skip reason. | **Closed without changing the canonical trace.** The U3.1 event stream freezes `node`, `task` and `correlation_id` in a separate envelope; U3.2 populates them, and the state view joins them to the report. The v2 canonical timeline still shows only its frozen fields and labels the absent ones. | Causal replay and state tabs | `U3.1`, `U3.2` |
 | G18 | No per-seed `MinimizeReport` artifact or UI. | **Closed.** `print_minimize_json()` writes `minimizations/<seed>.json`; the writer exposes `write_minimization()` and rejects a second report for the same seed; the read-only minimization endpoint validates identity and kept/only-faults consistency; the finding, universe, timeline and minimization views render it with the 1-minimal label. Proved by `test_ui_export` and `test_serve`. | Minimize UI, exact repro | `U2.4` |
 | G19 | One minimization report per seed. | Open/accepted for U2.4. If a seed fails several assertions, findings are sorted by assertion id and only the first finding is minimized; the writer rejects a second document for that seed. The finding view labels a report whose `finding_id` differs rather than showing it as that finding. | Per-finding minimization reports for multi-failure seeds | Future |
 
@@ -1323,6 +1322,7 @@ version rather than guessing. The implementation lives in `include/cosmos/json.h
 | `universes.ndjson` | NDJSON | One compact row per universe, ascending `index`; drives the universe table. |
 | `universes/<index>.json` | JSON object | Full `UniverseSummary`: checks, coverage, config, structured ledger, counters, trace metadata. |
 | `traces/<index>.bin` | Binary | Canonical `encode_trace()` bytes; `trace.hash` is FNV-1a over exactly these bytes. |
+| `events/<index>.bin` | Binary | Version-1 inspection stream (source 3): header with `dropped`/`rejected`/`count`, then 87-byte entries. |
 | `minimizations/<seed>.json` | JSON object | Optional `MinimizeReport` for one seed: candidates, kept 1-minimal fires, exact `--only-faults` repro, passes/replays/crashed trials. |
 
 The writer is `CampaignArtifactWriter` (`include/cosmos/export.hpp`). It creates directories,
@@ -1366,8 +1366,8 @@ not a whole worker slice.
 | `created_unix_ns`, `completed_unix_ns` | int/null | Host wall-clock metadata; never an ordering key. |
 | `error` | string | First artifact/write error, empty on success. |
 | `build.id`, `commit`, `dirty`, `binary_hash`, `mode`, `compiler`, `host` | mixed | Build identity (D9). |
-| `config.trials`, `base_seed` (string), `parallel`, `node_count`, `verify`, `trace`, `trace_capacity`, `program` | mixed | Launch config. `base_seed` also has a numeric `parent_seed` for older readers. |
-| `paths` | object | `campaign`, `universes`, `universe_dir`, `trace_dir`, `minimization_dir`. |
+| `config.trials`, `base_seed` (string), `parallel`, `node_count`, `verify`, `trace`, `trace_capacity`, `events`, `event_capacity`, `state`, `program` | mixed | Launch config. `events`/`event_capacity`/`state` are the requested switches; `state: true` implies an inspection capture, so `campaign.json` reports the derived `events` intent. `base_seed` also has a numeric `parent_seed` for older readers. |
+| `paths` | object | `campaign`, `universes`, `universe_dir`, `trace_dir`, `event_dir`, `minimization_dir`. |
 
 **`campaign.json`** keeps the existing aggregate fields and adds: `schema_version`, `campaign_id`,
 `name`, `node_count`, `parallel`, `trace`, `trace_capacity`, `base_seed_dec`; each finding adds `at_ns`,
@@ -1376,7 +1376,10 @@ not a whole worker slice.
 **`universes.ndjson` row:** `schema_version`, `index`, `seed` (string), `status`,
 `no_check_failed`, `vacuous`, `verify_failed`, `checks {total, failed}`, `eligible`, `fired`,
 `active_allocations`, `config_hash`, `virtual_end_ns`, `wall_ns`, `trace {present, traced, path, hash,
-capacity, dropped}`; `hash` is null when `traced` is false.
+capacity, dropped}`, `events {present, attached, path, version, capacity, dropped, rejected}` and
+`state_present`; `hash` is null when `traced` is false. The `events` object also carries `error`
+(empty on success); the writer marks the artifact incomplete rather than dropping a refused
+capture.
 
 **`universes/<index>.json`:** the row's identity, status, trace and counter fields plus `seed_hex`,
 `died`, `signal`, `threw`, `verify_mismatch`, `checks[]` (`id`, `detail`, `passed`, `at_ns`),
@@ -1585,10 +1588,10 @@ verified in one block. Statuses: `Not started`, `In progress`, `Done`, `Blocked`
 | `U2.3` | Compare two universes: config/report/trace diff, first divergence. | `U2.1` | Side-by-side view works on two fixtures. | Done — campaign-scoped compare route, pairwise canonical-entry comparison, fixed-order report diff, bounded config diff, first event/virtual-time divergence, explicit missing/truncated trace handling; browser smoke. |
 | `U2.4` | Minimize UI: display `MinimizeReport`, candidates/kept, `--only-faults` repro. | `U1.3`, `U2.1` | Report renders; 1-minimal label is explicit. Execution UI may follow. | Done — `print_minimize_json`, `minimizations/<seed>.json`, read-only minimization API, dedicated view, finding/universe/timeline links, refused/empty/missing states, 85 UI tests; execution still out of scope. |
 | `U3.1` | Event sink contract: envelope, sequence, virtual time, gap markers, versioning; bounded ring buffer. | `U0.1` | Contract documented; dropped events are explicit; hot path allocates nothing. | Done — `include/cosmos/event_sink.hpp`, `docs/event-stream.md`, `test_event_sink` (regular + static); no producer yet. |
-| `U3.2` | Instrument scheduler, network, storage, memory; add state enumerators. | `U3.1` | Events/state cover the tabs; existing tests still pass. | Not started |
-| `U3.3` | State inspector tabs: scheduler, network, storage, memory, nodes, RNG. | `U3.2` | Paused universe shows state from the event/snapshot source. | Not started |
-| `U3.4` | Breakpoints and interactive single-universe process: pause/step, command log. | `U3.2` | A breakpoint pauses and resumes; commands are recorded/replayable. | Not started |
-| `U3.5` | Application telemetry API: counters, gauges, spans, annotations. | `U3.1` | Demo app emits a span; UI renders it; payload redaction works. | Not started |
+| `U3.2` | Instrument scheduler, network, storage, memory; add state enumerators. | `U3.1` | Events/state cover the tabs; existing tests still pass. | Done — producers in `task.cpp`, `net.cpp`, `storage.cpp` and the wrappers; state enumerators in `inspection.hpp`; `test_inspection` plus its static-libstdc++ twin. |
+| `U3.3` | State inspector tabs: scheduler, network, storage, memory, nodes, RNG. | `U3.2` | Paused universe shows state from the event/snapshot source. | Done — `events/<index>.bin`, final `state` document, read-only events API and `/state` view with gap/rejected warnings. |
+| `U3.4` | Breakpoints and interactive single-universe process: pause/step, command log. | `U3.2` | A breakpoint pauses and resumes; commands are recorded/replayable. | Done — `EventSink` observer, `Breakpoint`, `CommandLog`, `cosmos_inspect`; pause does not rewrite ready order. |
+| `U3.5` | Application telemetry API: counters, gauges, spans, annotations. | `U3.1` | Demo app emits a span; UI renders it; payload redaction works. | Done — `telemetry.hpp`, demo series, state `telemetry`/`application` tables; numeric-only payload surface. |
 | `U4.1` | Snapshots and time travel: snapshot/restore, reconstructed-state cache. | `U3.2` | Restore at event; UI labels reconstructed vs snapshot. | Not started |
 | `U4.2` | Multiverse branch tree: fork at event, child runs, compare. | `U4.1` | Branch tree matches child artifacts. | Not started |
 | `U4.3` | Coverage guidance UI: bitmap, corpus, novelty, seed mutation. | `U3.1` | Coverage data rendered; seed steering visible. | Not started |
@@ -1620,9 +1623,11 @@ trials, the exact `--only-faults` repro and the explicit **1-minimal, not global
 label. Missing, refused and empty-kept reports are distinct states; the UI never runs
 minimization.
 
-**G3 — v3 inspection:** Event sink and state tabs work; breakpoints run in a single-universe
-process; command log is recorded; gaps are visible; telemetry does not block or allocate in the
-hot path.
+**G3 — v3 inspection:** **Passes as of session 9.** The event sink writes a versioned artifact;
+the state tabs render scheduler, network, storage, memory, nodes, RNG and telemetry rows; a
+breakpoint pauses and resumes in the separate `cosmos_inspect` process; the command log is
+recorded and applied at virtual time; gaps and rejected calls are explicit in the artifact and the
+view; `record()` allocates nothing (proved by the cumulative-heap oracle).
 
 **G4 — v4 exploration:** Snapshot/restore and branch tree work; coverage guidance is rendered;
 reconstructed state is labelled honestly.
@@ -1694,7 +1699,9 @@ consequence.
 | O15 | How replay advances | `U2.2` | **A client-side cursor over recorded entries, paced in events per second (1/2/4/8/16/32), always landing on a canonical event.** | Play/pause, step, next injected, next suppressed/skipped, next failed check and virtual-time jump are observation only. They never advance virtual time, mutate a universe or add a command-log entry. Playback stops at the last event; manual selection pauses it. Rejected: wall-clock-paced virtual time and timer-driven synthetic events. | Decided |
 | O16 | How two universes are compared | `U2.3` | **One campaign-scoped route `/campaigns/<id>/compare?left=<seed>&right=<seed>`; canonical entries compare pairwise in frozen encoding order; report fields use one fixed documented order; wall time is displayed but never compared; trace hashes are identity, not a divergence signal.** | No new server endpoint: the view composes two universe details and two trace responses. `left`/`right` accept decimal or 0x seeds and canonicalize to the row's decimal string; invalid or unknown seeds fall back with a warning. Trace hash differences across seeds are expected because the canonical header carries the seed. Missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces disable event comparison explicitly instead of treating absent evidence as equal. Rejected: a server-side compare endpoint (duplicates UI logic), treating a differing trace hash as behavioural divergence, and diffing by wall time. | Decided |
 | O17 | Where a `MinimizeReport` lives and how the UI uses it | `U2.4` | **One `minimizations/<seed>.json` document per minimized seed, written after the campaign; the server validates its seed identity, entry shape and kept/`only_faults` consistency; the UI is read-only and renders the report with an explicit 1-minimal label.** | Minimization is per seed, not per campaign or timeline entry, so a separate directory avoids a stale field in `universes/<index>.json` (reports are produced after the universe row is written). Absence is `present: false`, refused stays refused, and an empty kept set remains a completed report meaning the finding reproduces with every fault withheld. The UI never executes minimization (`O5`) and never synthesizes a repro; it copies the report's exact command and shows build identity separately. Rejected: embedding the report in the universe detail (writer ordering and staleness), one campaign aggregate (loses per-seed identity), and a POST/execution endpoint (out of scope and non-deterministic to expose). | Decided |
-| O18 | What the v3 inspection event stream is | `U3.1` | **A separate versioned stream: fixed envelope (`universe`, `seq`, virtual `at`, optional wall time, `kind`, `node`, `task`, `correlation_id`, five-slot numeric payload), an append-only kind taxonomy, a fixed-capacity drop-oldest ring, and a little-endian source-3/version-1 codec with explicit `dropped`/`rejected`/`first_seq` gaps. U3.2 writes it as `events/<index>.bin` with per-universe `events` metadata.** | `record()` is a preallocated assignment with no allocation, I/O or lock; the UI must render the gap rather than presenting a truncated window as complete; strings and redaction wait for U3.5 and a version bump; the decoder rejects unknown versions, bad kinds and non-contiguous sequences. The canonical trace remains the only replay input (D5). Rejected: extending `FaultTrace` (changes determinism), NDJSON or JSON on the hot path (allocation and volume), drop-newest (loses the recent failure evidence), and silent truncation (hides lost evidence). | Decided |
+| O18 | What the v3 inspection event stream is | `U3.1` | **A separate versioned stream: fixed envelope (`universe`, `seq`, virtual `at`, optional wall time, `kind`, `node`, `task`, `correlation_id`, five-slot numeric payload), an append-only kind taxonomy, a fixed-capacity drop-oldest ring, and a little-endian source-3/version-1 codec with explicit `dropped`/`rejected`/`first_seq` gaps. `events/<index>.bin` carries it with per-universe `events` metadata.** | `record()` is a preallocated assignment with no allocation, I/O or lock; the UI must render the gap rather than presenting a truncated window as complete; application names stay in the state document and events carry ids, so no payload bytes enter the stream. The canonical trace remains the only replay input (D5). Rejected: extending `FaultTrace` (changes determinism), NDJSON or JSON on the hot path (allocation and volume), drop-newest (loses the recent failure evidence), and silent truncation (hides lost evidence). | Decided |
+| O19 | How a breakpoint pauses and resumes | `U3.4` | **An `EventSink` observer evaluates a closed numeric predicate on the record path; a match asks the scheduler to yield to the drain owner at the next choice, without popping a ready task. The interactive process is `cosmos_inspect`, separate from the UI server.** | The observer allocates nothing, never edits the event, and never calls the UI. Pausing preserves the ready order, so resuming is observation rather than a reschedule. A match inside a running workload is observed at the next drain boundary; the tool documents that boundary rather than pretending it can preempt a fiber mid-call. Rejected: throwing from a producer (not noexcept), editing scheduler order (changes the run), and a live socket control channel (D4). | Decided |
+| O20 | Where final state and command logs live | `U3.3`, `U3.4` | **The final state is a `state` object in `universes/<index>.json` and `state_present` in the compact row; the inspection stream is `events/<index>.bin`; the inspector prints state to stdout and can write `commands.json` and raw event bytes.** | State is captured after the workload, before the Simulator dies; it is a point-in-time document, not a snapshot that can be restored. The browser never writes either artifact. The command log is the repro record; a command that the universe never reached is reported, not silently dropped. | Decided |
 
 ### A.12 Risks and guardrails
 
@@ -1729,25 +1736,29 @@ consequence.
 | The event stream becomes a second replay input | It is a separate header and artifact; no replay, minimization or `trace_hash` path reads it (D5). |
 | A UI hot-path call blocks a universe | Recording is a preallocated assignment with no I/O or locks; U3.2 must preserve that and never call the UI/control plane from a wrapper. |
 | A rejected event is read as complete evidence | `rejected()` is a producer-contract warning distinct from the drop gap; a consumer must surface `rejected > 0`, and the artifact metadata records it. |
+| A breakpoint changes the run it observes | A match only asks the drain owner to pause; it pops no ready task, so resuming observes the same order. The interactive process is separate from the UI server. |
+| An inspected state document is mistaken for a restorable snapshot | The field is named `state`, the view labels it a captured point, and snapshots remain U4.1. |
+| An application payload leaks into an event | The telemetry API accepts declared names and numeric values only; no bytes, hexdump or arbitrary string reaches the stream. |
 
 ### A.13 Next action
 
-Start **`U3.2`** (engine instrumentation and state enumerators):
+Phase 3 is complete. Do not start Phase 4 without a recorded scope change: snapshots (`U4.1`),
+branching (`U4.2`) and coverage guidance (`U4.3`) alter the state model and the artifact contract.
 
-1. Attach an `EventSink` to the per-universe `Simulator` or campaign path so producers reach one
-   buffer per universe; keep the sink construction outside the wrapped allocation path.
-2. Instrument scheduler, network, storage and memory at their existing decision/state boundaries.
-   Document each kind's payload slots in `docs/event-stream.md` as it lands.
-3. Add read-only state enumerators for tasks, endpoints, files and allocations without inventing
-   events or history.
-4. Keep telemetry off the hot path (§10.2) and separate from the canonical trace (§10.3); no UI
-   call may run inside a wrapper or a live universe. The canonical trace encoding and `trace_hash`
-   stay untouched (D5).
+Before starting a new phase:
+
+1. Re-read A.3 and add the next phase's in-scope and out-of-scope lists.
+2. Add the artifact fields the phase needs to A.5.1 before implementation, or state explicitly
+   that the phase is report-only.
+3. Decide whether a snapshot is a new artifact or a library-only capability; do not let the UI
+   claim a reconstructed state is a snapshot (O20).
+4. Keep the canonical trace encoding and `trace_hash` untouched (D5); the inspection stream is
+   still not a replay input.
 5. Run `nix develop -c just lint`, `nix develop -c just test` and the clang suite; update
    A.1/A.3/A.5/A.8/A.11/A.12/B before stopping.
 
-Current first deliverable: `U3.2` (first producers and state enumerators). Do not add live
-control, snapshots or a new replay input, and do not change the canonical trace format.
+Current deliverable: Phase 3. Do not add live control to the browser, snapshots or a new replay
+input, and do not change the canonical trace format.
 
 ---
 
@@ -1767,22 +1778,21 @@ Appendix A.
 | 2026-10-26 | 6 | `U2.3` | Added the campaign-scoped compare route and view, deterministic pairwise canonical-entry comparison, fixed-order report diff, bounded realized-config diff, first event/virtual-time/report divergence labels, seed canonicalization and fallback warnings, same-seed handling, and explicit disable states for missing, malformed, seed-mismatched, truncated or drop-count-undeclared traces. Added compare links from universe/timeline views and a small focus/scroll restoration for query-only renders. No server API or canonical trace change. | `nix develop -c just lint`; `nix develop -c just test` (40/40 + 61 UI tests); `nix develop .#clang -c just test`; browser checks on two-universe compare, selector/swap focus/scroll, same seed, invalid/unknown/empty seeds, missing/malformed/seed-mismatched/truncated/undeclared-drop traces, changed config hash, deep links, theme, and no console errors. | `U2.4` |
 | 2026-10-26 | 7 | `U2.4` | Added `print_minimize_json()`, the optional `minimizations/<seed>.json` artifact layout and writer API with stale-report cleanup and duplicate-seed rejection, validated read-only minimization API, the dedicated minimization view, finding/universe/timeline links, and explicit present/refused/empty/missing states. The demo check now depends on an observed injected OOM, so the fixture carries real non-empty kept sets without changing the failing universes or traces; added 24 server contract tests and the C++ JSON/writer tests. The UI never executes minimization and repeats the 1-minimal label. | `nix develop -c just lint`; `nix develop -c just test` (C++ + 85 UI tests); `nix develop .#clang -c just test`; two `just ui-fixture` runs byte-identical; browser checks on finding minimization panel, dedicated report, kept/candidate tables, missing report, timeline-at-kept-event link, theme, and no console errors. | Phase 3 scope change, then `U3.1` |
 | 2026-10-26 | 8 | `U3.1` | Recorded the Phase 3 scope fence. Added `include/cosmos/event_sink.hpp`: append-only `EventDomain`/`EventKind` taxonomy, full envelope, per-universe sequence assignment, bounded drop-oldest ring with explicit `EventGap` and rejected-call count, five-slot payload, and the source-3/version-1 fixed-width codec with structured encode errors. Added `docs/event-stream.md` (boundaries, gap/reject semantics, header/entry layout, taxonomy, payload slots, guardrails), the `cosmos.hpp` umbrella include, and `test_event_sink` plus its static-libstdc++ twin covering sequence, eviction, empty/gapped streams, every envelope field, ring rotation, malformed inputs and cumulative no-allocation while a universe is current. No engine producer is attached yet; the canonical trace is untouched. Three read-only deepseek-v4.1-flash review rounds found no remaining Critical/High; their fixes (release-safe rejection, cumulative allocation oracle, move safety, gap/encoder consistency) are included. | `nix develop -c just lint`; `nix develop -c just test` (C++ + 85 UI tests); `nix develop .#clang -c just test`; `test_event_sink` and `test_event_sink_static`. | `U3.2` |
+| 2026-10-26 | 9 | `U3.2`–`U3.5` | Attached scheduler, network, storage, memory, clock, random, application and node producers; added `inspection.hpp` state enumerators/JSON, breakpoint observer and command log, `telemetry.hpp`, `events/<index>.bin` and `state` artifacts, read-only events API, `/state` inspector view, `cosmos_inspect`, and event/state/telemetry fixtures and tests. Updated `event-stream.md` producer table and `ui/README.md`. The canonical trace is unchanged; pause preserves ready order, and commands are recorded at virtual time. | `nix develop -c just lint`; `nix develop -c just test` (C++ + 94 UI tests); `nix develop .#clang -c just test`; `just ui-fixture` byte-stable; `cosmos_inspect` breakpoint and command runs. | Phase 4 scope change |
 
 **Next-session prompt:**
 
 ```text
-Next task: U3.2 — attach the first scheduler, network, storage and memory event producers; add
-read-only state enumerators.
+Next task: none scheduled. Phase 3 is complete; choose U4.1 only after a recorded scope change.
 Read: AGENTS.md, docs/ui-design.md Appendix A (A.1, A.3, A.5, A.8, A.11, A.13), Appendix B last row,
 and docs/event-stream.md.
-Current phase: Phase 3; U3.1 is complete and the canonical trace is untouched (D5).
+Current phase: Phase 3 complete; U3.1–U3.5 are implemented and the canonical trace is untouched
+(D5).
 Decisions: D3 artifact-first, D5 canonical trace untouched, D10 virtual vs wall time, D12
-deterministic ordering; O4/O18 event transport, O10 schema versioning.
-Do not: change simulation semantics or the canonical trace, add live control, snapshots,
-minimization execution, or commit generated files. Keep record() allocation-free and never call the
-UI from a wrapper.
+deterministic ordering; O18 event stream, O19 breakpoint pause, O20 state/command artifacts.
+Do not: change simulation semantics or the canonical trace, add live browser control, snapshots
+without a scope change, minimization execution, or commit generated files. Keep record()
+allocation-free and never call the UI from a wrapper.
 First command: nix develop -c just test
-Done when: the first producers write through EventSink, every kind's payload slots are documented,
-state enumerators are read-only and deterministic, the event suite still proves no hot-path
-allocation, and the existing C++ and UI suites pass.
+Done when: the new phase's scope, artifact fields and acceptance gate are recorded first.
 ```
