@@ -252,9 +252,9 @@ print findings with "--seed S" repro commands
 print registered-but-never-satisfied sometimes() ids
 ```
 
-`trace_hash()` is an FNV-1a digest over the canonical little-endian encoding of the universe's event stream — the encoding is defined in `docs/fault-injection.md §11.3`. It is computed **incrementally as events occur**, never reconstructed after the fact: the original run and the verify re-run each hash their own live stream, and the two digests are compared at the end.
+`trace_hash()` is an FNV-1a digest over the canonical little-endian encoding of the canonical fault-event sequence — the encoding is defined in `docs/fault-injection.md §11.3`. It is computed **incrementally as events occur**, never reconstructed after the fact: the original run and the verify re-run each hash their own live stream, and the two digests are compared at the end.
 
-> **Encoding status:** fault-injection.md §11.3 does not yet define the scheduler/event encodings that the full stream will carry. Until the real event stream exists, implementations should feed `trace_hash()` from the `FaultLedger` (entries are already canonical) plus the virtual clock, structured so the full encoding can replace the interim input without changing the `trace_hash()` API or the campaign loop.
+> **Encoding status:** fault-injection.md §11.3 does not yet define the scheduler/event encodings that the full canonical sequence will carry. Until the full canonical sequence exists, implementations should feed `trace_hash()` from the `FaultLedger` (entries are already canonical) plus the virtual clock, structured so the full encoding can replace the interim input without changing the `trace_hash()` API or the campaign loop. The separate v3 inspection stream in `docs/event-stream.md` is never hashed.
 
 ### Quiescence: When a Universe Ends
 
