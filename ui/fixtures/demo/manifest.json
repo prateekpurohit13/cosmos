@@ -8,6 +8,6 @@
   "completed_unix_ns": 1792995643349177376,
   "error": "",
   "build": {"id": "build-demo", "commit": "0000000000000000000000000000000000000000", "dirty": false, "binary_hash": "", "mode": "SIM", "compiler": "fixture", "host": "demo"},
-  "config": {"trials": 4, "base_seed": "1", "parent_seed": 1, "parallel": 1, "node_count": 1, "verify": false, "trace": true, "trace_capacity": 4096, "program": "cosmos_ui_export"},
-  "paths": {"campaign": "campaign.json", "universes": "universes.ndjson", "universe_dir": "universes", "trace_dir": "traces", "minimization_dir": "minimizations"}
+  "config": {"trials": 4, "base_seed": "1", "parent_seed": 1, "parallel": 1, "node_count": 1, "verify": false, "trace": true, "trace_capacity": 4096, "events": true, "event_capacity": 2048, "state": true, "program": "cosmos_ui_export"},
+  "paths": {"campaign": "campaign.json", "universes": "universes.ndjson", "universe_dir": "universes", "trace_dir": "traces", "event_dir": "events", "minimization_dir": "minimizations"}
 }
