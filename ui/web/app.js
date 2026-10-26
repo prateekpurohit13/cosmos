@@ -3,6 +3,7 @@ import { campaignView } from "./views/campaign.js";
 import { universesView } from "./views/universes.js";
 import { universeView } from "./views/universe.js";
 import { timelineView } from "./views/timeline.js";
+import { compareView } from "./views/compare.js";
 import { findingView } from "./views/finding.js";
 import { errorView } from "./views/error.js";
 import { notFoundView } from "./views/not-found.js";
@@ -65,6 +66,25 @@ function focusMain() {
   if (main) main.focus({ preventScroll: true });
 }
 
+function restoreFocus(samePath, focusId) {
+  if (samePath && focusId && focusId !== "main") {
+    const target = document.getElementById(focusId);
+    if (target instanceof HTMLElement && target.isConnected) {
+      target.focus({ preventScroll: true });
+      return;
+    }
+  }
+  focusMain();
+}
+
+function restorePosition(samePath, focusId, scrollY) {
+  // Replacing main with the loading state collapses the page and clamps scrollY to zero. Put the
+  // reader back where they were when only the query string changed (compare selection, timeline
+  // event links), then restore focus without scrolling again.
+  if (samePath) window.scrollTo(0, scrollY);
+  restoreFocus(samePath, focusId);
+}
+
 function loadingView() {
   return el(
     "div",
@@ -85,6 +105,8 @@ async function viewFor(route, signal) {
       return universeView({ campaignId: route.campaignId, seed: route.seed, signal });
     case "timeline":
       return timelineView({ campaignId: route.campaignId, seed: route.seed, signal });
+    case "compare":
+      return compareView({ campaignId: route.campaignId, signal });
     case "finding":
       return findingView({
         campaignId: route.campaignId,
@@ -99,6 +121,7 @@ async function viewFor(route, signal) {
 let renderToken = 0;
 let activeController = null;
 let activeView = null;
+let lastRenderedPath = null;
 
 function disposeView() {
   if (!activeView) return;
@@ -112,6 +135,9 @@ function disposeView() {
 
 async function render() {
   const token = ++renderToken;
+  const previousPath = lastRenderedPath;
+  const focusId = document.activeElement?.id || null;
+  const scrollY = window.scrollY;
   if (activeController) activeController.abort();
   activeController = new AbortController();
   const { signal } = activeController;
@@ -122,7 +148,8 @@ async function render() {
   main.setAttribute("aria-busy", "true");
   main.replaceChildren(loadingView());
   setBuildContext();
-  window.scrollTo(0, 0);
+  const samePath = previousPath !== null && previousPath === window.location.pathname;
+  if (!samePath) window.scrollTo(0, 0);
 
   try {
     const view = await viewFor(route, signal);
@@ -133,7 +160,7 @@ async function render() {
     activeView = view;
     main.replaceChildren(view.node);
     document.title = view.title;
-    focusMain();
+    restorePosition(samePath, focusId, scrollY);
   } catch (error) {
     if (token !== renderToken || signal.aborted || error?.name === "AbortError") return;
     activeView = null;
@@ -143,10 +170,11 @@ async function render() {
         : errorView(error);
     main.replaceChildren(view.node);
     document.title = view.title;
-    focusMain();
+    restorePosition(samePath, focusId, scrollY);
   } finally {
     if (token === renderToken) {
       main.removeAttribute("aria-busy");
+      lastRenderedPath = window.location.pathname;
     }
   }
 }
