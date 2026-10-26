@@ -535,6 +535,31 @@ endif()
 
 add_test(NAME test_campaign COMMAND test_campaign)
 
+# The v1 artifact/UI contract: campaign JSON additions, per-universe summaries, the realized config,
+# structured ledger, canonical trace files, and atomic artifact layout. Same wrapped allocator
+# channel as the campaign fixture, because the test drives a real fault through malloc.
+add_executable(test_ui_export test_ui_export.cpp)
+target_link_libraries(test_ui_export PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_ui_export PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_ui_export PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+add_test(NAME test_ui_export COMMAND test_ui_export)
+
 # The decision trace is recorded inside decide(), so its tests need the same allocator channel the
 # wrappers use for the heap-invisibility case.
 add_executable(test_trace test_trace.cpp)
