@@ -248,6 +248,15 @@ class ServerCase(unittest.TestCase):
         self.assertIn("text/html", headers["content-type"])
         self.assertIn(b'id="main"', body)
 
+    def test_compare_route_uses_spa_fallback(self) -> None:
+        status, headers, body = self.request(
+            f"/campaigns/demo/compare?left={DEMO_SEED}&right={DEMO_SEED_HEX}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["content-type"])
+        self.assertIn(b'id="main"', body)
+        self.assertIn("default-src 'self'", headers["content-security-policy"])
+
     def test_dotfile_outside_client_routes_is_blocked(self) -> None:
         status, _, _ = self.request("/.git/config")
         self.assertEqual(status, 404)
@@ -381,23 +390,26 @@ class TraceArtifactCase(unittest.TestCase):
             18: ("59", True, "traces/18.bin", unsafe_integer, trace_hash(unsafe_integer)),
             19: ("60", True, "", missing_path, trace_hash(missing_path)),
             20: ("61", True, "traces/20.bin", duplicate_seq, trace_hash(duplicate_seq)),
+            21: ("62", False, "", None, None),
         }
         rows = []
         for index, (seed, present, path, data, digest) in variants.items():
+            trace_meta = {
+                "present": present,
+                "traced": present,
+                "path": path,
+                "hash": digest,
+                "capacity": 4096,
+            }
+            if index != 21:
+                trace_meta["dropped"] = 3 if index == 0 else 0
             rows.append(
                 {
                     "schema_version": 1,
                     "index": index,
                     "seed": seed,
                     "status": "passed",
-                    "trace": {
-                        "present": present,
-                        "traced": present,
-                        "path": path,
-                        "hash": digest,
-                        "capacity": 4096,
-                        "dropped": 3 if index == 0 else 0,
-                    },
+                    "trace": trace_meta,
                 }
             )
             if data is not None:
@@ -410,14 +422,7 @@ class TraceArtifactCase(unittest.TestCase):
                 "status": "passed",
                 "virtual_end_ns": 5_000,
                 "checks": [],
-                "trace": {
-                    "present": present,
-                    "traced": present,
-                    "path": path,
-                    "hash": digest,
-                    "capacity": 4096,
-                    "dropped": 3 if index == 0 else 0,
-                },
+                "trace": trace_meta,
             }
             (campaign / "universes" / f"{index}.json").write_text(
                 json.dumps(detail), encoding="utf-8"
@@ -591,6 +596,12 @@ class TraceArtifactCase(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertEqual(payload["error"]["code"], "artifact_trace_malformed")
         self.assertIn("non-increasing seq", payload["error"]["message"])
+
+    def test_missing_drop_count_is_null(self) -> None:
+        status, payload = self.trace("62")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["trace"]["present"])
+        self.assertIsNone(payload["trace"]["dropped"])
 
 
 class BrokenArtifactCase(unittest.TestCase):
