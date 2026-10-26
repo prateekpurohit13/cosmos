@@ -25,6 +25,9 @@ export function parseLocation(location = window.location) {
   if (parts.length === 2) {
     return { name: "campaign", campaignId, path };
   }
+  if (parts.length === 3 && parts[2] === "compare") {
+    return { name: "compare", campaignId, path };
+  }
   if (parts.length === 3 && parts[2] === "universes") {
     return { name: "universes", campaignId, path };
   }

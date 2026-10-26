@@ -4,6 +4,7 @@ import {
   buildContext,
   classChip,
   codeBlock,
+  compareHref,
   copyButton,
   detailsBlock,
   emptyState,
@@ -464,11 +465,16 @@ export async function timelineView({ campaignId, seed, signal }) {
 
   setBuildContext(buildContext(manifest));
 
+  const droppedDeclared = Number.isInteger(trace.dropped);
+  const droppedCount = droppedDeclared ? trace.dropped : null;
   const badges = [
     statusBadge(status),
     findingsSeed ? badge(String(findingsSeed.id), "bad") : null,
     trace.present ? badge("trace", "info") : badge("no trace", "warn"),
-    Number(trace.dropped) > 0 ? badge(`${formatCount(trace.dropped)} dropped`, "warn") : null,
+    droppedCount !== null && droppedCount > 0
+      ? badge(`${formatCount(droppedCount)} dropped`, "warn")
+      : null,
+    trace.present && !droppedDeclared ? badge("drop count missing", "warn") : null,
     trace.hash_matches === false ? badge("hash mismatch", "bad") : null,
   ].filter(Boolean);
 
@@ -720,8 +726,12 @@ export async function timelineView({ campaignId, seed, signal }) {
     {
       label: "Capacity",
       value: formatCount(trace.capacity),
-      note: Number(trace.dropped) > 0 ? `${formatCount(trace.dropped)} dropped` : "no drops recorded",
-      tone: Number(trace.dropped) > 0 ? "warn" : "neutral",
+      note: !droppedDeclared
+        ? "drop count not declared"
+        : droppedCount > 0
+          ? `${formatCount(droppedCount)} dropped`
+          : "no drops recorded",
+      tone: !droppedDeclared ? "warn" : droppedCount > 0 ? "warn" : "neutral",
     },
   ]);
 
@@ -760,6 +770,10 @@ export async function timelineView({ campaignId, seed, signal }) {
         "Back to universe",
         { class: "btn btn--ghost" },
       ),
+      link(compareHref(campaignId, seedValue), "Compare", {
+        class: "btn btn--ghost",
+        title: "Compare this universe with another universe in this campaign",
+      }),
       copyButton(invocation ?? identity, invocation ? "Copy repro" : "Copy repro identity", {
         class: "btn btn--primary",
         title: invocation ?? identity,

@@ -174,8 +174,12 @@ export function seedLink(campaignId, seed, props = {}) {
   );
 }
 
-export function timelineHref(campaignId, seed, { checkId = null, atNs = null } = {}) {
+export function timelineHref(campaignId, seed, { checkId = null, atNs = null, eventSeq = null } = {}) {
   const params = new URLSearchParams();
+  if (eventSeq !== null && eventSeq !== undefined && String(eventSeq) !== "") {
+    const seq = Number(eventSeq);
+    if (Number.isSafeInteger(seq) && seq >= 0) params.set("event", String(seq));
+  }
   if (checkId !== null && checkId !== undefined && String(checkId) !== "") {
     params.set("check", String(checkId));
   }
@@ -188,6 +192,21 @@ export function timelineHref(campaignId, seed, { checkId = null, atNs = null } =
   return (
     `/campaigns/${encodeURIComponent(String(campaignId))}/universes/` +
     `${encodeURIComponent(String(seed))}/timeline${query ? `?${query}` : ""}`
+  );
+}
+
+export function compareHref(campaignId, leftSeed, rightSeed) {
+  const params = new URLSearchParams();
+  if (leftSeed !== null && leftSeed !== undefined && String(leftSeed) !== "") {
+    params.set("left", String(leftSeed));
+  }
+  if (rightSeed !== null && rightSeed !== undefined && String(rightSeed) !== "") {
+    params.set("right", String(rightSeed));
+  }
+  const query = params.toString();
+  return (
+    `/campaigns/${encodeURIComponent(String(campaignId))}/compare` +
+    (query ? `?${query}` : "")
   );
 }
 

@@ -4,6 +4,7 @@ import {
   buildContext,
   classChip,
   codeBlock,
+  compareHref,
   copyButton,
   detailsBlock,
   emptyState,
@@ -427,9 +428,9 @@ export async function universeView({ campaignId, seed, signal }) {
     notices.push(
       notice(
         "verify",
-        "Determinism mismatch",
+        "Verification failed",
         universe.verify_mismatch ||
-          "Two runs of the same seed disagreed. This is a determinism bug, not an application bug.",
+          "Two runs of this seed did not agree. Treat the run as unverified evidence.",
       ),
     );
   }
@@ -484,6 +485,10 @@ export async function universeView({ campaignId, seed, signal }) {
       link(`/campaigns/${encodeURIComponent(campaignId)}/universes`, "Back to universes", {
         class: "btn btn--ghost",
       }),
+      link(compareHref(campaignId, seedValue), "Compare", {
+        class: "btn btn--ghost",
+        title: "Compare this universe with another universe in this campaign",
+      }),
       copyButton(
         invocation ?? identity,
         invocation ? "Copy repro" : "Copy repro identity",
@@ -530,8 +535,14 @@ export async function universeView({ campaignId, seed, signal }) {
     {
       label: "Trace",
       value: trace.present ? shortId(trace.hash) : trace.traced ? "missing" : "not traced",
-      note: trace.capacity ? `capacity ${formatCount(trace.capacity)}` : "no canonical bytes",
-      tone: trace.present && !Number(trace.dropped) ? "ok" : "warn",
+      note: trace.present
+        ? Number.isInteger(trace.dropped)
+          ? trace.capacity
+            ? `capacity ${formatCount(trace.capacity)}`
+            : "no canonical bytes"
+          : "drop count not declared"
+        : "no canonical bytes",
+      tone: trace.present && Number.isInteger(trace.dropped) && trace.dropped === 0 ? "ok" : "warn",
     },
   ]);
 
