@@ -13,12 +13,15 @@
 #include "cosmos/export.hpp"
 #include "cosmos/minimize.hpp"
 #include "cosmos/minimize_json.hpp"
+#include "demo_scenario.hpp"
+
 #include "cosmos/scenario.hpp"
 
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <pthread.h>
 #include <sstream>
 #include <string>
 #include <time.h>
@@ -26,67 +29,6 @@
 #include <vector>
 
 namespace {
-
-cosmos::FaultConfig demo_plan() {
-    cosmos::FaultConfig plan;
-    plan.enable_class(cosmos::FaultClass::Memory);
-    plan.enable_class(cosmos::FaultClass::Clock);
-    (void)plan.activate_site(cosmos::SiteId::malloc);
-    (void)plan.activate_site(cosmos::SiteId::clock_gettime);
-
-    cosmos::FaultRule memory;
-    memory.rate = 0.35;
-    (void)memory.outcomes.add(cosmos::FaultKind::OutOfMemory, 1.0);
-    (void)plan.set_rule(cosmos::SiteId::malloc, std::move(memory));
-
-    cosmos::FaultRule clock;
-    clock.rate = 0.4;
-    clock.amount = cosmos::Duration{50'000};
-    (void)clock.outcomes.add(cosmos::FaultKind::ClockStep, 1.0);
-    (void)plan.set_rule(cosmos::SiteId::clock_gettime, std::move(clock));
-    return plan;
-}
-
-// Explicit wrapped calls are the only place the demo's faults can fire. The loop deliberately
-// interleaves memory and clock decisions so the exported trace has more than one lane and more
-// than one virtual timestamp. A fired OOM returns null; freeing null is harmless, so the demo
-// application never has to recover from the fault to stay deterministic.
-//
-// The check is a pure function of the universe index *and* whether an injected OOM was observed,
-// which gives the minimizer something real to keep: for a failing odd index the finding needs at
-// least one OOM fire and does not need the clock steps. (The campaign's odd universes all see an
-// OOM, so this is the same failing set the earlier index-only check described.)
-void run_demo_body(cosmos::Scenario& scenario, uint64_t index) {
-    bool injected_oom = false;
-    scenario.run([&injected_oom, &scenario] {
-        for (int step = 0; step < 12; ++step) {
-            void* block = std::malloc(16);
-            if (block == nullptr) injected_oom = true;
-            std::free(block);
-            struct timespec now{};
-            (void)clock_gettime(CLOCK_MONOTONIC, &now);
-            scenario.simulator().advance_time(cosmos::Duration{100'000});
-        }
-    });
-    scenario.quiesce();
-    // A non-zero virtual end makes the artifact's time labels reviewable.
-    scenario.simulator().advance_time(cosmos::Duration{1'000'000});
-    scenario.check(
-        "odd-index-fails", [index, injected_oom] { return index % 2 == 0 || !injected_oom; },
-        "universe " + std::to_string(index) + " was asked to fail");
-    scenario.note_covered("odd-index-seen", index % 2 == 1);
-}
-
-cosmos::ScenarioReport run_demo_universe(cosmos::Simulator& sim, uint64_t index) {
-    auto scenario = cosmos::Scenario::on(sim, demo_plan());
-    if (!scenario) {
-        cosmos::ScenarioReport rejected;
-        rejected.no_check_failed = false;
-        return rejected;
-    }
-    run_demo_body(*scenario, index);
-    return scenario->report();
-}
 
 const char* compiler_name() {
 #if defined(__clang__)
@@ -114,6 +56,9 @@ int main(int argc, char** argv) {
     campaign.name = "Cosmos demo campaign";
     campaign.trace = true;
     campaign.trace_capacity = 4096;
+    campaign.events = true;
+    campaign.event_capacity = 2048;
+    campaign.state = true;
 
     cosmos::ArtifactOptions options;
     options.root = root;
@@ -143,7 +88,8 @@ int main(int argc, char** argv) {
         writer_sink(outcome);
     };
 
-    const cosmos::CampaignReport report = cosmos::Campaign::run(campaign, run_demo_universe);
+    const cosmos::CampaignReport report =
+        cosmos::Campaign::run(campaign, cosmos::demo::run_demo_universe);
 
     // Minimization is report-only (O5): the exporter runs it after the campaign over the recorded
     // traces and writes one document per failing seed. The UI never executes it.
@@ -212,13 +158,13 @@ int main(int argc, char** argv) {
             // Scenario::on installs this plan directly; the demo does not sample a swarm config,
             // so the template is the realized config for these universes.
             cosmos::MinimizeConfig minimize_config;
-            minimize_config.plan = demo_plan();
+            minimize_config.plan = cosmos::demo::demo_plan();
             minimize_config.finding_id = finding.id;
             minimize_config.node_count = campaign.node_count;
             minimize_config.program = campaign.program;
             const uint64_t universe_index = index->second;
             const auto body = [universe_index](cosmos::Scenario& scenario) {
-                run_demo_body(scenario, universe_index);
+                cosmos::demo::run_demo_body(scenario, universe_index);
             };
             const cosmos::MinimizeReport minimized_report =
                 cosmos::minimize(*source, minimize_config, body);

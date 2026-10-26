@@ -19,3 +19,26 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=clock_gettime"
     )
 endif()
+
+# Interactive single-universe inspector (U3.4). The wrapped allocator and clock are load-bearing:
+# the demo body's malloc/gettimeofday decisions must reach the injector and the event producers.
+add_executable(cosmos_inspect cosmos_inspect.cpp)
+target_link_libraries(cosmos_inspect PRIVATE cosmos)
+target_include_directories(cosmos_inspect PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(cosmos_inspect PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(cosmos_inspect PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=clock_gettime"
+    )
+endif()
