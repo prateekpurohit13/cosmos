@@ -28,7 +28,7 @@ import {
   formatWallNs,
   shortId,
 } from "../lib/format.js";
-import { compareSites, siteClass, siteStatus } from "../lib/faults.js";
+import { compareSites, isEventSite, siteClass, siteStatus } from "../lib/faults.js";
 import { finiteTimeNs } from "../lib/trace.js";
 import { setBuildContext } from "../lib/shell.js";
 
@@ -330,7 +330,16 @@ function sitesBody(universe) {
           const activated = Boolean(row?.activated);
           const eligible = Number(row?.eligible ?? 0);
           const fired = Number(row?.fired ?? 0);
-          const state = siteStatus(activated, eligible, fired);
+          const eventSite = isEventSite(site);
+          const state = eventSite
+            ? {
+                label: activated ? "armed" : "not activated",
+                tone: activated ? "ok" : "neutral",
+              }
+            : siteStatus(activated, eligible, fired);
+          const counterTitle = eventSite
+            ? "Episode site: starts and heals are recorded in the fault ledger and timeline, not in wrapper-call counters"
+            : undefined;
           return el(
             "tr",
             {},
@@ -343,9 +352,17 @@ function sitesBody(universe) {
                 ? el("span", { class: "status status--ok" }, "yes")
                 : el("span", { class: "status status--warn" }, "no"),
             ),
-            el("td", { class: "num" }, formatCount(eligible)),
-            el("td", { class: "num" }, formatCount(fired)),
-            el("td", {}, el("span", { class: `status status--${state.tone}` }, state.label)),
+            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(eligible)),
+            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(fired)),
+            el(
+              "td",
+              {},
+              el(
+                "span",
+                { class: `status status--${state.tone}`, title: counterTitle },
+                state.label,
+              ),
+            ),
           );
         }),
       ),
@@ -527,9 +544,9 @@ export async function universeView({ campaignId, seed, signal }) {
       tone: failedChecks.length > 0 ? "bad" : "ok",
     },
     {
-      label: "Faults",
+      label: "Wrapper faults",
       value: `${formatCount(fired)} / ${formatCount(eligible)}`,
-      note: "fired / eligible",
+      note: "fired / eligible calls",
       tone: fired > 0 ? "warn" : "neutral",
     },
     {

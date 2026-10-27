@@ -18,19 +18,29 @@ nix develop -c just ui
 ```
 
 Open <http://127.0.0.1:8000/>. The default artifact root is `ui/fixtures`, which contains the
-checked-in `demo` campaign. To generate and serve a replicated-KV campaign (the distributed
-example under the partition-plus-crash plan from `tests/test_distributed.cpp`):
+checked-in `demo` campaign. To generate and serve the real replicated-KV campaign:
 
 ```sh
-nix develop -c just ui-rkv
-nix develop -c just ui root=build/ui-artifacts
+nix develop -c just rkv-campaign --trials 1024 --verify
+nix develop -c just ui build/ui-artifacts
 ```
 
-The exporter writes `build/ui-artifacts/replicated-kv`, so the checked-in demo fixture remains
-the only campaign under `ui/fixtures`. To serve another artifact root:
+The campaign harness uses swarm-sampled wrapper faults, sampled process/network episodes, real
+build provenance, canonical traces, the inspection event stream, final state and minimization
+reports. `--mode regression` uses the exact partition-plus-crash repro from
+`tests/test_distributed.cpp`; `--mode chaos` randomizes the victim backup and crash target.
+Reproduce one finding from the terminal with:
 
 ```sh
-nix develop -c just ui root=/path/to/artifacts port=9000
+build/tools/replicated_kv_campaign --mode mixed --seed <seed>
+```
+
+The finding view's **Copy repro** button uses the same manifest template.
+
+To serve another artifact root:
+
+```sh
+nix develop -c just ui /path/to/artifacts 9000
 ```
 
 Or invoke the server directly (useful for `--host`, `--quiet`, or a non-default web root):

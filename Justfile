@@ -49,13 +49,25 @@ ui-fixture:
     just ui-export ui/fixtures/demo demo 4
     python3 tools/normalise_ui_fixture.py ui/fixtures/demo
 
-# Export the replicated-KV distributed example as a UI campaign (partition + crash finding).
-# Written under the build directory so the checked-in demo fixture stays the only campaign the
-# UI contract tests see.
-ui-rkv dir=rkv_artifacts id="replicated-kv" trials="4":
+# Real replicated-KV campaign: swarm-sampled wrapper faults, process/network episodes, real build
+# provenance, canonical traces, inspection events, state and minimization reports. Written under
+# the build directory so the checked-in demo fixture stays the only campaign the UI tests see.
+# Use `--mode regression` for the exact partition+crash repro from tests/test_distributed.cpp.
+rkv-campaign *args:
     cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
-    cmake --build {{build_dir}} --parallel --target replicated_kv_ui_export
-    {{build_dir}}/tools/replicated_kv_ui_export {{dir}} {{id}} {{trials}}
+    cmake --build {{build_dir}} --parallel --target replicated_kv_campaign
+    commit="$(jj log -r @ --no-graph -T 'commit_id' 2>/dev/null || true)"; \
+    dirty=0; if [ -n "$(jj diff --summary 2>/dev/null || true)" ]; then dirty=1; fi; \
+    binary_hash="$(sha256sum {{build_dir}}/tools/replicated_kv_campaign | cut -d' ' -f1)"; \
+    dirty_flag="--clean"; if [ "$dirty" = "1" ]; then dirty_flag="--dirty"; fi; \
+    {{build_dir}}/tools/replicated_kv_campaign \
+        --root {{rkv_artifacts}} --id replicated-kv \
+        --commit "$commit" --binary-hash "$binary_hash" "$dirty_flag" \
+        {{args}}
+
+# Backwards-compatible name for the real campaign target.
+ui-rkv *args:
+    just rkv-campaign {{args}}
 
 # Format all C/C++ source and header files
 format:

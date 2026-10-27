@@ -106,6 +106,7 @@ cosmos::ArtifactOptions artifact_options(const std::filesystem::path& root,
     options.build.mode = "SIM";
     options.build.compiler = "test";
     options.build.host = "localhost";
+    options.repro = "test-program --seed {seed}";
     return options;
 }
 
@@ -331,6 +332,7 @@ void test_artifact_writer_round_trips_one_campaign() {
     must(manifest.find("\"complete\": true") != std::string::npos);
     must(manifest.find("\"id\": \"build-test-1\"") != std::string::npos);
     must(manifest.find("\"trace\": true") != std::string::npos);
+    must(manifest.find("\"repro\": \"test-program --seed {seed}\"") != std::string::npos);
     must(is_balanced(manifest));
 
     const std::string campaign = read_file(root / cosmos::kCampaignFile);

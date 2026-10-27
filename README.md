@@ -33,9 +33,9 @@ just test        # or make test (or just t)
 # Build all targets (production binaries, simulation examples, and tests)
 just all         # or make all
 
-# Export the replicated-KV fault campaign, then serve it in the UI (see ui/README.md)
-just ui-rkv
-just ui root=build/ui-artifacts
+# Run the real replicated-KV campaign (swarm faults, verify), then serve it in the UI
+just rkv-campaign --trials 1024 --verify
+just ui build/ui-artifacts
 
 # Run the UI server contract tests
 just ui-test
@@ -68,7 +68,7 @@ ctest --test-dir build --output-on-failure
 ## Examples
 
 - [`examples/single_node/`](examples/single_node/) – Transactional WAL storage engine (crash durability & OOM fault injection).
-- [`examples/distributed/`](examples/distributed/) – Replicated consensus cluster (network partitions & message reordering). `just ui-rkv` exports its partition-plus-crash campaign for the UI.
+- [`examples/distributed/`](examples/distributed/) – Replicated consensus cluster (network partitions & message reordering). `just rkv-campaign` runs its real swarm + process/network campaign and exports it for the UI.
 
 ## LLM Usage Policy
 

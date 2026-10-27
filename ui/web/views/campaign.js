@@ -28,7 +28,13 @@ import {
   formatRatio,
   formatUnixNs,
 } from "../lib/format.js";
-import { compareSites, siteClass, siteStatus, vacuityAdvice } from "../lib/faults.js";
+import {
+  compareSites,
+  isEventSite,
+  siteClass,
+  siteStatus,
+  vacuityAdvice,
+} from "../lib/faults.js";
 import { setBuildContext } from "../lib/shell.js";
 
 function compareFindings(left, right, runs) {
@@ -89,12 +95,16 @@ function siteMatrix(campaign) {
           const activated = Number(row?.activated ?? 0);
           const eligible = Number(row?.eligible ?? 0);
           const fired = Number(row?.fired ?? 0);
-          const state = siteStatus(
-            activated,
-            eligible,
-            fired,
-            vacuousSites.has(site),
-          );
+          const eventSite = isEventSite(site);
+          const state = eventSite
+            ? {
+                label: activated > 0 ? "armed" : "not activated",
+                tone: activated > 0 ? "ok" : "neutral",
+              }
+            : siteStatus(activated, eligible, fired, vacuousSites.has(site));
+          const counterTitle = eventSite
+            ? "Episode site: starts and heals are recorded in the fault ledger and timeline, not in wrapper-call counters"
+            : undefined;
           return el(
             "tr",
             {},
@@ -112,12 +122,16 @@ function siteMatrix(campaign) {
               },
               formatRatio(activated, runs),
             ),
-            el("td", { class: "num" }, formatCount(eligible)),
-            el("td", { class: "num" }, formatCount(fired)),
+            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(eligible)),
+            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(fired)),
             el(
               "td",
               {},
-              el("span", { class: `status status--${state.tone}` }, state.label),
+              el(
+                "span",
+                { class: `status status--${state.tone}`, title: counterTitle },
+                state.label,
+              ),
             ),
           );
         }),

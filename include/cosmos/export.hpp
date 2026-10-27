@@ -438,8 +438,9 @@ inline void print_build_json(std::ostream& out, const BuildInfo& build) {
 }
 
 inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
-                                const BuildInfo& build, int64_t created_unix_ns,
-                                int64_t completed_unix_ns, bool complete, std::string_view error) {
+                                const BuildInfo& build, std::string_view repro,
+                                int64_t created_unix_ns, int64_t completed_unix_ns, bool complete,
+                                std::string_view error) {
     const json::classic_locale_guard locale(out);
     out << "{\n";
     out << "  \"schema_version\": " << kArtifactSchemaVersion << ",\n";
@@ -449,6 +450,8 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     json::string(out, config.name);
     out << ",\n  \"program\": ";
     json::string(out, config.program);
+    out << ",\n  \"repro\": ";
+    json::string(out, repro);
     out << ",\n  \"complete\": ";
     json::boolean(out, complete);
     out << ",\n  \"created_unix_ns\": " << created_unix_ns;
@@ -606,6 +609,9 @@ struct ArtifactOptions {
     // writer's sink to the live CampaignConfig after create().
     CampaignConfig campaign;
     BuildInfo build;
+    // Optional single-seed repro command template. Use `{seed}` where the finding seed belongs;
+    // the UI only offers a runnable command when this contains that placeholder.
+    std::string repro;
 };
 
 // Parent-side writer. Create it before Campaign::run, attach sink(), then call finish() with the
@@ -845,8 +851,9 @@ class CampaignArtifactWriter {
 
     std::expected<void, std::string> write_manifest() {
         std::ostringstream text;
-        print_manifest_json(text, options_.campaign, options_.build, created_unix_ns_,
-                            completed_unix_ns_, completed_unix_ns_ > 0 && error_.empty(), error_);
+        print_manifest_json(text, options_.campaign, options_.build, options_.repro,
+                            created_unix_ns_, completed_unix_ns_,
+                            completed_unix_ns_ > 0 && error_.empty(), error_);
         return export_detail::write_atomic(options_.root / kManifestFile, text.str());
     }
 

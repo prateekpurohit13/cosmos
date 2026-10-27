@@ -24,6 +24,11 @@ const SITE_TABLE = [
 
 const SITE_CLASS = new Map(SITE_TABLE);
 const SITE_INDEX = new Map(SITE_TABLE.map(([site], index) => [site, index]));
+const EVENT_SITES = new Set(["crash_node", "partition", "pause_node", "torn_write"]);
+
+export function isEventSite(site) {
+  return EVENT_SITES.has(String(site));
+}
 
 export function siteClass(site) {
   return SITE_CLASS.get(String(site)) ?? "Unknown";
