@@ -195,29 +195,6 @@ textarea {
   letter-spacing: 0.16em;
 }
 
-.brand__sub {
-  color: var(--faint);
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.04em;
-}
-
-.topnav {
-  display: flex;
-  gap: 0.9rem;
-  font-size: 0.82rem;
-}
-
-.topnav a {
-  color: var(--muted);
-}
-
-.topnav a[aria-current="page"],
-.topnav a:hover {
-  color: var(--text);
-  text-decoration: none;
-}
-
 .build-context {
   display: flex;
   flex-wrap: wrap;
@@ -1320,14 +1297,36 @@ pre {
 
 .campaign-card__name {
   color: var(--text);
-  font-size: 0.98rem;
+  font-family: var(--mono);
+  font-size: 0.92rem;
   font-weight: 600;
 }
 
-.campaign-card__id {
+.campaign-card__figures {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.campaign-card__figure dt {
+  overflow: hidden;
   color: var(--faint);
   font-family: var(--mono);
-  font-size: 0.7rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.campaign-card__figure dd {
+  margin: 0.1rem 0 0;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
 
 .campaign-card__meta {

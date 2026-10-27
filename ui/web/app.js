@@ -55,16 +55,6 @@ if (themeToggle) {
   applyTheme("dark");
 }
 
-function updateNav(route) {
-  const primary = document.querySelector(".topnav a[href='/']");
-  if (!primary) return;
-  if (route.name === "campaigns") {
-    primary.setAttribute("aria-current", "page");
-  } else {
-    primary.removeAttribute("aria-current");
-  }
-}
-
 function focusMain() {
   if (main) main.focus({ preventScroll: true });
 }
@@ -151,7 +141,6 @@ async function render() {
   activeController = new AbortController();
   const { signal } = activeController;
   const route = parseLocation();
-  updateNav(route);
 
   disposeView();
   main.setAttribute("aria-busy", "true");

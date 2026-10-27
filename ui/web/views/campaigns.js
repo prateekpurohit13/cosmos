@@ -1,13 +1,22 @@
 import { api } from "../lib/api.js";
 import { badge, emptyState, pageHeader, panel, statGrid } from "../lib/components.js";
 import { el, frag, link } from "../lib/dom.js";
-import { formatCount, formatUnixNs, shortCommit } from "../lib/format.js";
+import { formatCount, formatUnixNs } from "../lib/format.js";
 import { setBuildContext } from "../lib/shell.js";
 
 function compareCampaigns(left, right) {
   const l = String(left?.campaign_id ?? "");
   const r = String(right?.campaign_id ?? "");
   return l < r ? -1 : l > r ? 1 : 0;
+}
+
+function figure(label, value) {
+  return el(
+    "div",
+    { class: "campaign-card__figure" },
+    el("dt", {}, label),
+    el("dd", {}, formatCount(value)),
+  );
 }
 
 function campaignCard(entry) {
@@ -30,39 +39,29 @@ function campaignCard(entry) {
       ),
     );
   }
-  const build = entry.build ?? {};
   const config = entry.config ?? {};
   return link(
     `/campaigns/${encodeURIComponent(id)}`,
-    cardContents(id, entry, build, config),
+    cardContents(id, entry, config),
     { class: "campaign-card" },
   );
 }
 
-function cardContents(id, entry, build, config) {
+function cardContents(id, entry, config) {
   return frag(
     el(
       "div",
       { class: "campaign-card__head" },
-      el("span", { class: "campaign-card__name" }, entry.name || id),
+      el("span", { class: "campaign-card__name" }, id || "unnamed campaign"),
       entry.complete
         ? badge("complete", "ok")
         : badge("incomplete", "warn", entry.error || "The artifact writer did not finish."),
     ),
-    el("div", { class: "campaign-card__id" }, id),
     el(
-      "div",
-      { class: "campaign-card__meta" },
-      el("span", {}, `${formatCount(config.trials)} universes`),
-      el("span", {}, `${formatCount(config.node_count)} nodes`),
-      el("span", {}, `${formatCount(config.parallel)} workers`),
-      config.verify ? el("span", { class: "badge badge--verify" }, "verify") : null,
-    ),
-    el(
-      "div",
-      { class: "campaign-card__meta" },
-      el("span", {}, `build ${build.id || "unknown"} · ${build.mode || "—"}`),
-      el("span", {}, `commit ${shortCommit(build.commit)}`),
+      "dl",
+      { class: "campaign-card__figures" },
+      figure("Universes", config.trials),
+      figure("Nodes", config.node_count),
     ),
     el(
       "div",
@@ -74,7 +73,6 @@ function cardContents(id, entry, build, config) {
           ? `created ${formatUnixNs(entry.created_unix_ns)} wall`
           : "created —",
       ),
-      entry.program ? el("span", {}, entry.program) : null,
     ),
     entry.error ? el("p", { class: "campaign-card__error" }, entry.error) : null,
   );
