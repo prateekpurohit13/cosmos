@@ -149,14 +149,14 @@ public:
 };
 ```
 
-1. **`SimSubstrate` (Phases 1-6)**: Executes C++ fiber tasks inside the single-threaded simulation process. Determinism is maintained by single-threaded cooperation and wrapper interposition.
+1. **`SimSubstrate` (implemented)**: Executes C++ fiber tasks inside the single-threaded simulation process. Determinism is maintained by single-threaded cooperation and wrapper interposition. `include/cosmos/snapshot.hpp` provides the seam and the fork-COW checkpoint implementation.
 2. **`KvmSubstrate` (Phase 7+)**: Executes full virtual machine guests (Linux+KVM). Intercepts hypercalls and VM exits for unmodified multi-process guest OS determinism. Reuses 100% of the campaign runner, fault timeline, and exploration engine.
 
 ---
 
 ## 6. Snapshot Interface & Multiverse Branching
 
-State-space exploration v3 forks a universe at critical decision points to explore alternative interleavings without restarting from time zero.
+State-space exploration v3 forks a universe at critical decision points to explore alternative interleavings without restarting from time zero. Cosmos implements the fork-COW variant: a `Snapshot` is a live checkpoint process, and `explore()` starts a branch child from it.
 
 ```cpp
 struct Snapshot {
@@ -167,7 +167,7 @@ struct Snapshot {
 };
 ```
 
-- **`SimSubstrate`**: Creates an in-process state copy of the tracked heap, virtual clock, and network queues.
+- **`SimSubstrate` (implemented via `Snapshot`)**: forks a checkpoint process, so the tracked heap, fiber stacks and registers, scheduler queues, RNGs and in-flight packets are captured by COW. Tracked host files are copied into branch-private paths and descriptors are redirected because fork does not isolate them.
 - **`KvmSubstrate`**: Performs hypervisor COW memory snapshot & vCPU register state save.
 
 ---

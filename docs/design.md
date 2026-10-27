@@ -560,6 +560,21 @@ FNV-1a 64 uses offset basis `14695981039346656037` and prime `1099511628211`.
 
 ---
 
+## 13.3 Exploration (`coverage.hpp`, `snapshot.hpp`, `exploration.hpp`)
+
+Level 2 coverage is a fixed 64 KiB bitmap filled by sanitizer callbacks. Clang uses
+`trace-pc-guard`; GCC uses `trace-pc` with a normalized return address. `coverage_reset()` precedes
+a universe body and `coverage_snapshot()` copies the map after it. `CampaignConfig::guidance =
+SeedGuidance::Coverage` retains novel seeds in a bounded corpus and derives later seeds from it.
+Coverage never enters the canonical trace or `trace_hash`.
+
+Level 3 snapshots are fork-COW checkpoints (`Snapshot::capture()`), not serialized in-process
+images. The checkpoint captures the heap, fiber stacks, scheduler queues, RNGs and network queues
+through fork; tracked host files and descriptor offsets are copied explicitly. `explore()` asks
+the checkpoint for a branch child, optionally forcing the next scheduler choice. `SimSubstrate`
+implements the `ISubstrate` seam. `exploration.json` is additive observation data and is not a
+replay or minimization input.
+
 ## 14. The Determinism Contract
 
 Under `libcosmos`, determinism holds provided that application code:

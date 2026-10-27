@@ -37,6 +37,13 @@ just all         # or make all
 just rkv-campaign --trials 1024 --verify
 just ui build/ui-artifacts
 
+# Coverage-guided campaign plus fork-COW snapshot branches
+just exploration-campaign build/ui-artifacts/exploration 24
+just ui build/ui-artifacts
+
+# Coverage-guided replicated-KV campaign
+just rkv-campaign --trials 256 --guidance coverage --initial-trials 4
+
 # Run the UI server contract tests
 just ui-test
 
@@ -69,6 +76,7 @@ ctest --test-dir build --output-on-failure
 
 - [`examples/single_node/`](examples/single_node/) – Transactional WAL storage engine (crash durability & OOM fault injection).
 - [`examples/distributed/`](examples/distributed/) – Replicated consensus cluster (network partitions & message reordering). `just rkv-campaign` runs its real swarm + process/network campaign and exports it for the UI.
+- [`tools/exploration_campaign.cpp`](tools/exploration_campaign.cpp) – Coverage-guided corpus and fork-COW snapshot branch exporter for the UI exploration view.
 
 ## LLM Usage Policy
 

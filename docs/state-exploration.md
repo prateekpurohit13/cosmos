@@ -488,13 +488,31 @@ Level 1 might run 10,000 seeds and never exercise the error-handling branch insi
 
 ---
 
+### Implementation status (level 2)
+
+Delivered in `include/cosmos/coverage.hpp`, `src/cosmos/coverage.cpp`, `tests/test_coverage.cpp`
+and the guided path in `include/cosmos/campaign.hpp`:
+
+- Clang uses `-fsanitize-coverage=trace-pc-guard`; GCC, which does not implement guard coverage,
+  uses `-fsanitize-coverage=trace-pc` with a return address normalized against a fixed anchor.
+- The map is a fixed 64 KiB bitmap per process. Callbacks only set a bit and count an edge; they
+  never allocate, so recording is safe while a universe is current.
+- `CampaignConfig::guidance = SeedGuidance::Coverage` runs the initial seeded universes, retains
+  seeds whose bitmap adds an edge, and derives later seeds from the corpus. `CampaignReport`
+  carries the corpus and coverage summary; `tools/exploration_campaign.cpp` and
+  `just rkv-campaign --guidance coverage` export it.
+- The corpus is capped by `CampaignConfig::max_corpus`. Guided selection is sequential because the
+  next seed depends on the previous novelty result; a seeded campaign that merely collects
+  coverage keeps its parallel workers. Coverage is observation data: it is not part of
+  `trace_hash` or the canonical replay input.
+
 ## 6. Level 3 — Snapshot Branching / Multiverse (Phase 5v3)
 
 ### What It Is
 
 The most powerful exploration mode. Instead of running every universe from scratch, the engine **forks** an execution at a choice point, explores one branch, then **rewinds** to the fork point and explores another branch — without replaying from the beginning.
 
-This is what Antithesis does at the hypervisor level (full VM memory snapshots). Cosmos does it in-process via explicit heap + RNG + event queue serialization.
+This is what Antithesis does at the hypervisor level (full VM memory snapshots). Cosmos uses the fork-COW variant: a checkpoint process owns the heap, fiber stacks and queues, and a branch child starts from that image. Host storage is made private to each branch because fork does not isolate it.
 
 ### The Core Insight
 
@@ -725,14 +743,51 @@ The snapshot must capture all of this and restore it exactly. Two implementation
 
 | Strategy | How | Trade-off |
 |---|---|---|
-| **Stack copy** | `memcpy` the full fiber stack into `FiberSnapshot::stack_bytes` | Simple; works for any fiber library |
-| **`fork()` COW** | `fork()` the process at the snapshot point; child explores branch A, parent explores branch B via COW pages | Zero copy cost; requires careful fd/signal cleanup |
+| **Stack copy** | `memcpy` the full fiber stack into `FiberSnapshot::stack_bytes` | Simple only if every live allocation is address-stable; the tracked heap is not. |
+| **`fork()` COW** | `fork()` the process at the snapshot point; a branch child explores one continuation via COW pages | Zero copy cost; requires careful fd/signal cleanup and explicit host-file isolation. |
 
-Phase 5v3 starts with stack copy (simpler, fully in-process) and may graduate to `fork()` COW for larger heaps.
+Cosmos implements the fork-COW variant. A snapshot is a live checkpoint process, `explore()` forks one branch child, and tracked host files are copied into a branch-private directory before the child runs.
 
 > **Scheduler design constraint:** "works for any fiber library" is true only of the *mechanism*, not the *scheduler*. Stack-copy snapshots require the Phase 1 fiber scheduler to be designed snapshot-first: each fiber on an isolated, contiguous stack, saved context as plain data (ucontext/assembly swapcontext, not a library with hidden per-fiber state), and no fiber-local TLS or side tables that a restore would miss. This must be pinned as a Phase 1 scheduler requirement, or Level 3 will have to rewrite the scheduler.
 
 ---
+
+### Implementation status (level 3)
+
+Delivered in `include/cosmos/snapshot.hpp`, `src/cosmos/snapshot.cpp`, `tests/test_snapshot.cpp`
+and `tools/exploration_campaign.cpp`. The implementation uses the fork-COW variant the design
+permits rather than an in-process heap/stack copy:
+
+- `Snapshot::capture()` forks a live checkpoint process. The heap, every fiber stack and register
+  set, the scheduler queues, the RNGs, the injector and in-flight network packets are captured by
+  copy-on-write. `Snapshot::explore()` asks that process for a branch child and returns a
+  `ScenarioReport`.
+- Host storage is the one boundary fork does not isolate. Capture copies every tracked file and
+  records open descriptor flags/offsets. Each branch gets its own file copies; existing descriptors
+  are replaced with descriptors on those copies and later calls to the wrapped `open*` symbols are
+  redirected by the storage wrapper. A branch therefore starts from the captured bytes without
+  reading or writing the parent's tracked paths and open-file descriptions. The parent may continue
+  after capture. Unwrapped path APIs (`fopen`, `openat`, `creat`, libstdc++ stream internals) remain
+  outside the interposition contract and are not isolated.
+- `BranchContext` can force one ready-queue index, reseed the schedule stream after that choice,
+  and carries a branch identity. `SimSubstrate` implements the `ISubstrate` seam from
+  `docs/architecture.md`.
+- Capture is accepted only at the main-fiber boundary with no active drain. A capture inside a
+  fiber or during `run_until_quiescence()` is refused rather than forking a context the scheduler
+  cannot resume safely.
+- A branch starts a fresh report (`Scenario::begin_branch_report`) so pre-snapshot checks are not
+  branch evidence. Its trace is the suffix from the snapshot; the hash is not comparable to a
+  per-universe canonical identity.
+- Path isolation covers tracked descriptors plus wrapped `open`, `open64`, `openat`, `creat`,
+  `unlink`, `rename`, `truncate` and `truncate64`. The application's simulation link must pass the
+  matching `-Wl,--wrap=` flags; libcosmos provides the symbols but cannot add linker flags to a
+  consumer. Untracked descriptors inherited from outside the model, `dup` of an unwrapped
+  descriptor, `mmap`, `fopen` and libstdc++ stream internals are outside the interposition
+  contract. Capture also copies untracked regular descriptors whose paths are reachable through
+  procfs into the branch image, so a branch cannot inherit an unmodelled open file by accident.
+- `exploration.json` is an additive artifact containing the coverage corpus, snapshot metadata and
+  branch summaries. It is not read by replay, minimization or `trace_hash`. Branch trace hashes
+  cover only the continuation from the snapshot and are not comparable to per-universe identities.
 
 ## 7. Prerequisites and Dependency Order
 

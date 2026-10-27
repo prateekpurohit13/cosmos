@@ -194,7 +194,7 @@ Under `libcosmos`, determinism is guaranteed **if** application code obeys these
 | 2 | **Simulated Network & Socket Wrapping**: Linker wrapping for `socket`, `bind`, `connect`, `send`, `recv`; latency/loss/reorder/partition faults | Ping-pong application survives network faults deterministically |
 | 3 | **Workloads & Campaign Runner**: `gen::*` combinators, multi-core parallel campaign runner, repro CLI, double-run trace verification | 10k-seed campaign across cores; findings replay exactly |
 | 4 | **Simulated Storage & File Wrapping**: Linker wrapping for `open`, `read`, `write`, `fsync`; torn writes and crash durability model — **delivered in P5.5 (2026-10-21)** | KV store example detects lost-write bug under crash faults ✅ |
-| 5 | **Exploration v2/v3**: Sancov guidance, `Snapshot` branching, decision-log minimization, chrome-trace export | Minimized repro traces and branching map |
+| 5 | **Exploration v2/v3**: coverage-guided seed selection, fork-COW `Snapshot` branching, decision-log minimization, chrome-trace export — coverage guidance and snapshot branching delivered in the exploration pass; chrome-trace export remains | Minimized repro traces and branching map |
 | 6 | **Production Hardening**: Full native production build verification, packaging, comprehensive documentation | Example app runs reliably in both test and prod modes |
 | 7 | **Hypervisor Substrate**: `KvmSubstrate : ISubstrate` - run unmodified VM binaries deterministically | Reuses Phases 1-5 engine |
 
