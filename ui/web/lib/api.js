@@ -59,6 +59,10 @@ export const api = {
     return getJson(campaignPath(campaignId), signal);
   },
 
+  exploration(campaignId, signal) {
+    return getJson(`${campaignPath(campaignId)}/exploration`, signal);
+  },
+
   universe(campaignId, seed, signal) {
     return getJson(
       `${campaignPath(campaignId)}/universes/${encodeURIComponent(String(seed))}`,

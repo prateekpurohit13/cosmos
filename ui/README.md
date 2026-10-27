@@ -7,8 +7,9 @@ simulation semantics, canonical trace encoding, or `trace_hash` are touched.
 The v3 UI covers the campaign cockpit, universe explorer/detail, finding triage, the canonical
 fault timeline, deterministic replay controls, the finding → failed-check jump, two-universe
 compare, the exported minimization report, and the read-only state inspector over the versioned
-inspection stream. It does not include live streaming from a running campaign, minimization
-execution, snapshots or arbitrary state mutation. Breakpoint inspection runs in the separate
+inspection stream. Phase 4 adds the read-only exploration view: coverage corpus, snapshot branch
+tree and a two-branch summary diff. It does not include live streaming from a running campaign, minimization
+execution, or arbitrary state mutation. Breakpoint inspection runs in the separate
 single-universe `cosmos_inspect` process, not in the browser.
 
 ## Run it
@@ -24,6 +25,16 @@ checked-in `demo` campaign. To generate and serve the real replicated-KV campaig
 nix develop -c just rkv-campaign --trials 1024 --verify
 nix develop -c just ui build/ui-artifacts
 ```
+
+For a coverage-guided campaign with a fork-COW snapshot branch tree:
+
+```sh
+nix develop -c just exploration-campaign build/ui-artifacts/exploration 24
+nix develop -c just ui build/ui-artifacts
+```
+
+Then open `/campaigns/exploration/exploration`. The real replicated-KV campaign can also collect and
+guide coverage with `just rkv-campaign --guidance coverage --initial-trials 4`.
 
 The campaign harness uses swarm-sampled wrapper faults, sampled process/network episodes, real
 build provenance, canonical traces, the inspection event stream, final state and minimization
@@ -72,7 +83,12 @@ Two regenerations are byte-identical.
 | `/campaigns/<campaign-id>/universes/<seed>/minimization` | Exported minimization report |
 | `/campaigns/<campaign-id>/universes/<seed>/state` | State inspector and inspection event stream |
 | `/campaigns/<campaign-id>/compare?left=<seed>&right=<seed>` | Two-universe compare |
+| `/campaigns/<campaign-id>/exploration?left=<branch-id>&right=<branch-id>` | Coverage corpus and snapshot branch tree |
 | `/campaigns/<campaign-id>/findings/<assertion-id>` | Finding triage |
+
+The exploration API is `/api/campaigns/<campaign-id>/exploration`. A seeded campaign returns
+`present: false` with empty arrays; a missing or malformed `exploration.json` is an explicit state,
+not an empty success.
 
 All routes are deep-linkable. Explorer filters live in the query string (`status`, `finding`,
 `verify`, `q`, `page`). Timeline search and selection live in `q` and `event`. Compare keeps
@@ -261,9 +277,12 @@ runs it after the C++ suite.
 ## v3 limits
 
 - No live campaign ingestion; the server reads completed artifacts.
-- No minimization execution, snapshots, branching or arbitrary state mutation. Browser playback
-  and the state inspector are read-only. The separate `cosmos_inspect` tool can pause at a
-  scheduler boundary and records operator commands; it is not a browser control channel.
+- No minimization execution or arbitrary state mutation. Browser playback and the state inspector
+  are read-only. The separate `cosmos_inspect` tool can pause at a scheduler boundary and records
+  operator commands; it is not a browser control channel.
+- Snapshot branches are fork-COW observations from `exploration.json`, not canonical replay inputs.
+  The exploration view shows the branch method, coverage and checks; it never claims a branch is a
+  new universe or a replay of the canonical trace.
 - The artifact layout holds one minimization report per seed: if a seed fails several assertions,
   the first finding in report order is minimized and the writer rejects a second report for that
   seed. The finding view labels a report whose `finding_id` differs instead of showing it as that

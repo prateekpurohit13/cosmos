@@ -1999,3 +1999,55 @@ pre {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+
+/* Level-2/3 exploration: coverage corpus and fork-COW branch tree. */
+.branch-tree {
+  display: grid;
+  gap: 1rem;
+}
+
+.branch-snapshot {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.branch-snapshot__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.branch-snapshot__head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.branch-snapshot__meta {
+  margin: 0;
+  padding: 0.6rem 1rem;
+  color: var(--text-muted);
+  font: 0.78rem/1.5 var(--mono);
+  border-bottom: 1px solid var(--border);
+}
+
+.compare-selectors {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0 0 0.75rem;
+}
+
+.row--diff > * {
+  background: var(--amber-soft);
+}
+
+.input--sm {
+  min-width: 12rem;
+}

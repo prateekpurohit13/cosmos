@@ -6,6 +6,7 @@ import { timelineView } from "./views/timeline.js";
 import { minimizationView } from "./views/minimization.js";
 import { stateView } from "./views/state.js";
 import { compareView } from "./views/compare.js";
+import { explorationView } from "./views/exploration.js";
 import { findingView } from "./views/finding.js";
 import { errorView } from "./views/error.js";
 import { notFoundView } from "./views/not-found.js";
@@ -113,6 +114,8 @@ async function viewFor(route, signal) {
       return stateView({ campaignId: route.campaignId, seed: route.seed, signal });
     case "compare":
       return compareView({ campaignId: route.campaignId, signal });
+    case "exploration":
+      return explorationView({ campaignId: route.campaignId, signal });
     case "finding":
       return findingView({
         campaignId: route.campaignId,

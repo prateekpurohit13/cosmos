@@ -287,7 +287,16 @@ function wallTime(value) {
 }
 
 export async function campaignView({ campaignId, signal }) {
-  const data = await api.campaign(campaignId, signal);
+  const explorationFetch = api
+    .exploration(campaignId, signal)
+    .then((exploration) => ({ exploration, error: null }))
+    .catch((error) => (signal?.aborted ? Promise.reject(error) : { exploration: null, error }));
+  const [data, loadedExploration] = await Promise.all([
+    api.campaign(campaignId, signal),
+    explorationFetch,
+  ]);
+  const exploration = loadedExploration.exploration ?? { present: false };
+  const explorationError = loadedExploration.error;
   const manifest = data.manifest ?? {};
   const campaign = data.campaign ?? {};
   const universes = Array.isArray(data.universes) ? data.universes : [];
@@ -373,6 +382,48 @@ export async function campaignView({ campaignId, signal }) {
       tone: campaign.trace ? "ok" : "neutral",
     },
   ]);
+
+  const explorationPanel =
+    exploration.present || campaign.coverage?.enabled || explorationError
+      ? panel({
+          title: "Exploration",
+          subtitle: "Coverage corpus and fork-COW snapshot branches",
+          count: Array.isArray(exploration.branches) ? exploration.branches.length : 0,
+          actions: [
+            link(`/campaigns/${encodeURIComponent(campaignId)}/exploration`, "Open exploration", {
+              class: "btn btn--ghost btn--sm",
+            }),
+          ],
+          body: el(
+            "div",
+            {},
+            kvList([
+              ["Guidance", campaign.guidance || exploration.guidance || "seeded"],
+              [
+                "Coverage method",
+                campaign.coverage?.method || exploration.coverage?.method || "—",
+              ],
+              ["Unique edges", formatCount(campaign.coverage?.unique_edges ?? exploration.coverage?.unique_edges)],
+              ["Corpus", formatCount(campaign.coverage?.corpus_size ?? exploration.coverage?.corpus_size)],
+              ["Snapshots", formatCount((exploration.snapshots ?? []).length)],
+              ["Branches", formatCount((exploration.branches ?? []).length)],
+            ]),
+            explorationError
+              ? notice(
+                  "bad",
+                  "Exploration artifact could not be read",
+                  explorationError.message || String(explorationError),
+                )
+              : exploration.present
+                ? null
+                : notice(
+                    "info",
+                    "No branch artifact",
+                    "Coverage is present in the campaign report. Run the exploration exporter to add a snapshot branch tree.",
+                  ),
+          ),
+        })
+      : null;
 
   const findingsPanel = panel({
     title: "Findings",
@@ -471,6 +522,7 @@ export async function campaignView({ campaignId, signal }) {
       { class: "page" },
       header,
       stats,
+      explorationPanel,
       el("div", { class: "cockpit" }, findingsPanel, vacuityPanel),
       panel({
         title: "Site matrix",

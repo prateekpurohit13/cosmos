@@ -1583,5 +1583,201 @@ class EventArtifactCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["events"]["entries"][0]["task"], "18446744073709551615")
 
+class ExplorationArtifactCase(unittest.TestCase):
+    """Coverage/corpus and fork-COW branch documents are additive exploration artifacts."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        for campaign_id, with_exploration in (("explore", True), ("plain", False)):
+            campaign = cls.root / campaign_id
+            (campaign / "universes").mkdir(parents=True)
+            (campaign / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "campaign_id": campaign_id,
+                        "name": campaign_id,
+                        "complete": True,
+                        "build": {"id": "explore-build", "mode": "SIM"},
+                        "config": {"trials": 4, "trace": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (campaign / "campaign.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "campaign_id": campaign_id,
+                        "name": campaign_id,
+                        "runs": 4,
+                        "guidance": "coverage" if with_exploration else "seeded",
+                        "coverage": {
+                            "enabled": with_exploration,
+                            "method": "trace-pc" if with_exploration else "",
+                            "unique_edges": 9 if with_exploration else 0,
+                            "corpus_size": 2 if with_exploration else 0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (campaign / "universes.ndjson").write_text("", encoding="utf-8")
+            if with_exploration:
+                (campaign / "exploration.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "campaign_id": campaign_id,
+                            "guidance": "coverage",
+                            "coverage": {
+                                "enabled": True,
+                                "guidance": "coverage",
+                                "method": "trace-pc",
+                                "runs_with_coverage": 4,
+                                "total_edges": 20,
+                                "unique_edges": 9,
+                                "novel_runs": 2,
+                                "corpus_size": 2,
+                                "corpus": [
+                                    {
+                                        "seed": "11",
+                                        "parent_seed": None,
+                                        "index": 0,
+                                        "edges": 6,
+                                        "new_edges": 6,
+                                        "hash": "0x000000000000000b",
+                                        "generation": 0,
+                                        "finding": False,
+                                    },
+                                    {
+                                        "seed": "12",
+                                        "parent_seed": "11",
+                                        "index": 1,
+                                        "edges": 5,
+                                        "new_edges": 3,
+                                        "hash": "0x000000000000000c",
+                                        "generation": 1,
+                                        "finding": True,
+                                    },
+                                ],
+                            },
+                            "snapshots": [
+                                {
+                                    "id": 1,
+                                    "parent_id": 0,
+                                    "seed": "13",
+                                    "at_ns": 0,
+                                    "tasks": 3,
+                                    "ready": 2,
+                                    "blocked": 0,
+                                    "ready_choices": 2,
+                                    "heap_allocations": 0,
+                                    "heap_bytes": 0,
+                                    "endpoints": 0,
+                                    "pending_packets": 0,
+                                    "storage_files": 0,
+                                    "trace_decisions": 0,
+                                    "coverage_edges": 4,
+                                    "coverage_hash": "0x000000000000000d",
+                                    "method": "fork-cow",
+                                }
+                            ],
+                            "branches": [
+                                {
+                                    "id": "S1-B0",
+                                    "snapshot_id": 1,
+                                    "branch_index": 0,
+                                    "forced_choice": 0,
+                                    "seed": "13",
+                                    "status": "passed",
+                                    "no_check_failed": True,
+                                    "coverage": {"present": True, "edges": 4, "hash": "0x000000000000000e"},
+                                    "trace": {"traced": False, "hash": None},
+                                    "checks": [],
+                                },
+                                {
+                                    "id": "S1-B1",
+                                    "snapshot_id": 1,
+                                    "branch_index": 1,
+                                    "forced_choice": 1,
+                                    "seed": "13",
+                                    "status": "failed",
+                                    "no_check_failed": False,
+                                    "coverage": {"present": True, "edges": 4, "hash": "0x000000000000000f"},
+                                    "trace": {"traced": False, "hash": None},
+                                    "checks": [{"id": "order", "passed": False}],
+                                },
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+        cls.server = serve.create_server(cls.root, WEB_ROOT, "127.0.0.1", 0, quiet=True)
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever,
+            kwargs={"poll_interval": 0.02},
+            daemon=True,
+        )
+        cls.thread.start()
+        cls.host, cls.port = cls.server.server_address[:2]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+        cls.temp.cleanup()
+
+    def request(self, path: str):
+        connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    def test_exploration_document_is_served(self) -> None:
+        status, payload = self.request("/api/campaigns/explore/exploration")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["present"])
+        self.assertEqual(payload["campaign_id"], "explore")
+        self.assertEqual(payload["guidance"], "coverage")
+        self.assertEqual(len(payload["coverage"]["corpus"]), 2)
+        self.assertEqual(len(payload["snapshots"]), 1)
+        self.assertEqual(len(payload["branches"]), 2)
+        self.assertEqual(payload["branches"][1]["status"], "failed")
+
+    def test_missing_exploration_is_explicit(self) -> None:
+        status, payload = self.request("/api/campaigns/plain/exploration")
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["present"])
+        self.assertEqual(payload["campaign_id"], "plain")
+        self.assertEqual(payload["snapshots"], [])
+        self.assertEqual(payload["branches"], [])
+
+    def test_malformed_exploration_is_rejected(self) -> None:
+        path = self.root / "explore" / "exploration.json"
+        original = json.loads(path.read_text())
+        try:
+            for mutation in ("campaign_id", "branch_status", "corpus_entry"):
+                document = json.loads(json.dumps(original))
+                if mutation == "campaign_id":
+                    document["campaign_id"] = "other"
+                elif mutation == "branch_status":
+                    document["branches"][0]["status"] = "unknown"
+                else:
+                    document["coverage"]["corpus"][0] = "not-an-object"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                status, payload = self.request("/api/campaigns/explore/exploration")
+                self.assertEqual(status, 500)
+                self.assertEqual(payload["error"]["code"], "artifact_exploration_malformed")
+        finally:
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+
 if __name__ == "__main__":
     unittest.main()

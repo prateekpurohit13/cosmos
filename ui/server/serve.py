@@ -53,6 +53,10 @@ MAX_SAFE_JS_INTEGER = (1 << 53) - 1
 # report larger than this is refused rather than materialized in the browser.
 MAX_MINIMIZATION_BYTES = 8 * 1024 * 1024
 MAX_MINIMIZATION_ENTRIES = 100_000
+# Exploration is additive observation data (coverage corpus, snapshots, branch summaries). Bound
+# it so a malformed artifact cannot force the browser to hold an unbounded document.
+MAX_EXPLORATION_BYTES = 8 * 1024 * 1024
+MAX_EXPLORATION_ENTRIES = 5_000
 assert TRACE_HEADER_BYTES == 17
 assert TRACE_ENTRY_BYTES == 43
 
@@ -1412,6 +1416,105 @@ def _read_minimization(
     }
 
 
+def _exploration_payload(root: Path, campaign_id: str) -> dict[str, Any]:
+    """Read the optional level-2/3 exploration document.
+
+    Absence is an explicit ``present: false``, not a 404 or an empty success: a seeded campaign
+    predates coverage and branching and is still a valid artifact.
+    """
+    campaign_dir = _campaign_dir(root, campaign_id)
+    _read_manifest(campaign_dir, campaign_id)
+    path = _artifact_file(campaign_dir, "exploration.json")
+    if not path.exists():
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "campaign_id": campaign_id,
+            "present": False,
+            "guidance": None,
+            "coverage": None,
+            "snapshots": [],
+            "branches": [],
+        }
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_unreadable",
+            f"exploration.json could not be inspected: {exc.strerror or exc}",
+        ) from exc
+    if size > MAX_EXPLORATION_BYTES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_too_large",
+            f"exploration.json is {size} bytes; this UI supports at most {MAX_EXPLORATION_BYTES}",
+        )
+    document = _read_json_object(path, "exploration.json")
+    if document.get("schema_version") != SCHEMA_VERSION:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_malformed",
+            "exploration.json does not declare schema_version 1",
+        )
+    if document.get("campaign_id") != campaign_id:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_malformed",
+            "exploration.json names a different campaign",
+        )
+    snapshots = document.get("snapshots", [])
+    branches = document.get("branches", [])
+    if not isinstance(snapshots, list) or not isinstance(branches, list):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_malformed",
+            "exploration.json snapshots and branches must be arrays",
+        )
+    if len(snapshots) > MAX_EXPLORATION_ENTRIES or len(branches) > MAX_EXPLORATION_ENTRIES:
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_too_large",
+            "exploration.json has too many snapshots or branches",
+        )
+    if any(not isinstance(item, dict) or not isinstance(item.get("id"), int) for item in snapshots):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_malformed",
+            "exploration.json snapshots must be objects with an integer id",
+        )
+    statuses = {"passed", "failed", "crashed", "threw", "error", "vacuous"}
+    if any(
+        not isinstance(item, dict) or item.get("status") not in statuses
+        for item in branches
+    ):
+        raise ArtifactError(
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "artifact_exploration_malformed",
+            "exploration.json branches must be objects with a known status",
+        )
+    coverage = document.get("coverage")
+    if coverage is not None:
+        if not isinstance(coverage, dict):
+            raise ArtifactError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "artifact_exploration_malformed",
+                "exploration.json coverage must be an object or null",
+            )
+        corpus = coverage.get("corpus", [])
+        if (
+            not isinstance(corpus, list)
+            or len(corpus) > MAX_EXPLORATION_ENTRIES
+            or any(not isinstance(item, dict) for item in corpus)
+        ):
+            raise ArtifactError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "artifact_exploration_malformed",
+                "exploration.json coverage corpus must be a bounded array of objects",
+            )
+    document["present"] = True
+    return document
+
+
 def _minimization_payload(root: Path, campaign_id: str, seed_text: str) -> dict[str, Any]:
     campaign_dir = _campaign_dir(root, campaign_id)
     manifest = _read_manifest(campaign_dir, campaign_id)
@@ -1546,6 +1649,8 @@ class UIRequestHandler(SimpleHTTPRequestHandler):
                     payload = _campaign_payload(self.server.artifact_root, campaign_id)
                 elif len(segments) == 4 and segments[3] == "universes":
                     payload = _universes_payload(self.server.artifact_root, campaign_id)
+                elif len(segments) == 4 and segments[3] == "exploration":
+                    payload = _exploration_payload(self.server.artifact_root, campaign_id)
                 elif len(segments) == 5 and segments[3] == "universes":
                     payload = _universe_payload(
                         self.server.artifact_root, campaign_id, segments[4]
