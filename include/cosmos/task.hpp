@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <pthread.h>
 #include <sched.h>
 #include <ucontext.h>
@@ -182,6 +183,25 @@ class Scheduler {
 
     void yield();
 
+    // Branch exploration seam (docs/state-exploration.md §6). A snapshot records the ready set
+    // and the next scheduler choice; a branch can force one specific ready index instead of
+    // drawing from the schedule stream. The override is consumed by exactly one choice.
+    void force_next_choice(uint64_t index) {
+        forced_choice_ = index;
+        forced_choice_used_ = false;
+    }
+    void clear_forced_choice() {
+        forced_choice_.reset();
+        forced_choice_used_ = false;
+    }
+    bool has_forced_choice() const { return forced_choice_.has_value(); }
+    // True only when pick_next_ready() actually consumed a forced index. A request that never met
+    // a choice, or met a one-element ready queue, reports false.
+    bool forced_choice_used() const { return forced_choice_used_; }
+    // Replaces the schedule stream for a branch that wants a different continuation after its
+    // forced first choice. The snapshot's stream is otherwise preserved.
+    void reseed_schedule(uint64_t seed) { schedule_rng_ = Rng(seed); }
+
     // Blocking sleeps. Validation mirrors VirtualClock so wrappers stay thin.
     // nanosleep convention: 0 or -1 with errno. clock_nanosleep convention:
     // error number directly.
@@ -193,6 +213,10 @@ class Scheduler {
     void run_until_quiescence();
 
     bool deadlocked() const { return deadlocked_; }
+    // Snapshot capture is only safe at the main-fiber boundary. Capturing inside a fiber would
+    // fork that fiber's stack as the branch's main context, and capturing during a drain would
+    // leave drain_requester_ set in the child so its first drain returns immediately.
+    bool can_capture() const { return current_ == &main_task_ && drain_requester_ == nullptr; }
     Task* current_task() { return current_; }
     const Task* current_task() const { return current_; }
     Rng& schedule_rng() { return schedule_rng_; }
@@ -252,6 +276,8 @@ class Scheduler {
     [[noreturn]] void abort_deadlock(const char* what);
 
     Rng schedule_rng_;
+    std::optional<uint64_t> forced_choice_{};
+    bool forced_choice_used_ = false;
     VirtualClock& clock_;
     Task main_task_;
     Task* current_ = nullptr;

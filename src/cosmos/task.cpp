@@ -137,10 +137,26 @@ Task* Scheduler::pick_next_ready() {
         return drain_requester_;
     }
     if (ready_.size() == 1) {
+        forced_choice_.reset();
         Task* task = ready_.back();
         ready_.pop_back();
         return task;
     }
+    if (forced_choice_.has_value() && *forced_choice_ < ready_.size()) {
+        const size_t index = static_cast<size_t>(*forced_choice_);
+        forced_choice_.reset();
+        forced_choice_used_ = true;
+        Task* task = ready_[index];
+        ready_.erase(ready_.begin() + static_cast<ptrdiff_t>(index));
+        record_task(event_sink_, EventKind::scheduler_choice, clock_.now(), task,
+                    EventPayload{.subject = static_cast<uint64_t>(index),
+                                 .related = 0,
+                                 .value = static_cast<uint64_t>(ready_.size()),
+                                 .extra = 1,
+                                 .amount_ns = 0});
+        return task;
+    }
+    forced_choice_.reset();
     const uint64_t idx = schedule_rng_.range(0, ready_.size() - 1);
     Task* task = ready_[static_cast<size_t>(idx)];
     ready_.erase(ready_.begin() + static_cast<ptrdiff_t>(idx));

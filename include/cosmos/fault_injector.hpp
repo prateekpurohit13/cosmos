@@ -141,6 +141,8 @@ template <ClockLike Clock> class BasicFaultInjector {
         return true;
     }
     bool quiescing() const { return quiescing_; }
+    bool faults_quiet() const { return quiet_depth_ > 0 || quiescing_; }
+    int quiet_depth() const { return quiet_depth_; }
     size_t active_episodes() const { return active_count_; }
     bool arm_scheduled() {
         if (cfg_.scheduled_episodes.size() > kMaxScheduledEpisodes) return false;

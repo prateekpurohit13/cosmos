@@ -129,6 +129,33 @@ void record_storage_event(cosmos::Simulator* sim, cosmos::EventKind kind, int fd
     cosmos::wrappers::record_event(sim, kind, payload);
 }
 
+// A snapshot branch redirects captured paths to branch-private copies. Keep the ordinary path
+// allocation-free: an empty redirect map is the normal case.
+struct ResolvedPath {
+    const char* original = nullptr;
+    std::string storage{};
+    bool redirected = false;
+    bool invalid = false;
+
+    // Dereference only after the object has reached its final location; the storage string may
+    // have moved and its old SSO pointer would be dangling.
+    const char* value() const {
+        if (invalid) return "";
+        return redirected ? storage.c_str() : original;
+    }
+};
+
+ResolvedPath resolve_open_path(cosmos::Simulator* sim, const char* pathname, int flags) {
+    ResolvedPath resolved;
+    resolved.original = pathname;
+    if (sim->storage().has_redirects()) {
+        resolved.storage = sim->storage().redirect_path(pathname, (flags & O_CREAT) != 0);
+        resolved.redirected = true;
+        resolved.invalid = resolved.storage.empty();
+    }
+    return resolved;
+}
+
 // A successful open can land on fd 0 after the application closed stdin. The descriptor is then
 // the application's file, not the harness stream, so stdin ownership must be released first.
 void note_open_result(cosmos::Simulator* sim, int fd, const char* path, int flags) {
@@ -145,6 +172,12 @@ int __real_open(const char* pathname, int flags, ...);
 int __real_open64(const char* pathname, int flags, ...);
 int __real___open_2(const char* pathname, int flags);
 int __real___open64_2(const char* pathname, int flags);
+int __real_openat(int dirfd, const char* pathname, int flags, ...);
+int __real_creat(const char* pathname, mode_t mode);
+int __real_unlink(const char* pathname);
+int __real_rename(const char* oldpath, const char* newpath);
+int __real_truncate(const char* pathname, off_t length);
+int __real_truncate64(const char* pathname, off64_t length);
 ssize_t __real_read(int fd, void* buf, size_t count);
 ssize_t __real___read_chk(int fd, void* buf, size_t count, size_t buflen);
 ssize_t __real_write(int fd, const void* buf, size_t count);
@@ -191,8 +224,9 @@ int __wrap_open(const char* pathname, int flags, ...) {
         break; // None, or an unknown kind: the real call goes through unchanged.
     }
     // Only a successful open registers: a faulted open returned above and creates nothing.
-    const int fd = __real_open(pathname, flags, mode);
-    note_open_result(sim, fd, pathname, flags);
+    const ResolvedPath resolved = resolve_open_path(sim, pathname, flags);
+    const int fd = __real_open(resolved.value(), flags, mode);
+    note_open_result(sim, fd, resolved.value(), flags);
     if (fd >= 0) {
         record_storage_event(sim, cosmos::EventKind::storage_open, fd,
                              cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
@@ -234,8 +268,9 @@ int __wrap_open64(const char* pathname, int flags, ...) {
     default:
         break; // None, or an unknown kind: the real call goes through unchanged.
     }
-    const int fd = __real_open64(pathname, flags, mode);
-    note_open_result(sim, fd, pathname, flags);
+    const ResolvedPath resolved = resolve_open_path(sim, pathname, flags);
+    const int fd = __real_open64(resolved.value(), flags, mode);
+    note_open_result(sim, fd, resolved.value(), flags);
     if (fd >= 0) {
         record_storage_event(sim, cosmos::EventKind::storage_open, fd,
                              cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
@@ -260,8 +295,9 @@ int __wrap___open_2(const char* pathname, int flags) {
     default:
         break;
     }
-    const int fd = __real___open_2(pathname, flags);
-    note_open_result(sim, fd, pathname, flags);
+    const ResolvedPath resolved = resolve_open_path(sim, pathname, flags);
+    const int fd = __real___open_2(resolved.value(), flags);
+    note_open_result(sim, fd, resolved.value(), flags);
     if (fd >= 0) {
         record_storage_event(sim, cosmos::EventKind::storage_open, fd,
                              cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
@@ -286,13 +322,92 @@ int __wrap___open64_2(const char* pathname, int flags) {
     default:
         break;
     }
-    const int fd = __real___open64_2(pathname, flags);
-    note_open_result(sim, fd, pathname, flags);
+    const ResolvedPath resolved = resolve_open_path(sim, pathname, flags);
+    const int fd = __real___open64_2(resolved.value(), flags);
+    note_open_result(sim, fd, resolved.value(), flags);
     if (fd >= 0) {
         record_storage_event(sim, cosmos::EventKind::storage_open, fd,
                              cosmos::EventPayload{.value = static_cast<uint64_t>(flags)});
     }
     return fd;
+}
+
+int __wrap_openat(int dirfd, const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+#if defined(O_TMPFILE)
+    const bool mode_needed = (flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE;
+#else
+    const bool mode_needed = (flags & O_CREAT) != 0;
+#endif
+    if (mode_needed) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = static_cast<mode_t>(va_arg(ap, int));
+        va_end(ap);
+    }
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic ||
+        dirfd == AT_FDCWD || pathname == nullptr || pathname[0] == '/') {
+        // The common case still goes through the open site so faults and redirection apply.
+        if (cosmos::Simulator::has_current() && !cosmos::wrappers::in_wrapper_logic &&
+            (dirfd == AT_FDCWD || (pathname != nullptr && pathname[0] == '/'))) {
+            return __wrap_open(pathname, flags, mode);
+        }
+        return __real_openat(dirfd, pathname, flags, mode);
+    }
+    // A relative openat needs the directory descriptor's path. Linux exposes it through procfs;
+    // if that fails, pass the call through unchanged rather than guessing a base.
+    const std::string proc = "/proc/self/fd/" + std::to_string(dirfd);
+    char target[4096];
+    const ssize_t length = ::readlink(proc.c_str(), target, sizeof(target) - 1);
+    if (length <= 0) return __real_openat(dirfd, pathname, flags, mode);
+    target[length] = '\0';
+    const std::string full = std::string(target) + "/" + pathname;
+    return __wrap_open(full.c_str(), flags, mode);
+}
+
+int __wrap_creat(const char* pathname, mode_t mode) {
+    return __wrap_open(pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
+}
+
+int __wrap_unlink(const char* pathname) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real_unlink(pathname);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+    auto* sim = cosmos::Simulator::current();
+    const std::string resolved = sim->storage().redirect_path(pathname);
+    return __real_unlink(resolved.c_str());
+}
+
+int __wrap_rename(const char* oldpath, const char* newpath) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real_rename(oldpath, newpath);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+    auto* sim = cosmos::Simulator::current();
+    const std::string old_resolved = sim->storage().redirect_path(oldpath);
+    const std::string new_resolved = sim->storage().redirect_path(newpath);
+    return __real_rename(old_resolved.c_str(), new_resolved.c_str());
+}
+
+int __wrap_truncate(const char* pathname, off_t length) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real_truncate(pathname, length);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+    auto* sim = cosmos::Simulator::current();
+    const std::string resolved = sim->storage().redirect_path(pathname);
+    return __real_truncate(resolved.c_str(), length);
+}
+
+int __wrap_truncate64(const char* pathname, off64_t length) {
+    if (!cosmos::Simulator::has_current() || cosmos::wrappers::in_wrapper_logic) {
+        return __real_truncate64(pathname, length);
+    }
+    cosmos::wrappers::ReentrancyGuard guard;
+    auto* sim = cosmos::Simulator::current();
+    const std::string resolved = sim->storage().redirect_path(pathname);
+    return __real_truncate64(resolved.c_str(), length);
 }
 
 ssize_t __wrap_read(int fd, void* buf, size_t count) {

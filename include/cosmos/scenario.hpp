@@ -19,6 +19,16 @@
 
 namespace cosmos {
 
+// Harness bookkeeping must not become a tracked application allocation or consume a live fault
+// draw. Scenario methods set the universe slot to null while they record results.
+struct UntrackedHarness {
+    Simulator* previous = nullptr;
+    UntrackedHarness() : previous(Simulator::current()) { Simulator::set_current(nullptr); }
+    ~UntrackedHarness() { Simulator::set_current(previous); }
+    UntrackedHarness(const UntrackedHarness&) = delete;
+    UntrackedHarness& operator=(const UntrackedHarness&) = delete;
+};
+
 using FaultPlan = FaultConfig;
 
 template <typename F>
@@ -140,6 +150,25 @@ class Scenario {
         workload();
     }
 
+    // Starts a fresh report for a snapshot branch. The parent's checks and coverage notes are
+    // evidence about the pre-snapshot run, not about a continuation; carrying them into a branch
+    // would let a branch that verified nothing look like it inherited a pass.
+    void begin_branch_report() {
+        const bool had_run = ran_;
+        report_ = ScenarioReport{};
+        report_.seed = sim_->seed();
+        ran_ = had_run;
+        quiesced_ = false;
+    }
+
+    // Drains the scheduler with faults still enabled, without marking the scenario quiesced. This
+    // is the continuation half of a snapshot branch: the snapshot owns the point where the
+    // workload stopped, and a branch chooses how the ready fibers run from there.
+    void drain() {
+        CurrentGuard guard(*this);
+        sim_->scheduler().run_until_quiescence();
+    }
+
     // §9.3's faults-off half, as a permanent quiet window, plus the fiber
     // drain: remaining tasks run to quiescence with faults OFF. Load-bearing
     // whenever the universe is made current again after the run — an oracle
@@ -217,9 +246,12 @@ class Scenario {
         }
         // Outside the guard: the harness's own bookkeeping must not become a block this universe
         // owns, or it contaminates the accounting it is about to report — and P2-S3's leak check.
-        if (!ok) sim_->record_application_event(EventKind::app_always, id, 0);
-        report_.checks.push_back(CheckResult{std::move(id), std::move(detail), ok, at});
-        if (!ok) report_.no_check_failed = false;
+        {
+            UntrackedHarness untracked;
+            if (!ok) sim_->record_application_event(EventKind::app_always, id, 0);
+            report_.checks.push_back(CheckResult{std::move(id), std::move(detail), ok, at});
+            if (!ok) report_.no_check_failed = false;
+        }
         return ok;
     }
 
@@ -238,6 +270,7 @@ class Scenario {
     // observing the world, so ordering it after quiesce would buy nothing and surprise the natural
     // "set a flag in the workload, note it straight after run()" pattern.
     void note_covered(std::string id, bool hit) {
+        UntrackedHarness untracked;
         sim_->record_application_event(EventKind::app_reachable, id, hit ? 1 : 0);
         report_.coverage.push_back(CoverageNote{std::move(id), hit});
     }
@@ -248,6 +281,7 @@ class Scenario {
     // Mid-run invariant violations land here: unlike check(), this needs no preceding quiesce, so
     // an `always` inside the workload is recorded the moment it fails.
     void record_violation(std::string id, std::string detail = "") {
+        UntrackedHarness untracked;
         sim_->record_application_event(EventKind::app_always, id, 0);
         report_.checks.push_back(CheckResult{std::move(id), std::move(detail), false, sim_->now()});
         report_.no_check_failed = false;
@@ -255,6 +289,7 @@ class Scenario {
 
     // Coalesced by id: a workload may call this in a loop, and only the OR across calls matters.
     void record_sometimes(std::string id, bool hit) {
+        UntrackedHarness untracked;
         if (hit) sim_->record_application_event(EventKind::app_sometimes, id, 1);
         for (CoverageNote& note : report_.coverage) {
             if (note.id == id) {
@@ -301,6 +336,7 @@ class Scenario {
     explicit Scenario(Simulator& sim) : sim_(&sim) { report_.seed = sim.seed(); }
 
     void record_lifecycle(std::string detail) {
+        UntrackedHarness untracked;
         report_.checks.push_back(CheckResult{kLifecycleId, std::move(detail), false, sim_->now()});
         report_.no_check_failed = false;
     }

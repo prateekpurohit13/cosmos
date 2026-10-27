@@ -9,6 +9,7 @@
 // and its returned ScenarioReport is the only channel back.
 
 #include "cosmos/assert.hpp"
+#include "cosmos/coverage.hpp"
 #include "cosmos/faults_json.hpp"
 #include "cosmos/inspection.hpp"
 #include "cosmos/ledger_print.hpp"
@@ -57,11 +58,64 @@ using UniverseFn = std::function<ScenarioReport(Simulator&, uint64_t universe_in
 // Same body with the cluster size from CampaignConfig::node_count, so a fixture cannot disagree.
 using NodeUniverseFn = std::function<ScenarioReport(Simulator&, uint64_t, uint32_t node_count)>;
 
+// Seeded fuzzing is level 1; coverage guidance is level 2 (docs/state-exploration.md §4–§5). The
+// seeded path keeps the existing forked slice runner. The guided path picks new seeds from a
+// novelty corpus and runs one universe at a time so the parent can make the next choice.
+enum class SeedGuidance : uint8_t { Seeded, Coverage };
+
+constexpr const char* name_of(SeedGuidance guidance) {
+    switch (guidance) {
+    case SeedGuidance::Seeded:
+        return "seeded";
+    case SeedGuidance::Coverage:
+        return "coverage";
+    }
+    return "seeded";
+}
+
+// One seed retained by the guided campaign because it added an edge the union did not have.
+struct CorpusEntry {
+    uint64_t seed = 0;
+    uint64_t parent_seed = 0; // zero for the initial batch
+    uint64_t index = 0;       // universe index that produced it
+    uint64_t edges = 0;
+    uint64_t new_edges = 0;
+    uint64_t hash = 0;
+    uint64_t generation = 0;
+    bool finding = false;
+    bool vacuous = false;
+};
+
+// Aggregate coverage facts. The corpus itself lives in CampaignReport::corpus. Per-universe
+// bitmaps cross the worker channel (64 KiB each) so the parent can compute novelty; only the
+// retained corpus is kept after selection.
+struct CoverageStats {
+    bool enabled = false;
+    uint64_t runs_with_coverage = 0;
+    uint64_t total_edges = 0;  // sum of per-run edge counts
+    uint64_t unique_edges = 0; // edges in the corpus union
+    uint64_t novel_runs = 0;   // runs that added at least one edge
+    uint64_t corpus_size = 0;
+    uint64_t corpus_dropped = 0; // novel runs not retained because the corpus was full
+    std::string method{};
+};
+
 struct CampaignConfig {
     uint64_t trials = 1000;
     uint64_t base_seed = 0;
     unsigned parallel = std::thread::hardware_concurrency();
     uint32_t node_count = 1;
+    // Level-2 exploration. Seeded runs the existing static slices. Coverage runs sequentially,
+    // selecting each next seed from the retained novelty corpus. `parallel` is ignored by the
+    // guided loop because the next seed depends on the previous result; the report records 1.
+    SeedGuidance guidance = SeedGuidance::Seeded;
+    // Collects a bitmap for every universe even without guidance. Guidance implies this.
+    bool coverage = false;
+    // Number of initial universe seeds before guided mutation begins. Zero means
+    // min(trials, 8).
+    uint64_t initial_trials = 0;
+    // The corpus is bounded so a long campaign cannot grow the parent without limit.
+    uint64_t max_corpus = 256;
     // Runs each universe twice and compares the full report and the canonical trace hash.
     // Implies tracing; a mismatch becomes a cosmos.campaign.verify finding.
     bool verify = false;
@@ -168,6 +222,11 @@ struct CampaignReport {
     bool events = false;
     uint64_t event_capacity = 0;
     bool state = false;
+    // Exploration intent and results. A seeded campaign leaves guidance at Seeded, coverage
+    // disabled, and an empty corpus.
+    SeedGuidance guidance = SeedGuidance::Seeded;
+    CoverageStats coverage{};
+    std::vector<CorpusEntry> corpus{};
 };
 
 namespace detail {
@@ -179,9 +238,10 @@ static_assert(kSiteCount <= 64, "activation set must fit the worker channel's u6
 struct UniverseOutcome {
     uint64_t index = 0;
     uint64_t seed = 0;
-    bool died = false; // produced no report: a signal, or an exit without one
-    int signal = 0;    // WTERMSIG when it died on a signal
-    std::string threw; // nonempty when the universe's body threw instead of reporting
+    bool died = false;        // produced no report: a signal, or an exit without one
+    int signal = 0;           // WTERMSIG when it died on a signal
+    bool fork_failed = false; // parent had to run it in-process; not crash-contained
+    std::string threw;        // nonempty when the universe's body threw instead of reporting
     uint64_t out_of_scope = 0;
     // Virtual time when the universe body returned. This is not a wall-clock duration, and the
     // UI must label it as virtual time (D10); wall_ns is the separate host measurement.
@@ -214,6 +274,12 @@ struct UniverseOutcome {
     // Canonical fault-trace bytes, present only when the run was asked to keep them. They are the
     // same bytes trace_hash() covers, so an artifact can be verified without re-running.
     std::string trace_bytes;
+    // Compiler coverage for this universe. Empty unless UniverseOptions::coverage is set.
+    bool coverage_present = false;
+    bool forced_choice_used = false; // branch snapshots only; campaign runs leave false
+    CoverageSnapshot coverage{};
+    // Snapshot branch children only. The campaign ignores it; snapshot.cpp owns the encoding.
+    std::string nested_payload;
     ScenarioReport report{};
 };
 
@@ -231,6 +297,8 @@ struct UniverseOptions {
     bool events = false;
     uint64_t event_capacity = 4096;
     bool state = false;
+    // Copies the compiler coverage bitmap into the outcome after the body returns.
+    bool coverage = false;
 };
 
 // Runs one universe in this process: the Simulator is per universe, so no state crosses between
@@ -245,6 +313,9 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
         Simulator sim(seed);
         sim.set_default_trace_options(options.trace);
         if (options.events) sim.enable_event_capture(options.event_capacity);
+        // Reset after the harness's own Simulator setup and before the body, so the bitmap
+        // describes the application plus the wrapper calls it makes, not campaign bookkeeping.
+        if (options.coverage) coverage_reset();
         const auto wall_start = std::chrono::steady_clock::now();
         try {
             outcome.report = build_fn(sim, index);
@@ -257,6 +328,12 @@ inline UniverseOutcome run_one_universe(uint64_t index, uint64_t seed, const Uni
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - wall_start)
                                       .count());
+        // Capture coverage before ledger rendering, event encoding or state serialization. Those
+        // are harness work compiled into the instrumented body and must not steer the corpus.
+        if (options.coverage) {
+            outcome.coverage_present = coverage_method() != "none";
+            outcome.coverage = coverage_snapshot();
+        }
         // Read while the universe still exists, and before the report is escaped or rendered: the
         // end time and the injector state die with the Simulator.
         outcome.ended_at = sim.now();
@@ -378,6 +455,11 @@ inline std::string verify_difference(const UniverseOutcome& first, const Univers
                ", second=" + std::to_string(second.trace_dropped) + " entries dropped)";
     }
     if (first.trace_hash != second.trace_hash) return "trace hash";
+    if (first.coverage_present != second.coverage_present) return "coverage presence";
+    if (first.coverage_present) {
+        if (first.coverage.hash != second.coverage.hash) return "coverage hash";
+        if (first.coverage.edges != second.coverage.edges) return "coverage edge count";
+    }
     return {};
 }
 
@@ -400,6 +482,11 @@ inline UniverseOutcome run_universe(uint64_t index, uint64_t seed, const Univers
 // The only place a finding is created or merged, so sequential and parallel runs cannot diverge.
 class CampaignAccumulator {
   public:
+    explicit CampaignAccumulator(bool collect_corpus = false, uint64_t corpus_limit = 256)
+        : collect_corpus_(collect_corpus), corpus_limit_(std::max<uint64_t>(1, corpus_limit)) {
+        coverage_union_.bits.assign(kCoverageBitmapBytes, 0);
+    }
+
     // Outcomes must arrive in ascending index so the "first universe" evidence is the lowest one.
     void add(const UniverseOutcome& outcome) {
         ++report_.runs;
@@ -447,6 +534,7 @@ class CampaignAccumulator {
             report_.activated_runs[slot] += universe.activated_sites.test(slot) ? 1 : 0;
         }
         report_.out_of_scope_assertions += outcome.out_of_scope;
+        if (outcome.coverage_present) observe_coverage(outcome);
     }
 
     // A complaint about the campaign itself, belonging to no single universe.
@@ -469,6 +557,17 @@ class CampaignAccumulator {
         for (const auto& [id, hit] : covered_) {
             if (!hit) report.never_hit.push_back(id);
         }
+        report.coverage.runs_with_coverage = coverage_runs_;
+        report.coverage.total_edges = coverage_total_edges_;
+        report.coverage.unique_edges = coverage_union_.edges;
+        report.coverage.novel_runs = coverage_novel_runs_;
+        report.coverage.corpus_size = corpus_.size();
+        report.coverage.corpus_dropped = corpus_dropped_;
+        if (coverage_runs_ > 0) {
+            report.coverage.enabled = true;
+            report.coverage.method = std::string(coverage_method());
+        }
+        if (collect_corpus_) report.corpus = corpus_;
         for (size_t slot = 0; slot < kWrapperSiteCount; ++slot) {
             VacuousSite site;
             site.site = site_at_slot(slot);
@@ -502,6 +601,31 @@ class CampaignAccumulator {
         return finding;
     }
 
+    void observe_coverage(const UniverseOutcome& outcome) {
+        ++coverage_runs_;
+        coverage_total_edges_ += outcome.coverage.edges;
+        const uint64_t novel = coverage_novelty(outcome.coverage, coverage_union_);
+        coverage_merge(coverage_union_, outcome.coverage);
+        if (novel > 0) ++coverage_novel_runs_;
+        if (!collect_corpus_) return;
+        if (corpus_.empty() || novel > 0) {
+            if (corpus_.size() < corpus_limit_) {
+                corpus_.push_back(CorpusEntry{.seed = outcome.seed,
+                                              .parent_seed = 0,
+                                              .index = outcome.index,
+                                              .edges = outcome.coverage.edges,
+                                              .new_edges = novel,
+                                              .hash = outcome.coverage.hash,
+                                              .generation = 0,
+                                              .finding = !outcome.report.no_check_failed ||
+                                                         !outcome.threw.empty() || outcome.died,
+                                              .vacuous = outcome.report.vacuous()});
+            } else {
+                ++corpus_dropped_;
+            }
+        }
+    }
+
     Finding& find_or_add(const std::string& id, const UniverseOutcome& outcome) {
         auto [position, inserted] = findings_.try_emplace(id);
         if (inserted) {
@@ -515,6 +639,14 @@ class CampaignAccumulator {
     std::map<std::string, Finding> findings_;
     std::map<std::string, bool> covered_;
     CampaignReport report_{};
+    bool collect_corpus_ = false;
+    uint64_t corpus_limit_ = 256;
+    std::vector<CorpusEntry> corpus_{};
+    CoverageSnapshot coverage_union_{};
+    uint64_t coverage_runs_ = 0;
+    uint64_t coverage_total_edges_ = 0;
+    uint64_t coverage_novel_runs_ = 0;
+    uint64_t corpus_dropped_ = 0;
 };
 
 // ---- the worker channel ----------------------------------------------------
@@ -598,6 +730,12 @@ inline std::string serialize_outcome(const UniverseOutcome& outcome) {
     put_text(bytes, outcome.event_bytes);
     put_text(bytes, outcome.events_error);
     put_text(bytes, outcome.state_json);
+    put_field(bytes, static_cast<uint8_t>(outcome.coverage_present ? 1 : 0));
+    put_field(bytes, outcome.coverage.edges);
+    put_field(bytes, outcome.coverage.hash);
+    put_text(bytes, std::string(outcome.coverage.bits.begin(), outcome.coverage.bits.end()));
+    put_field(bytes, static_cast<uint8_t>(outcome.forced_choice_used ? 1 : 0));
+    put_text(bytes, outcome.nested_payload);
     return bytes;
 }
 
@@ -743,6 +881,27 @@ class OutcomeReader {
         parsed.events_encoded = events_encoded != 0;
         if (parsed.events_encoded && !parsed.events_attached) return false;
         if (!parsed.events_encoded && !parsed.event_bytes.empty()) return false;
+
+        uint8_t coverage_present = 0;
+        if (!take(coverage_present) || !take(parsed.coverage.edges) ||
+            !take(parsed.coverage.hash)) {
+            return false;
+        }
+        parsed.coverage_present = coverage_present != 0;
+        std::string coverage_bytes;
+        if (!take_text(coverage_bytes)) return false;
+        if (parsed.coverage_present) {
+            if (coverage_bytes.size() != kCoverageBitmapBytes) return false;
+            parsed.coverage.bits.assign(coverage_bytes.begin(), coverage_bytes.end());
+        } else if (!coverage_bytes.empty()) {
+            return false;
+        }
+        uint8_t forced_choice_used = 0;
+        if (parse_offset_ < bytes_.size()) {
+            if (!take(forced_choice_used)) return false;
+        }
+        parsed.forced_choice_used = forced_choice_used != 0;
+        if (!take_text(parsed.nested_payload)) return false;
 
         outcome = std::move(parsed);
         return true;
@@ -893,16 +1052,52 @@ inline void recover_slice(uint64_t from, uint64_t to, uint64_t base_seed,
     }
 }
 
-} // namespace detail
+// Runs one arbitrary seed in a forked worker. The seeded slice runner maps index -> seed; guided
+// selection needs the seed as the input, because it is chosen by novelty rather than by position.
+inline UniverseOutcome run_isolated(uint64_t index, uint64_t seed, const UniverseFn& build_fn,
+                                    const UniverseOptions& options) {
+    UniverseOutcome outcome;
+    const int fd = open_scratch_file();
+    const pid_t pid = fd < 0 ? -1 : ::fork();
+    if (pid == 0) {
+        try {
+            const std::string record =
+                serialize_outcome(run_universe(index, seed, build_fn, options));
+            std::string bytes;
+            put_field(bytes, static_cast<uint64_t>(record.size()));
+            bytes += record;
+            if (!write_all(fd, bytes)) ::_exit(1);
+        } catch (...) {
+            ::_exit(1);
+        }
+        ::_exit(0);
+    }
+    if (pid < 0) {
+        if (fd >= 0) ::close(fd);
+        outcome = run_universe(index, seed, build_fn, options);
+        outcome.fork_failed = true;
+        return outcome;
+    }
+    int status = 0;
+    ::waitpid(pid, &status, 0);
+    OutcomeReader reader(fd);
+    if (!reader.next(outcome)) {
+        outcome.index = index;
+        outcome.seed = seed;
+        outcome.died = true;
+        outcome.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    }
+    ::close(fd);
+    return outcome;
+}
 
-// Refusing costs nothing and says so; running anyway would hand back a green campaign that never
-// checked what the flag names.
+} // namespace detail
 inline CampaignReport refused_report(const CampaignConfig& config, const char* detail) {
     CampaignReport report;
     report.refused = true;
     report.base_seed = config.base_seed;
     report.node_count = config.node_count;
-    report.parallel = config.parallel;
+    report.parallel = 1; // guided selection is sequential by construction
     report.program = config.program;
     report.verify = config.verify;
     report.id = config.id;
@@ -913,6 +1108,9 @@ inline CampaignReport refused_report(const CampaignConfig& config, const char* d
     report.event_capacity =
         report.events ? (config.event_capacity != 0 ? config.event_capacity : 4096) : 0;
     report.state = config.state;
+    report.guidance = config.guidance;
+    report.coverage.enabled = config.coverage || config.guidance == SeedGuidance::Coverage;
+    if (report.coverage.enabled) report.coverage.method = std::string(coverage_method());
     Finding finding;
     finding.id = kVerifyFailedId;
     finding.detail = detail;
@@ -1018,6 +1216,16 @@ inline void print_campaign_json(std::ostream& out, const CampaignReport& report)
     out << "  \"base_seed\": " << report.base_seed << ",\n";
     out << "  \"node_count\": " << report.node_count << ",\n";
     out << "  \"parallel\": " << report.parallel << ",\n";
+    out << "  \"guidance\": \"" << name_of(report.guidance) << "\",\n";
+    out << "  \"coverage\": {"
+        << "\"enabled\": " << (report.coverage.enabled ? "true" : "false") << ", \"method\": ";
+    detail::json_escape(out, report.coverage.method);
+    out << ", \"runs_with_coverage\": " << report.coverage.runs_with_coverage
+        << ", \"total_edges\": " << report.coverage.total_edges
+        << ", \"unique_edges\": " << report.coverage.unique_edges
+        << ", \"novel_runs\": " << report.coverage.novel_runs
+        << ", \"corpus_size\": " << report.coverage.corpus_size
+        << ", \"corpus_dropped\": " << report.coverage.corpus_dropped << "},\n";
     out << "  \"base_seed_dec\": ";
     detail::json_escape(out, json::decimal(report.base_seed));
     out << ",\n";
@@ -1074,6 +1282,117 @@ inline void print_campaign_json(std::ostream& out, const CampaignReport& report)
     out << "}\n";
 }
 
+// Level-2 exploration (docs/state-exploration.md §5). The first `initial_trials` universes are
+// seeded; after that each seed is derived from a corpus member and kept when its bitmap contains
+// an edge the union did not. Every run still crosses a fork, so a crash remains a finding.
+inline CampaignReport run_guided(const CampaignConfig& config, const UniverseFn& build_fn) {
+    const detail::UniverseOptions options{
+        .trace = {.enabled = config.verify || config.trace, .capacity = config.trace_capacity},
+        .verify = config.verify,
+        .keep_trace_bytes = config.trace && static_cast<bool>(config.on_universe),
+        .capture_metadata = static_cast<bool>(config.on_universe),
+        .events = config.events || config.state,
+        .event_capacity = config.event_capacity != 0 ? config.event_capacity : 4096,
+        .state = config.state,
+        .coverage = true,
+    };
+
+    detail::CampaignAccumulator accumulator;
+    const auto& sink = config.on_universe;
+    std::vector<CorpusEntry> corpus;
+    CoverageSnapshot union_bits;
+    union_bits.bits.assign(kCoverageBitmapBytes, 0);
+    const uint64_t max_corpus = std::max<uint64_t>(1, config.max_corpus);
+    const uint64_t initial =
+        std::min<uint64_t>(config.trials, config.initial_trials == 0 ? 8 : config.initial_trials);
+
+    uint64_t runs_with_coverage = 0;
+    uint64_t total_edges = 0;
+    uint64_t novel_runs = 0;
+    uint64_t corpus_dropped = 0;
+
+    auto record = [&](uint64_t index, uint64_t seed, uint64_t parent_seed, uint64_t generation) {
+        detail::UniverseOutcome outcome = detail::run_isolated(index, seed, build_fn, options);
+        if (outcome.fork_failed) {
+            accumulator.add_harness_finding(
+                kForkFailedId,
+                "fork() failed; that guided universe ran in-process and is not crash-contained");
+        }
+        accumulator.add(outcome);
+        if (sink) sink(outcome);
+        if (!outcome.coverage_present) return;
+        ++runs_with_coverage;
+        total_edges += outcome.coverage.edges;
+        const uint64_t novel = coverage_novelty(outcome.coverage, union_bits);
+        coverage_merge(union_bits, outcome.coverage);
+        if (novel > 0) ++novel_runs;
+        if (corpus.empty() || novel > 0) {
+            if (corpus.size() < max_corpus) {
+                corpus.push_back(CorpusEntry{.seed = seed,
+                                             .parent_seed = parent_seed,
+                                             .index = index,
+                                             .edges = outcome.coverage.edges,
+                                             .new_edges = novel,
+                                             .hash = outcome.coverage.hash,
+                                             .generation = generation,
+                                             .finding = !outcome.report.no_check_failed ||
+                                                        !outcome.threw.empty() || outcome.died,
+                                             .vacuous = outcome.report.vacuous()});
+            } else {
+                ++corpus_dropped;
+            }
+        }
+    };
+
+    for (uint64_t index = 0; index < initial; ++index) {
+        const uint64_t seed = universe_seed(config.base_seed, index);
+        record(index, seed, 0, 0);
+    }
+
+    // A fixed mutation stream makes the chosen parents and children a function of the campaign
+    // base seed, not of wall time or worker scheduling.
+    Rng mutation(stream_seed(config.base_seed, StreamDomain::Swarm));
+    for (uint64_t index = initial; index < config.trials; ++index) {
+        uint64_t parent_seed = 0;
+        uint64_t seed = universe_seed(config.base_seed, index);
+        if (!corpus.empty()) {
+            const CorpusEntry& parent =
+                corpus[static_cast<size_t>(mutation.range(0, corpus.size() - 1))];
+            parent_seed = parent.seed;
+            seed = derive_seed(parent_seed ^ mutation.next(), index + 1);
+        }
+        record(index, seed, parent_seed, index + 1);
+    }
+
+    CampaignReport report = accumulator.finish();
+    report.base_seed = config.base_seed;
+    report.node_count = config.node_count;
+    // Guided selection is sequential by construction: the next seed depends on the previous
+    // novelty result. Echo the worker count the caller requested, but do not imply it ran.
+    report.parallel = 1; // guided selection is sequential by construction
+    report.program = config.program;
+    report.verify = config.verify;
+    report.id = config.id;
+    report.name = config.name;
+    report.trace = config.verify || config.trace;
+    report.trace_capacity = config.trace_capacity;
+    report.events = config.events || config.state;
+    report.event_capacity =
+        report.events ? (config.event_capacity != 0 ? config.event_capacity : 4096) : 0;
+    report.state = config.state;
+    report.guidance = SeedGuidance::Coverage;
+    report.coverage.enabled = true;
+    report.coverage.runs_with_coverage = runs_with_coverage;
+    report.coverage.total_edges = total_edges;
+    report.coverage.unique_edges = union_bits.edges;
+    report.coverage.novel_runs = novel_runs;
+    report.coverage.corpus_size = corpus.size();
+    report.coverage.corpus_dropped = corpus_dropped;
+    report.coverage.method = std::string(coverage_method());
+    report.corpus = std::move(corpus);
+    return report;
+}
+
 class Campaign {
   public:
     static CampaignReport run(const CampaignConfig& config, const NodeUniverseFn& build_fn) {
@@ -1094,6 +1413,9 @@ class Campaign {
         if (config.events && config.event_capacity == 0) {
             return refused_report(config, "CampaignConfig::events needs event_capacity > 0");
         }
+        if (config.guidance == SeedGuidance::Coverage) {
+            return run_guided(config, build_fn);
+        }
         const detail::UniverseOptions options{
             .trace = {.enabled = config.verify || config.trace, .capacity = config.trace_capacity},
             .verify = config.verify,
@@ -1102,6 +1424,7 @@ class Campaign {
             .events = config.events || config.state,
             .event_capacity = config.event_capacity != 0 ? config.event_capacity : 4096,
             .state = config.state,
+            .coverage = config.coverage,
         };
         const auto& sink = config.on_universe;
 
@@ -1132,7 +1455,7 @@ class Campaign {
             launched.push_back(LaunchedWorker{slice, fd, pid});
         }
 
-        detail::CampaignAccumulator accumulator;
+        detail::CampaignAccumulator accumulator(config.coverage, config.max_corpus);
         for (const LaunchedWorker& worker : launched) {
             if (worker.pid > 0) {
                 int status = 0;
@@ -1174,6 +1497,9 @@ class Campaign {
         report.event_capacity =
             report.events ? (config.event_capacity != 0 ? config.event_capacity : 4096) : 0;
         report.state = config.state;
+        report.guidance = config.guidance;
+        report.coverage.enabled = config.coverage;
+        if (config.coverage) report.coverage.method = std::string(coverage_method());
         return report;
     }
 };

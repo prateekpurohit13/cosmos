@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fcntl.h>
+#include <filesystem>
 #include <string>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -290,6 +291,20 @@ void StorageModel::drop_unsynced(FileState& file) {
     file.unsynced.clear();
 }
 
+std::vector<std::string> StorageModel::tracked_paths() const {
+    std::vector<std::pair<uint64_t, std::string>> rows;
+    rows.reserve(files_.size());
+    for (const auto& [path, file] : files_)
+        rows.emplace_back(file.id, path);
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+    std::vector<std::string> paths;
+    paths.reserve(rows.size());
+    for (auto& row : rows)
+        paths.push_back(std::move(row.second));
+    return paths;
+}
+
 std::vector<FileInfo> StorageModel::file_infos() const {
     std::vector<FileInfo> infos;
     infos.reserve(files_.size());
@@ -299,12 +314,14 @@ std::vector<FileInfo> StorageModel::file_infos() const {
             (void)fd;
             if (fd_path == path) ++open_fds;
         }
+        auto display = display_paths_.find(path);
+        const std::string shown_path = display == display_paths_.end() ? path : display->second;
         uint64_t unsynced_bytes = 0;
         for (const WriteRecord& record : file.unsynced)
             unsynced_bytes += record.previous.size();
         infos.push_back(FileInfo{
             file.id,
-            path,
+            shown_path,
             file.node,
             static_cast<int64_t>(file.durable_size),
             static_cast<uint64_t>(file.unsynced.size()),
@@ -318,6 +335,136 @@ std::vector<FileInfo> StorageModel::file_infos() const {
     std::sort(infos.begin(), infos.end(),
               [](const FileInfo& left, const FileInfo& right) { return left.id < right.id; });
     return infos;
+}
+
+std::vector<OpenDescriptorInfo> StorageModel::open_descriptors() const {
+    std::vector<OpenDescriptorInfo> descriptors;
+    descriptors.reserve(fd_paths_.size());
+    for (const auto& [fd, path] : fd_paths_) {
+        const off_t offset = ::lseek(fd, 0, SEEK_CUR);
+        const int flags = ::fcntl(fd, F_GETFL);
+        const int fd_flags = ::fcntl(fd, F_GETFD);
+        if (offset < 0 || flags < 0 || fd_flags < 0) continue;
+        descriptors.push_back(OpenDescriptorInfo{fd, offset, flags, fd_flags, path});
+    }
+    std::sort(descriptors.begin(), descriptors.end(),
+              [](const OpenDescriptorInfo& left, const OpenDescriptorInfo& right) {
+                  return left.fd < right.fd;
+              });
+    return descriptors;
+}
+
+namespace {
+std::string canonicalize_path(std::string_view path) {
+    std::error_code error;
+    const std::filesystem::path requested(path);
+    const std::filesystem::path absolute = std::filesystem::absolute(requested, error);
+    if (error) return std::string(path);
+    return absolute.lexically_normal().string();
+}
+
+std::string private_name(const std::string& root, uint64_t id, std::string_view path) {
+    const std::filesystem::path original(path);
+    const std::string filename =
+        original.filename().empty() ? "file" : original.filename().string();
+    return root + "/new-" + std::to_string(id) + "-" + filename;
+}
+} // namespace
+
+void StorageModel::begin_branch_storage(std::string root,
+                                        const std::map<std::string, std::string>& redirects) {
+    branch_root_ = std::move(root);
+    branch_active_ = true;
+    std::error_code error;
+    std::filesystem::create_directories(branch_root_, error);
+    for (const auto& [source, private_path] : redirects) {
+        (void)private_path;
+        captured_paths_.insert(source);
+        captured_paths_.insert(canonicalize_path(source));
+    }
+    redirect_paths(redirects);
+}
+
+std::string StorageModel::redirect_path(std::string_view path, bool create) {
+    if (!branch_active_) return std::string(path);
+    const std::string canonical = canonicalize_path(path);
+    auto exact = redirects_.find(std::string(path));
+    if (exact != redirects_.end() && !exact->second.empty()) return exact->second;
+    auto normalized = redirects_.find(canonical);
+    if (normalized != redirects_.end() && !normalized->second.empty()) {
+        return normalized->second;
+    }
+    if (create) {
+        // An earlier read miss cached the absence; O_CREAT is allowed to create a private file.
+        const bool same =
+            exact != redirects_.end() && normalized != redirects_.end() && exact == normalized;
+        if (exact != redirects_.end()) redirects_.erase(exact);
+        if (normalized != redirects_.end() && !same) redirects_.erase(normalized);
+    }
+
+    std::error_code error;
+    const std::filesystem::path canonical_path(canonical);
+    const bool parent_exists =
+        std::filesystem::is_directory(canonical_path.parent_path(), error) && !error;
+    error.clear();
+    const bool is_directory = std::filesystem::is_directory(canonical_path, error) && !error;
+    if (!parent_exists || is_directory) {
+        // A new path whose real parent does not exist must still fail with ENOENT in the branch.
+        redirects_[std::string(path)].clear();
+        redirects_[canonical].clear();
+        return {};
+    }
+    const bool exists_on_host = std::filesystem::is_regular_file(canonical, error) && !error;
+    if (exists_on_host && !captured_paths_.contains(canonical) && !create) {
+        // The parent created or modified this path after the snapshot. Reading live bytes here
+        // would make the branch a function of parent progress rather than the captured image.
+        redirects_[std::string(path)].clear();
+        redirects_[canonical].clear();
+        return {};
+    }
+    const std::string private_path = private_name(branch_root_, next_new_file_++, path);
+    redirects_[std::string(path)] = private_path;
+    redirects_[canonical] = private_path;
+    display_paths_[private_path] = std::string(path);
+    const bool captured = captured_paths_.contains(canonical);
+    captured_paths_.insert(canonical);
+    if (exists_on_host && captured) {
+        // A path present at capture is copied; a path created in this branch stays empty until the
+        // application writes it. A post-capture parent path is not copied here.
+        std::filesystem::copy_file(canonical, private_path,
+                                   std::filesystem::copy_options::overwrite_existing, error);
+    }
+    return private_path;
+}
+
+std::string StorageModel::canonical_path(std::string_view path) const {
+    if (!branch_active_) return std::string(path);
+    const std::string canonical = canonicalize_path(path);
+    auto entry = redirects_.find(canonical);
+    if (entry != redirects_.end()) return entry->second;
+    entry = redirects_.find(std::string(path));
+    return entry == redirects_.end() ? canonical : entry->second;
+}
+
+void StorageModel::redirect_paths(const std::map<std::string, std::string>& redirects) {
+    if (redirects.empty()) return;
+    std::map<std::string, FileState> redirected;
+    for (auto& [path, file] : files_) {
+        auto entry = redirects.find(path);
+        const std::string& target = entry == redirects.end() ? path : entry->second;
+        redirected.emplace(target, std::move(file));
+    }
+    files_.swap(redirected);
+    for (auto& [fd, path] : fd_paths_) {
+        (void)fd;
+        auto entry = redirects.find(path);
+        if (entry != redirects.end()) path = entry->second;
+    }
+    for (const auto& [source, private_path] : redirects) {
+        redirects_[source] = private_path;
+        auto shown = display_paths_.find(source);
+        display_paths_[private_path] = shown == display_paths_.end() ? source : shown->second;
+    }
 }
 
 } // namespace cosmos
