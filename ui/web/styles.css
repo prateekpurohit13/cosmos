@@ -244,21 +244,6 @@ textarea {
   color: var(--line-strong);
 }
 
-.footer {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  justify-content: center;
-  padding: 2rem 1rem 2.5rem;
-  color: var(--faint);
-  font-family: var(--mono);
-  font-size: 0.7rem;
-}
-
-.footer__sep {
-  color: var(--line-strong);
-}
-
 .page {
   width: min(1480px, 100%);
   margin: 0 auto;

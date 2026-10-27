@@ -89,6 +89,7 @@ export async function campaignsView({ signal }) {
   const readable = campaigns.filter(
     (entry) => entry.readable !== false && !entry.catalog_error,
   ).length;
+  const unreadable = campaigns.length - readable;
 
   const body =
     campaigns.length > 0
@@ -110,19 +111,17 @@ export async function campaignsView({ signal }) {
       "div",
       { class: "page" },
       pageHeader({
-        eyebrow: "Cosmos / artifact root",
         title: "Campaigns",
-        subtitle:
-          "Read-only v1 artifacts. Pick a campaign to inspect findings, vacuity, and the universes behind them.",
       }),
-      statGrid([
-        { label: "Campaigns", value: formatCount(campaigns.length), tone: "accent" },
-        { label: "Readable", value: formatCount(readable) },
-        { label: "Unreadable", value: formatCount(campaigns.length - readable), tone: campaigns.length - readable ? "bad" : "neutral" },
-      ]),
+      unreadable > 0
+        ? statGrid([
+            { label: "Campaigns", value: formatCount(campaigns.length), tone: "accent" },
+            { label: "Readable", value: formatCount(readable) },
+            { label: "Unreadable", value: formatCount(unreadable), tone: "bad" },
+          ])
+        : null,
       panel({
         title: "Artifact campaigns",
-        subtitle: "Ordered by campaign id; no wall-clock or random ordering.",
         count: campaigns.length,
         body,
       }),
