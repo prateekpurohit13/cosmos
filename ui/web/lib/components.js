@@ -96,6 +96,7 @@ export function statGrid(items) {
 export function panel({
   title,
   subtitle,
+  hint,
   count,
   actions = [],
   body,
@@ -118,7 +119,7 @@ export function panel({
       el(
         "div",
         { class: "panel__heading" },
-        el("h2", { class: "panel__title" }, title),
+        el("h2", { class: "panel__title", ...(hint ? { title: hint } : {}) }, title),
         subtitle ? el("p", { class: "panel__subtitle" }, subtitle) : null,
       ),
       el(
@@ -263,13 +264,18 @@ export function reproIdentity(manifest, seed) {
   return parts.join(" ");
 }
 
-export function buildBadges(manifest) {
-  const config = manifest?.config ?? {};
+export function artifactBadges(manifest) {
   const badges = [];
   if (manifest?.complete === false) {
     badges.push(badge("incomplete", "warn", "The artifact writer did not finish."));
   }
   if (manifest?.error) badges.push(badge("write error", "bad", manifest.error));
+  return badges;
+}
+
+export function buildBadges(manifest) {
+  const config = manifest?.config ?? {};
+  const badges = artifactBadges(manifest);
   if (config.verify) badges.push(badge("verify", "verify", "Double-run verification was enabled."));
   if (config.trace) {
     badges.push(

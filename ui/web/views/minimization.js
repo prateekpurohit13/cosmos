@@ -313,7 +313,7 @@ export async function minimizationView({ campaignId, seed, signal }) {
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
-        label: manifest.name || campaignId,
+        label: campaignId,
         href: `/campaigns/${encodeURIComponent(campaignId)}`,
       },
       {

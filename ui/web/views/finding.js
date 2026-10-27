@@ -354,7 +354,7 @@ export async function findingView({ campaignId, findingId, signal }) {
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
-        label: campaign.name || campaignId,
+        label: campaignId,
         href: `/campaigns/${encodeURIComponent(campaignId)}`,
       },
       { label: finding.id || "Finding" },
@@ -492,7 +492,7 @@ export async function findingView({ campaignId, findingId, signal }) {
     : null;
 
   return {
-    title: `${finding.id || "Finding"} · ${campaign.name || campaignId} · Cosmos`,
+    title: `${finding.id || "Finding"} · ${campaignId} · Cosmos`,
     node: el(
       "div",
       { class: "page" },

@@ -986,17 +986,17 @@ export async function compareView({ campaignId, signal }) {
 
   if (rows.length === 0) {
     return {
-      title: `Compare · ${campaign.name || campaignId} · Cosmos`,
+      title: `Compare · ${campaignId} · Cosmos`,
       node: el(
         "div",
         { class: "page" },
         pageHeader({
           eyebrow: `Campaign / ${campaignId} / compare`,
           title: "Compare universes",
-          subtitle: campaign.name || campaignId,
+          subtitle: campaignId,
           crumbs: [
             { label: "Campaigns", href: "/" },
-            { label: campaign.name || campaignId, href: campaignHref(campaignId) },
+            { label: campaignId, href: campaignHref(campaignId) },
             { label: "Universes", href: `${campaignHref(campaignId)}/universes` },
             { label: "Compare" },
           ],
@@ -1240,11 +1240,11 @@ export async function compareView({ campaignId, signal }) {
     eyebrow: `Campaign / ${campaignId} / compare`,
     title: "Compare universes",
     subtitle:
-      `${campaign.name || campaignId} · ${formatCount(rows.length)} universes · ` +
+      `${campaignId} · ${formatCount(rows.length)} universes · ` +
       "read-only report, config and canonical-trace comparison",
     crumbs: [
       { label: "Campaigns", href: "/" },
-      { label: campaign.name || campaignId, href: campaignHref(campaignId) },
+      { label: campaignId, href: campaignHref(campaignId) },
       { label: "Universes", href: `${campaignHref(campaignId)}/universes` },
       { label: "Compare" },
     ],
@@ -1477,7 +1477,7 @@ export async function compareView({ campaignId, signal }) {
   });
 
   return {
-    title: `Compare · ${campaign.name || campaignId} · Cosmos`,
+    title: `Compare · ${campaignId} · Cosmos`,
     node: el(
       "div",
       { class: "page" },

@@ -478,7 +478,7 @@ export async function universeView({ campaignId, seed, signal }) {
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
-        label: campaign.name || campaignId,
+        label: campaignId,
         href: `/campaigns/${encodeURIComponent(campaignId)}`,
       },
       {
@@ -662,7 +662,7 @@ export async function universeView({ campaignId, seed, signal }) {
   });
 
   return {
-    title: `Universe #${formatCount(index)} · ${campaign.name || campaignId} · Cosmos`,
+    title: `Universe #${formatCount(index)} · ${campaignId} · Cosmos`,
     node: el(
       "div",
       { class: "page" },

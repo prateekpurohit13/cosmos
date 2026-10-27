@@ -741,35 +741,24 @@ textarea {
   background: var(--green);
 }
 
-.vacuity-list {
-  display: grid;
-  max-height: 34rem;
-  overflow: auto;
-  scrollbar-gutter: stable;
-}
-
-.vacuity {
-  padding: 0.65rem 0.8rem;
-  background: linear-gradient(90deg, var(--amber-soft), transparent 75%);
-}
-
-.vacuity + .vacuity {
-  border-top: 1px solid var(--line);
-}
-
-.vacuity__head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.4rem;
-}
-
-.vacuity__site {
-  color: var(--text);
+.vacuity-summary {
+  margin: 0 0 0.6rem;
+  color: var(--amber);
   font-family: var(--mono);
-  font-size: 0.82rem;
-  font-weight: 600;
+  font-size: 0.74rem;
+  letter-spacing: 0.03em;
+}
+
+.vacuity-advice {
+  margin: 0.6rem 0 0;
+  padding: 0;
+  color: var(--text-soft);
+  font-size: 0.74rem;
+  list-style: none;
+}
+
+.vacuity-advice li {
+  margin: 0;
 }
 
 .vacuity__reason {
@@ -778,19 +767,6 @@ textarea {
   font-size: 0.66rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-}
-
-.vacuity__counts {
-  margin-top: 0.2rem;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 0.68rem;
-}
-
-.vacuity__advice {
-  margin: 0.25rem 0 0;
-  color: var(--text-soft);
-  font-size: 0.74rem;
 }
 
 .never-hit {

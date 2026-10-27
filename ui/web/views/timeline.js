@@ -748,7 +748,7 @@ export async function timelineView({ campaignId, seed, signal }) {
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
-        label: campaign.name || campaignId,
+        label: campaignId,
         href: `/campaigns/${encodeURIComponent(campaignId)}`,
       },
       {
@@ -1548,7 +1548,7 @@ export async function timelineView({ campaignId, seed, signal }) {
   );
 
   return {
-    title: `Timeline · universe #${formatCount(universe.index)} · ${campaign.name || campaignId} · Cosmos`,
+    title: `Timeline · universe #${formatCount(universe.index)} · ${campaignId} · Cosmos`,
     node,
     destroy() {
       window.clearTimeout(searchTimer);

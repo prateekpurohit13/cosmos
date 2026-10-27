@@ -1,7 +1,7 @@
 import { api } from "../lib/api.js";
 import {
+  artifactBadges,
   badge,
-  buildBadges,
   classChip,
   copyButton,
   emptyState,
@@ -25,7 +25,6 @@ import {
   formatCount,
   formatPercent,
   formatRatio,
-  formatUnixNs,
 } from "../lib/format.js";
 import {
   compareSites,
@@ -148,25 +147,66 @@ function vacuityBody(campaign) {
       body: "Every site the configuration armed was reached and fired at least once. This is separate from findings.",
     });
   }
+  const reasons = new Map();
+  for (const site of vacuous) {
+    const reason = String(site.reason || "unknown");
+    reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+  }
+  const summary = [...reasons.entries()]
+    .map(([reason, count]) => `${formatCount(count)} ${reason.replace(/_/g, " ")}`)
+    .join(" · ");
   return el(
     "div",
-    { class: "vacuity-list" },
-    ...vacuous.map((site) =>
+    {},
+    el("p", { class: "vacuity-summary" }, summary),
+    el(
+      "div",
+      { class: "table-wrap" },
       el(
-        "article",
-        { class: "vacuity" },
+        "table",
+        { class: "data" },
         el(
-          "div",
-          { class: "vacuity__head" },
-          el("span", { class: "vacuity__site" }, site.site || "unknown"),
-          el("span", { class: "vacuity__reason" }, String(site.reason || "unknown")),
+          "caption",
+          { class: "sr-only" },
+          "Sites the configuration armed that were never activated, reached or fired",
         ),
         el(
-          "div",
-          { class: "vacuity__counts" },
-          `${formatCount(site.activated_runs)} activated · ${formatCount(site.eligible)} eligible · ${formatCount(site.fired)} fired`,
+          "thead",
+          {},
+          el(
+            "tr",
+            {},
+            el("th", { scope: "col" }, "Site"),
+            el("th", { scope: "col" }, "Reason"),
+          ),
         ),
-        el("p", { class: "vacuity__advice" }, vacuityAdvice(site.reason)),
+        el(
+          "tbody",
+          {},
+          ...vacuous.map((site) =>
+            el(
+              "tr",
+              {},
+              el("td", {}, el("span", { class: "mono" }, site.site || "unknown")),
+              el(
+                "td",
+                {},
+                el("span", { class: "vacuity__reason" }, String(site.reason || "unknown")),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    el(
+      "ul",
+      { class: "vacuity-advice" },
+      ...[...reasons.keys()].map((reason) =>
+        el(
+          "li",
+          {},
+          `${reason.replace(/_/g, " ")}: ${vacuityAdvice(reason)}`,
+        ),
       ),
     ),
   );
@@ -280,10 +320,6 @@ function findingsBody(campaign, campaignId, manifest, seedIndex) {
   );
 }
 
-function wallTime(value) {
-  return value ? `${formatUnixNs(value)} wall` : "—";
-}
-
 export async function campaignView({ campaignId, signal }) {
   const explorationFetch = api
     .exploration(campaignId, signal)
@@ -310,75 +346,56 @@ export async function campaignView({ campaignId, signal }) {
   const config = manifest.config ?? {};
 
 
-  const build = manifest.build ?? {};
-  const title = campaign.name || campaignId;
-  const subtitle = [
-    manifest.program || "unknown program",
-    `${formatCount(campaign.node_count)} nodes`,
-    `base seed ${config.base_seed ?? campaign.base_seed_dec ?? "—"}`,
-    `${formatCount(runs)} universes`,
-  ].join(" · ");
-
   const badges = [
-    ...buildBadges(manifest),
-    badge(`${formatCount(runs)} runs`, "plain"),
+    ...artifactBadges(manifest),
     campaign.refused ? badge("refused", "bad") : null,
   ].filter(Boolean);
 
   const header = pageHeader({
-    eyebrow: `Campaign / ${campaignId}`,
-    title,
-    subtitle,
+    title: campaignId,
     badges,
     actions: [
       link(`/campaigns/${encodeURIComponent(campaignId)}/universes`, "Universe explorer", {
         class: "btn btn--primary",
       }),
-      copyButton(String(config.base_seed ?? campaign.base_seed_dec ?? ""), "Copy base seed"),
     ],
   });
 
-  const stats = statGrid([
-    { label: "Runs", value: formatCount(campaign.runs), tone: "accent" },
-    {
-      label: "Failed",
-      value: formatCount(campaign.failed_runs),
-      note: formatPercent(campaign.failed_runs, runs),
-      tone: Number(campaign.failed_runs) > 0 ? "bad" : "ok",
-    },
-    {
-      label: "Crashed",
-      value: formatCount(campaign.crashed_runs),
-      tone: Number(campaign.crashed_runs) > 0 ? "bad" : "neutral",
-    },
-    {
-      label: "Findings",
-      value: formatCount(findings.length),
-      tone: findings.length > 0 ? "bad" : "ok",
-    },
-    {
-      label: "Never hit",
-      value: formatCount(neverHit.length),
-      tone: neverHit.length > 0 ? "warn" : "neutral",
-    },
-    {
-      label: "Vacuous sites",
-      value: formatCount(vacuous.length),
-      note: "separate from findings",
-      tone: vacuous.length > 0 ? "warn" : "ok",
-    },
-    {
-      label: "Out of scope",
-      value: formatCount(campaign.out_of_scope_assertions),
-      tone: Number(campaign.out_of_scope_assertions) > 0 ? "warn" : "neutral",
-    },
-    {
-      label: "Trace",
-      value: campaign.trace ? "on" : "off",
-      note: campaign.trace ? `capacity ${formatCount(campaign.trace_capacity)}` : "no canonical bytes",
-      tone: campaign.trace ? "ok" : "neutral",
-    },
-  ]);
+  const stats = statGrid(
+    [
+      { label: "Runs", value: formatCount(campaign.runs), tone: "accent" },
+      {
+        label: "Failed",
+        value: formatCount(campaign.failed_runs),
+        note: formatPercent(campaign.failed_runs, runs),
+        tone: Number(campaign.failed_runs) > 0 ? "bad" : "ok",
+      },
+      Number(campaign.crashed_runs) > 0
+        ? { label: "Crashed", value: formatCount(campaign.crashed_runs), tone: "bad" }
+        : null,
+      {
+        label: "Findings",
+        value: formatCount(findings.length),
+        tone: findings.length > 0 ? "bad" : "ok",
+      },
+      neverHit.length > 0
+        ? { label: "Never hit", value: formatCount(neverHit.length), tone: "warn" }
+        : null,
+      {
+        label: "Vacuous sites",
+        value: formatCount(vacuous.length),
+        note: "separate from findings",
+        tone: vacuous.length > 0 ? "warn" : "ok",
+      },
+      Number(campaign.out_of_scope_assertions) > 0
+        ? {
+            label: "Out of scope",
+            value: formatCount(campaign.out_of_scope_assertions),
+            tone: "warn",
+          }
+        : null,
+    ].filter(Boolean),
+  );
 
   const explorationPanel =
     exploration.present || campaign.coverage?.enabled || explorationError
@@ -424,14 +441,14 @@ export async function campaignView({ campaignId, signal }) {
 
   const findingsPanel = panel({
     title: "Findings",
-    subtitle: "Deduplicated by assertion id, ordered by prevalence then id.",
+    hint: "Deduplicated by assertion id, ordered by prevalence then id.",
     count: findings.length,
     body: findingsBody(campaign, campaignId, manifest, seedIndex),
   });
 
   const vacuityPanel = panel({
     title: "Vacuity",
-    subtitle: "Configuration facts, never findings",
+    hint: "Configuration facts, never findings",
     count: vacuous.length,
     tone: "warn",
     body: vacuityBody(campaign),
@@ -456,19 +473,15 @@ export async function campaignView({ campaignId, signal }) {
 
   const configPanel = panel({
     title: "Launch configuration",
-    subtitle: "Template, not the per-universe realized config",
+    hint: "Template, not the per-universe realized config",
     body: el(
       "div",
       {},
       kvList([
-        ["Program", manifest.program || "—"],
         ["Trials", formatCount(config.trials ?? campaign.runs)],
         ["Base seed", String(config.base_seed ?? campaign.base_seed_dec ?? "—")],
-        ["Parallel", formatCount(config.parallel)],
         ["Nodes", formatCount(config.node_count)],
         ["Verify", config.verify ? "double-run" : "off"],
-        ["Trace", config.trace ? `on · capacity ${formatCount(config.trace_capacity)}` : "off"],
-        ["Out-of-scope", formatCount(campaign.out_of_scope_assertions)],
       ]),
       el(
         "p",
@@ -478,42 +491,8 @@ export async function campaignView({ campaignId, signal }) {
     ),
   });
 
-  const buildPanel = panel({
-    title: "Build and artifact",
-    subtitle: "A seed is not a valid repro without this build identity",
-    tone: manifest.complete === false || manifest.error ? "bad" : undefined,
-    body: el(
-      "div",
-      {},
-      manifest.complete === false
-        ? notice("warn", "Incomplete artifact", manifest.error || "The writer did not finish.")
-        : null,
-      manifest.error ? notice("bad", "Artifact write error", manifest.error) : null,
-      campaign.refused ? notice("bad", "Refused campaign", "The harness declined to run this campaign.") : null,
-      kvList(
-        [
-          ["Build id", build.id || "—"],
-          ["Commit", build.commit || "—"],
-          ["Binary hash", build.binary_hash || "—"],
-          ["Mode", build.mode || "—"],
-          ["Compiler", build.compiler || "—"],
-          ["Host", build.host || "—"],
-          ["Dirty", build.dirty ? "yes" : "no"],
-          ["Created", wallTime(manifest.created_unix_ns)],
-          ["Completed", wallTime(manifest.completed_unix_ns)],
-        ],
-        { className: "kv--wide" },
-      ),
-      el(
-        "p",
-        { class: "notice notice--info" },
-        "Virtual times are simulation time; wall timestamps label artifact creation and are never the simulation axis.",
-      ),
-    ),
-  });
-
   return {
-    title: `${title} · Cosmos`,
+    title: `${campaignId} · Cosmos`,
     node: el(
       "div",
       { class: "page" },
@@ -534,7 +513,6 @@ export async function campaignView({ campaignId, signal }) {
         neverHitPanel,
         configPanel,
       ),
-      el("div", { class: "section-gap" }, buildPanel),
     ),
   };
 }

@@ -474,12 +474,11 @@ export async function universesView({ campaignId, signal }) {
     eyebrow: `Campaign / ${campaignId} / universes`,
     title: "Universe explorer",
     subtitle:
-      campaign.name ||
       "Every row is one replayable universe. Filters are client-side and the page is deep-linkable.",
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
-        label: campaign.name || campaignId,
+        label: campaignId,
         href: `/campaigns/${encodeURIComponent(campaignId)}`,
       },
       { label: "Universes" },
@@ -527,7 +526,7 @@ export async function universesView({ campaignId, signal }) {
   refresh();
 
   return {
-    title: `Universes · ${campaign.name || campaignId} · Cosmos`,
+    title: `Universes · ${campaignId} · Cosmos`,
     node: el(
       "div",
       { class: "page" },
