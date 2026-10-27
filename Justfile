@@ -44,6 +44,12 @@ ui-export dir="ui/fixtures/demo" id="demo" trials="4":
     cmake --build {{build_dir}} --parallel --target cosmos_ui_export
     {{build_dir}}/tools/cosmos_ui_export {{dir}} {{id}} {{trials}}
 
+# Level-2/3 exploration: coverage-guided campaign + fork-COW snapshot branches
+exploration-campaign root="build/ui-artifacts/exploration" trials="24":
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
+    cmake --build {{build_dir}} --parallel --target exploration_campaign
+    {{build_dir}}/tools/exploration_campaign {{root}} {{trials}}
+
 # Regenerate the checked-in fixture deterministically (fixed timestamps, zeroed wall time)
 ui-fixture:
     just ui-export ui/fixtures/demo demo 4

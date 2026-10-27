@@ -19,6 +19,7 @@
 //   replicated_kv_campaign --root build/ui-artifacts/replicated-kv --trials 256 --verify
 
 #include "cosmos/campaign.hpp"
+#include "cosmos/exploration.hpp"
 #include "cosmos/export.hpp"
 #include "cosmos/minimize.hpp"
 #include "cosmos/minimize_json.hpp"
@@ -85,6 +86,9 @@ struct Options {
     bool events = true;
     bool state = true;
     uint64_t minimize_per_finding = 1;
+    std::string guidance = "seeded";
+    bool coverage = false;
+    uint64_t initial_trials = 4;
 
     std::string build_id;
     std::string commit;
@@ -286,6 +290,10 @@ void usage(const char* argv0) {
         << "  --no-events             do not capture the inspection event stream\n"
         << "  --no-state              do not capture the final state document\n"
         << "  --minimize-per-finding N  failing seeds minimized per finding, 0 = none (default 1)\n"
+        << "  --guidance NAME         seeded | coverage (default seeded)\n"
+        << "  --coverage              collect compiler coverage without guided selection\n"
+        << "  --initial-trials N      initial seeded universes before coverage mutation (default "
+           "4)\n"
         << "  --seed N                run one seed directly (repro mode; no artifacts)\n"
         << "  --build-id ID           build identity (or COSMOS_BUILD_ID)\n"
         << "  --commit HASH           source commit (or COSMOS_BUILD_COMMIT)\n"
@@ -354,6 +362,19 @@ bool parse_args(int argc, char** argv, Options& opts, bool& show_help) {
         } else if (arg == "--minimize-per-finding") {
             const char* v = value("--minimize-per-finding");
             if (v == nullptr || !parse_u64(v, opts.minimize_per_finding)) return false;
+        } else if (arg == "--guidance") {
+            const char* v = value("--guidance");
+            if (v == nullptr) return false;
+            opts.guidance = v;
+            if (opts.guidance != "seeded" && opts.guidance != "coverage") {
+                std::cerr << "unknown --guidance: " << opts.guidance << "\n";
+                return false;
+            }
+        } else if (arg == "--coverage") {
+            opts.coverage = true;
+        } else if (arg == "--initial-trials") {
+            const char* v = value("--initial-trials");
+            if (v == nullptr || !parse_u64(v, opts.initial_trials)) return false;
         } else if (arg == "--seed") {
             const char* v = value("--seed");
             if (v == nullptr || !parse_u64(v, opts.seed)) return false;
@@ -428,6 +449,13 @@ int main(int argc, char** argv) {
         opts.parallel == 0 ? std::max(1u, std::thread::hardware_concurrency()) : opts.parallel;
     campaign.node_count = kNodes;
     campaign.verify = opts.verify;
+    // Guided selection is sequential by construction: the next seed depends on the previous
+    // novelty result. Seeded campaigns keep the requested worker count.
+    campaign.guidance =
+        opts.guidance == "coverage" ? cosmos::SeedGuidance::Coverage : cosmos::SeedGuidance::Seeded;
+    campaign.coverage = opts.coverage || campaign.guidance == cosmos::SeedGuidance::Coverage;
+    campaign.initial_trials = opts.initial_trials;
+    if (campaign.guidance == cosmos::SeedGuidance::Coverage) campaign.parallel = 1;
     campaign.trace = true;
     campaign.trace_capacity = opts.trace_capacity;
     campaign.events = opts.events;
@@ -461,11 +489,14 @@ int main(int argc, char** argv) {
     }
 
     // Precompute the realized plan for every universe in the parent. The workers use the same
-    // plan, and the parent keeps it for minimization after the campaign.
+    // plan, and the parent keeps it for minimization after the campaign. Guided selection chooses
+    // seeds in the parent, so its plan is derived from the seed inside the body instead.
     std::vector<FaultConfig> plans;
-    plans.reserve(static_cast<size_t>(opts.trials));
-    for (uint64_t index = 0; index < opts.trials; ++index) {
-        plans.push_back(make_plan(opts, index));
+    if (campaign.guidance == cosmos::SeedGuidance::Seeded) {
+        plans.reserve(static_cast<size_t>(opts.trials));
+        for (uint64_t index = 0; index < opts.trials; ++index) {
+            plans.push_back(make_plan(opts, index));
+        }
     }
 
     cosmos::ArtifactOptions artifact;
@@ -490,7 +521,13 @@ int main(int argc, char** argv) {
     std::map<uint64_t, std::string> trace_by_seed;
     const auto writer_sink = writer->sink();
     campaign.on_universe = [&](const cosmos::detail::UniverseOutcome& outcome) {
-        index_by_seed[outcome.seed] = outcome.index;
+        const auto [position, inserted] = index_by_seed.emplace(outcome.seed, outcome.index);
+        if (!inserted && position->second != outcome.index) {
+            std::cerr << "replicated_kv_campaign: warning: repeated universe seed " << outcome.seed
+                      << " at indices " << position->second << " and " << outcome.index
+                      << "; artifact rows are keyed by index, but per-seed "
+                         "lookups use the first index\n";
+        }
         if (!outcome.report.no_check_failed || outcome.died || !outcome.threw.empty()) {
             trace_by_seed[outcome.seed] = outcome.trace_bytes;
         }
@@ -498,14 +535,19 @@ int main(int argc, char** argv) {
     };
 
     std::cout << "campaign " << opts.id << ": " << opts.trials << " universes, base seed "
-              << opts.base_seed << ", mode " << opts.mode << ", parallel " << campaign.parallel
-              << ", verify " << (opts.verify ? "on" : "off") << "\n";
+              << opts.base_seed << ", mode " << opts.mode << ", guidance " << opts.guidance
+              << ", parallel " << campaign.parallel << ", verify " << (opts.verify ? "on" : "off")
+              << "\n";
     std::cout << "build " << opts.build_id << " commit " << short_commit(opts.commit)
               << (opts.dirty ? " dirty" : " clean") << " binary "
               << (opts.binary_hash.empty() ? "unknown" : opts.binary_hash.substr(0, 12)) << "\n";
 
     const cosmos::CampaignReport report = Campaign::run(
-        campaign, NodeUniverseFn([&plans](Simulator& sim, uint64_t index, uint32_t node_count) {
+        campaign,
+        NodeUniverseFn([&plans, &opts](Simulator& sim, uint64_t index, uint32_t node_count) {
+            if (opts.guidance == "coverage") {
+                return run_universe(sim, index, node_count, make_plan_for_seed(opts, sim.seed()));
+            }
             if (index >= plans.size()) {
                 ScenarioReport rejected;
                 rejected.seed = sim.seed();
@@ -545,14 +587,20 @@ int main(int argc, char** argv) {
             if (minimized_here >= opts.minimize_per_finding) break;
             if (minimized_findings.find(seed) != minimized_findings.end()) continue;
 
-            const auto index_it = index_by_seed.find(seed);
-            if (index_it == index_by_seed.end() || index_it->second >= plans.size()) {
-                if (!write_refused(seed, finding.id,
-                                   "the universe index was not recorded for this seed")) {
-                    return 1;
+            FaultConfig plan;
+            if (opts.guidance == "coverage") {
+                plan = make_plan_for_seed(opts, seed);
+            } else {
+                const auto index_it = index_by_seed.find(seed);
+                if (index_it == index_by_seed.end() || index_it->second >= plans.size()) {
+                    if (!write_refused(seed, finding.id,
+                                       "the universe index was not recorded for this seed")) {
+                        return 1;
+                    }
+                    ++minimized_here;
+                    continue;
                 }
-                ++minimized_here;
-                continue;
+                plan = plans[static_cast<size_t>(index_it->second)];
             }
 
             const auto trace_bytes = trace_by_seed.find(seed);
@@ -574,7 +622,7 @@ int main(int argc, char** argv) {
             }
 
             MinimizeConfig config;
-            config.plan = plans[static_cast<size_t>(index_it->second)];
+            config.plan = plan;
             config.finding_id = finding.id;
             config.node_count = kNodes;
             config.program = campaign.program;
@@ -589,6 +637,17 @@ int main(int argc, char** argv) {
             minimized_findings[seed] = finding.id;
             ++minimized;
             ++minimized_here;
+        }
+    }
+
+    if (campaign.coverage) {
+        cosmos::ExplorationReport exploration;
+        exploration.campaign = report;
+        std::ostringstream exploration_json;
+        cosmos::print_exploration_json(exploration_json, exploration);
+        if (auto written = writer->write_exploration(exploration_json.str()); !written) {
+            std::cerr << "replicated_kv_campaign: " << written.error() << "\n";
+            return 1;
         }
     }
 

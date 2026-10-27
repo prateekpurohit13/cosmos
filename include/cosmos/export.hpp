@@ -55,6 +55,8 @@ inline constexpr const char* kTraceDir = "traces";
 inline constexpr const char* kEventDir = "events";
 // Optional per-seed MinimizeReport documents; a campaign may have none.
 inline constexpr const char* kMinimizationDir = "minimizations";
+// Optional coverage/corpus and snapshot-branch report. Additive; a seeded campaign may omit it.
+inline constexpr const char* kExplorationFile = "exploration.json";
 
 struct BuildInfo {
     // Content address of the build. The caller supplies it; an empty id falls back to the binary
@@ -114,6 +116,9 @@ struct UniverseSummary {
     std::string events_path;  // relative to the campaign root, empty when absent
     std::string events_error; // nonempty when the capture was refused by the encoder
     std::string state_json;   // complete state object, empty when not captured
+    bool coverage_present = false;
+    uint64_t coverage_edges = 0;
+    uint64_t coverage_hash = 0;
     SiteCounterMap eligible_calls{};
     SiteCounterMap injections{};
     SiteActivationSet activated_sites{};
@@ -161,6 +166,9 @@ inline UniverseSummary summarize(const detail::UniverseOutcome& outcome) {
     if (summary.events_present) summary.events_path = event_relative_path(outcome.index);
     summary.events_error = outcome.events_error;
     summary.state_json = outcome.state_json;
+    summary.coverage_present = outcome.coverage_present;
+    summary.coverage_edges = outcome.coverage.edges;
+    summary.coverage_hash = outcome.coverage.hash;
 
     const ScenarioReport& report = outcome.report;
     summary.no_check_failed = report.no_check_failed;
@@ -357,6 +365,15 @@ inline void print_universe_json(std::ostream& out, const UniverseSummary& summar
     print_checks_json(out, summary.checks);
     out << ",\n  \"coverage\": ";
     print_coverage_json(out, summary.coverage);
+    out << ",\n  \"compiler_coverage\": {\"present\": ";
+    json::boolean(out, summary.coverage_present);
+    out << ", \"edges\": " << summary.coverage_edges << ", \"hash\": ";
+    if (summary.coverage_present) {
+        json::string(out, json::hex(summary.coverage_hash));
+    } else {
+        out << "null";
+    }
+    out << '}';
     out << ",\n  \"active_allocations\": " << summary.active_allocations;
     out << ",\n  \"out_of_scope_assertions\": " << summary.out_of_scope_assertions;
     out << ",\n  \"config_hash\": ";
@@ -416,7 +433,15 @@ inline void print_universe_row_json(std::ostream& out, const UniverseSummary& su
     print_events_json(out, summary);
     out << ", \"state_present\": ";
     json::boolean(out, !summary.state_json.empty());
-    out << '}';
+    out << ", \"compiler_coverage\": {\"present\": ";
+    json::boolean(out, summary.coverage_present);
+    out << ", \"edges\": " << summary.coverage_edges << ", \"hash\": ";
+    if (summary.coverage_present) {
+        json::string(out, json::hex(summary.coverage_hash));
+    } else {
+        out << "null";
+    }
+    out << "}}";
 }
 
 inline void print_build_json(std::ostream& out, const BuildInfo& build) {
@@ -440,7 +465,7 @@ inline void print_build_json(std::ostream& out, const BuildInfo& build) {
 inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
                                 const BuildInfo& build, std::string_view repro,
                                 int64_t created_unix_ns, int64_t completed_unix_ns, bool complete,
-                                std::string_view error) {
+                                std::string_view error, bool exploration_present = false) {
     const json::classic_locale_guard locale(out);
     out << "{\n";
     out << "  \"schema_version\": " << kArtifactSchemaVersion << ",\n";
@@ -466,6 +491,12 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     out << ", \"parent_seed\": " << config.base_seed << ", \"parallel\": " << config.parallel
         << ", \"node_count\": " << config.node_count << ", \"verify\": ";
     json::boolean(out, config.verify);
+    out << ", \"guidance\": ";
+    json::string(out, name_of(config.guidance));
+    out << ", \"coverage\": ";
+    json::boolean(out, config.coverage || config.guidance == SeedGuidance::Coverage);
+    out << ", \"initial_trials\": " << config.initial_trials
+        << ", \"max_corpus\": " << config.max_corpus;
     out << ", \"trace\": ";
     json::boolean(out, config.verify || config.trace);
     out << ", \"trace_capacity\": " << config.trace_capacity << ", \"events\": ";
@@ -488,6 +519,12 @@ inline void print_manifest_json(std::ostream& out, const CampaignConfig& config,
     json::string(out, kEventDir);
     out << ", \"minimization_dir\": ";
     json::string(out, kMinimizationDir);
+    out << ", \"exploration_file\": ";
+    if (exploration_present) {
+        json::string(out, kExplorationFile);
+    } else {
+        out << "null";
+    }
     out << "}\n}\n";
 }
 
@@ -651,6 +688,30 @@ class CampaignArtifactWriter {
     // optional and parent-side: minimization runs after the campaign, so this must be called
     // after the universe that owns the seed has arrived. The caller renders the document with
     // print_minimize_json(); an empty body is refused rather than written.
+    // Write the optional level-2/3 exploration document. It is observation data, written after the
+    // campaign and before finish(); the canonical trace and its hash are untouched.
+    std::expected<void, std::string> write_exploration(std::string_view json) {
+        if (finished_) return std::unexpected("the artifact writer is already finished");
+        if (!error_.empty()) return std::unexpected(error_);
+        if (json.empty()) {
+            fail("exploration document is empty");
+            return std::unexpected(error_);
+        }
+        if (json.find("\"schema_version\": 1") == std::string_view::npos ||
+            json.find("\"campaign_id\": \"" + options_.campaign.id + "\"") ==
+                std::string_view::npos) {
+            fail("exploration document does not identify this campaign and schema version");
+            return std::unexpected(error_);
+        }
+        if (auto written = export_detail::write_atomic(options_.root / kExplorationFile, json);
+            !written) {
+            fail(written.error());
+            return std::unexpected(error_);
+        }
+        exploration_written_ = true;
+        return {};
+    }
+
     std::expected<void, std::string> write_minimization(uint64_t seed, std::string_view json) {
         if (finished_) return std::unexpected("the artifact writer is already finished");
         if (!error_.empty()) return std::unexpected(error_);
@@ -814,7 +875,7 @@ class CampaignArtifactWriter {
             // Re-exporting the same campaign must not leave stale universe/trace files from a
             // larger previous run: a complete manifest plus leftover rows is a lying artifact.
             for (const char* name : {kUniverseDir, kTraceDir, kEventDir, kMinimizationDir,
-                                     kUniverseIndexFile, kCampaignFile}) {
+                                     kExplorationFile, kUniverseIndexFile, kCampaignFile}) {
                 std::filesystem::remove_all(root / name, error);
                 if (error) {
                     return std::unexpected("remove_all(" + (root / name).string() +
@@ -853,7 +914,7 @@ class CampaignArtifactWriter {
         std::ostringstream text;
         print_manifest_json(text, options_.campaign, options_.build, options_.repro,
                             created_unix_ns_, completed_unix_ns_,
-                            completed_unix_ns_ > 0 && error_.empty(), error_);
+                            completed_unix_ns_ > 0 && error_.empty(), error_, exploration_written_);
         return export_detail::write_atomic(options_.root / kManifestFile, text.str());
     }
 
@@ -915,6 +976,7 @@ class CampaignArtifactWriter {
     uint64_t written_ = 0;
     std::vector<uint64_t> seeds_;
     std::vector<uint64_t> minimized_seeds_;
+    bool exploration_written_ = false;
     std::string error_;
     bool finished_ = false;
 };

@@ -176,6 +176,12 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
         "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=openat"
+        "-Wl,--wrap=creat"
+        "-Wl,--wrap=unlink"
+        "-Wl,--wrap=rename"
+        "-Wl,--wrap=truncate"
+        "-Wl,--wrap=truncate64"
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
@@ -864,6 +870,12 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
         "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=openat"
+        "-Wl,--wrap=creat"
+        "-Wl,--wrap=unlink"
+        "-Wl,--wrap=rename"
+        "-Wl,--wrap=truncate"
+        "-Wl,--wrap=truncate64"
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
         "-Wl,--wrap=write"
@@ -956,6 +968,12 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=open64"
         "-Wl,--wrap=__open_2"
         "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=openat"
+        "-Wl,--wrap=creat"
+        "-Wl,--wrap=unlink"
+        "-Wl,--wrap=rename"
+        "-Wl,--wrap=truncate"
+        "-Wl,--wrap=truncate64"
         "-Wl,--wrap=read"
         "-Wl,--wrap=__read_chk"
     )
@@ -991,3 +1009,125 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         message(STATUS "test_workload_static skipped: no static libstdc++ for this toolchain")
     endif()
 endif()
+
+add_executable(test_coverage test_coverage.cpp)
+target_link_libraries(test_coverage PRIVATE cosmos)
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_coverage PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_coverage PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+add_test(NAME test_coverage COMMAND test_coverage)
+
+
+add_executable(test_snapshot test_snapshot.cpp)
+target_link_libraries(test_snapshot PRIVATE cosmos)
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_snapshot PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_snapshot PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=openat"
+        "-Wl,--wrap=creat"
+        "-Wl,--wrap=unlink"
+        "-Wl,--wrap=rename"
+        "-Wl,--wrap=truncate"
+        "-Wl,--wrap=truncate64"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=close"
+    )
+endif()
+add_test(NAME test_snapshot COMMAND test_snapshot)
+
+
+add_executable(test_exploration test_exploration.cpp)
+target_link_libraries(test_exploration PRIVATE cosmos)
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_exploration PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_exploration PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+    )
+endif()
+add_test(NAME test_exploration COMMAND test_exploration)
+
+# Static-libstdc++ twin: operator new reaches the wrappers here, which is the only configuration
+# in which a snapshot branch's check/collection bookkeeping would pollute the tracked heap.
+if (COSMOS_HAVE_STATIC_LIBSTDCXX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(test_snapshot_static test_snapshot.cpp)
+    target_link_libraries(test_snapshot_static PRIVATE cosmos)
+    target_compile_options(test_snapshot_static PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(test_snapshot_static PRIVATE
+        "-static-libstdc++"
+        "-Wl,--gc-sections"
+        "-Wl,--undefined=__wrap_realloc"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
+        "-Wl,--wrap=open"
+        "-Wl,--wrap=open64"
+        "-Wl,--wrap=__open_2"
+        "-Wl,--wrap=__open64_2"
+        "-Wl,--wrap=openat"
+        "-Wl,--wrap=creat"
+        "-Wl,--wrap=unlink"
+        "-Wl,--wrap=rename"
+        "-Wl,--wrap=truncate"
+        "-Wl,--wrap=truncate64"
+        "-Wl,--wrap=read"
+        "-Wl,--wrap=__read_chk"
+        "-Wl,--wrap=write"
+        "-Wl,--wrap=__write_chk"
+        "-Wl,--wrap=close"
+    )
+    add_test(NAME test_snapshot_static COMMAND test_snapshot_static)
+else()
+    message(STATUS "test_snapshot_static skipped: no static libstdc++ for this toolchain")
+endif()
+
+
+add_test(NAME test_exploration_campaign
+    COMMAND ${CMAKE_SOURCE_DIR}/tests/exploration_campaign_smoke.sh
+            $<TARGET_FILE:exploration_campaign>
+            ${CMAKE_CURRENT_BINARY_DIR}/exploration-smoke)
+set_tests_properties(test_exploration_campaign PROPERTIES
+    ENVIRONMENT "TMPDIR=${CMAKE_CURRENT_BINARY_DIR}")

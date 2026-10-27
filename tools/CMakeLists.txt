@@ -1,3 +1,6 @@
+# Tools assert their harness preconditions; a Release cache must not turn those checks off.
+add_compile_options(-UNDEBUG)
+
 # Phase-0/1 artifact exporter: a deterministic demo campaign written as the v1 UI layout.
 # The wrapped allocator is load-bearing: the demo's one explicit malloc must reach the injector.
 add_executable(cosmos_ui_export ui_export.cpp)
@@ -104,5 +107,25 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=calloc"
         "-Wl,--wrap=realloc"
         "-Wl,--wrap=clock_gettime"
+    )
+endif()
+
+# Level-2/3 exploration exporter: coverage-guided campaign plus fork-COW snapshot branches.
+add_executable(exploration_campaign exploration_campaign.cpp)
+target_link_libraries(exploration_campaign PRIVATE cosmos)
+
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(exploration_campaign PRIVATE
+        "-fno-builtin-malloc"
+        "-fno-builtin-free"
+        "-fno-builtin-calloc"
+        "-fno-builtin-realloc"
+    )
+    target_link_options(exploration_campaign PRIVATE
+        "-Wl,--gc-sections"
+        "-Wl,--wrap=malloc"
+        "-Wl,--wrap=free"
+        "-Wl,--wrap=calloc"
+        "-Wl,--wrap=realloc"
     )
 endif()
