@@ -2,7 +2,6 @@ import { api } from "../lib/api.js";
 import {
   badge,
   buildBadges,
-  buildContext,
   compareHref,
   copyButton,
   detailsBlock,
@@ -37,7 +36,6 @@ import {
 } from "../lib/compare.js";
 import { finiteTimeNs, traceStatusTone } from "../lib/trace.js";
 import { navigate } from "../lib/router.js";
-import { setBuildContext } from "../lib/shell.js";
 
 const MAX_RENDERED_DIFFS = 200;
 
@@ -985,7 +983,6 @@ export async function compareView({ campaignId, signal }) {
   const rows = (Array.isArray(data.universes) ? data.universes : []).filter(
     (row) => row && typeof row === "object" && typeof row.seed === "string",
   );
-  setBuildContext(buildContext(manifest));
 
   if (rows.length === 0) {
     return {

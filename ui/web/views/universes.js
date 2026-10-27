@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   emptyState,
   pageHeader,
   panel,
@@ -17,7 +16,6 @@ import {
   formatWallNs,
   shortId,
 } from "../lib/format.js";
-import { setBuildContext } from "../lib/shell.js";
 
 const PAGE_SIZE = 100;
 const STATUS_ORDER = ["failed", "crashed", "threw", "verify_failed", "vacuous", "passed"];
@@ -288,7 +286,6 @@ export async function universesView({ campaignId, signal }) {
   const seedsByFinding = findingSeedSets(findings);
   const state = normalizeState(readState(new URLSearchParams(window.location.search)), rows, findings);
 
-  setBuildContext(buildContext(manifest));
 
   const statuses = statusOptions(rows);
   const statusSelect = el(

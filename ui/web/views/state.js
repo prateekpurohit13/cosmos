@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   emptyState,
   kvList,
   notice,
@@ -11,7 +10,6 @@ import {
 } from "../lib/components.js";
 import { el, link } from "../lib/dom.js";
 import { formatAt, formatCount } from "../lib/format.js";
-import { setBuildContext } from "../lib/shell.js";
 
 const EVENT_ROW_LIMIT = 500;
 
@@ -520,7 +518,6 @@ export async function stateView({ campaignId, seed, signal }) {
   const universe = universeData.universe ?? {};
   const state = universe.state ?? null;
   const seedValue = universe.seed ?? seed;
-  setBuildContext(buildContext(manifest));
 
   let eventsPayload = null;
   let eventsError = null;

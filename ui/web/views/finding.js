@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   codeBlock,
   copyButton,
   emptyState,
@@ -27,7 +26,6 @@ import {
   formatRatio,
   shortId,
 } from "../lib/format.js";
-import { setBuildContext } from "../lib/shell.js";
 import { notFoundView } from "./not-found.js";
 
 const SEED_PAGE_SIZE = 100;
@@ -320,7 +318,6 @@ export async function findingView({ campaignId, findingId, signal }) {
       message: `Campaign ${campaignId} has no finding ${findingId}.`,
     });
   }
-  setBuildContext(buildContext(manifest));
 
   const seeds = findingSeeds(finding);
   const firstSeed = firstFindingSeed(finding);

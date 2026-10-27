@@ -151,6 +151,7 @@ textarea {
   top: 0;
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 1.1rem;
   min-height: 52px;
   padding: 0.4rem clamp(1rem, 3vw, 2rem);
@@ -193,32 +194,6 @@ textarea {
   font-size: 0.95rem;
   font-weight: 700;
   letter-spacing: 0.16em;
-}
-
-.build-context {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.35rem;
-  margin-left: auto;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 0.72rem;
-}
-
-.build-context code {
-  color: var(--text-soft);
-  font-family: var(--mono);
-}
-
-.build-context__label {
-  color: var(--faint);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.build-context__sep {
-  color: var(--line-strong);
 }
 
 .page {
@@ -1815,12 +1790,6 @@ pre {
   .topbar {
     flex-wrap: wrap;
     gap: 0.6rem;
-  }
-
-  .build-context {
-    order: 5;
-    width: 100%;
-    margin-left: 0;
   }
 
   .page {

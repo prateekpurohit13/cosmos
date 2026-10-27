@@ -2,7 +2,6 @@ import { api } from "../lib/api.js";
 import {
   badge,
   buildBadges,
-  buildContext,
   classChip,
   copyButton,
   emptyState,
@@ -35,7 +34,6 @@ import {
   siteStatus,
   vacuityAdvice,
 } from "../lib/faults.js";
-import { setBuildContext } from "../lib/shell.js";
 
 function compareFindings(left, right, runs) {
   const denominator = Number(runs) > 0 ? Number(runs) : 1;
@@ -311,7 +309,6 @@ export async function campaignView({ campaignId, signal }) {
   const neverHit = Array.isArray(campaign.never_hit) ? campaign.never_hit : [];
   const config = manifest.config ?? {};
 
-  setBuildContext(buildContext(manifest));
 
   const build = manifest.build ?? {};
   const title = campaign.name || campaignId;

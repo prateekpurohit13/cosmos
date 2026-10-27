@@ -12,7 +12,6 @@ import { errorView } from "./views/error.js";
 import { notFoundView } from "./views/not-found.js";
 import { el } from "./lib/dom.js";
 import { installLinkHandler, parseLocation } from "./lib/router.js";
-import { setBuildContext } from "./lib/shell.js";
 
 const THEME_KEY = "cosmos.theme";
 const main = document.getElementById("main");
@@ -145,7 +144,6 @@ async function render() {
   disposeView();
   main.setAttribute("aria-busy", "true");
   main.replaceChildren(loadingView());
-  setBuildContext();
   const samePath = previousPath !== null && previousPath === window.location.pathname;
   if (!samePath) window.scrollTo(0, 0);
 

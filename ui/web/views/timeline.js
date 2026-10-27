@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   classChip,
   codeBlock,
   compareHref,
@@ -50,7 +49,6 @@ import {
   traceEntryTone,
   traceSearchHelp,
 } from "../lib/trace.js";
-import { setBuildContext } from "../lib/shell.js";
 
 const PAGE_SIZE = 100;
 
@@ -464,7 +462,6 @@ export async function timelineView({ campaignId, seed, signal }) {
     },
   );
 
-  setBuildContext(buildContext(manifest));
 
   const droppedDeclared = Number.isInteger(trace.dropped);
   const droppedCount = droppedDeclared ? trace.dropped : null;

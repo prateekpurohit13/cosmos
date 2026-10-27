@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   classChip,
   codeBlock,
   compareHref,
@@ -30,7 +29,6 @@ import {
 } from "../lib/format.js";
 import { compareSites, isEventSite, siteClass, siteStatus } from "../lib/faults.js";
 import { finiteTimeNs } from "../lib/trace.js";
-import { setBuildContext } from "../lib/shell.js";
 
 const LEDGER_UI_LIMIT = 500;
 
@@ -380,7 +378,6 @@ export async function universeView({ campaignId, seed, signal }) {
       .filter((finding) => finding && typeof finding === "object")
       .map((finding) => String(finding.id)),
   );
-  setBuildContext(buildContext(manifest));
 
   const index = universe.index ?? "—";
   const status = universe.status ?? "unknown";

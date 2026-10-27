@@ -1,7 +1,6 @@
 import { api } from "../lib/api.js";
 import {
   badge,
-  buildContext,
   emptyState,
   notice,
   pageHeader,
@@ -12,7 +11,6 @@ import {
 import { el, link } from "../lib/dom.js";
 import { formatAt, formatCount, formatNs, shortId } from "../lib/format.js";
 import { navigate } from "../lib/router.js";
-import { setBuildContext } from "../lib/shell.js";
 
 function campaignHref(campaignId) {
   return `/campaigns/${encodeURIComponent(String(campaignId))}`;
@@ -332,7 +330,6 @@ export async function explorationView({ campaignId, signal }) {
     api.campaign(campaignId, signal),
   ]);
   const manifest = campaignData.manifest ?? {};
-  setBuildContext(buildContext(manifest));
   const title = `Exploration · ${campaignData.campaign?.name || campaignId}`;
   const coverage = exploration.coverage ?? {};
   const corpus = Array.isArray(coverage.corpus) ? coverage.corpus : [];

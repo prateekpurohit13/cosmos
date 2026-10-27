@@ -2,7 +2,6 @@ import { api } from "../lib/api.js";
 import {
   badge,
   buildBadges,
-  buildContext,
   classChip,
   codeBlock,
   copyButton,
@@ -25,7 +24,6 @@ import {
   formatPercent,
   formatRatio,
 } from "../lib/format.js";
-import { setBuildContext } from "../lib/shell.js";
 
 function findingLabel(findingId) {
   const text = String(findingId ?? "");
@@ -298,7 +296,6 @@ export async function minimizationView({ campaignId, seed, signal }) {
   const manifest = data.manifest ?? {};
   const universe = data.universe ?? {};
   const report = data.minimization ?? {};
-  setBuildContext(buildContext(manifest));
 
   const seedValue = String(universe.seed ?? seed);
   const present = report.present === true;

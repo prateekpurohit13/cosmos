@@ -1,7 +1,6 @@
-import { copyButton, el, frag, link } from "./dom.js";
+import { copyButton, el, link } from "./dom.js";
 import {
   formatCount,
-  shortCommit,
   statusLabel,
   statusTone,
 } from "./format.js";
@@ -265,13 +264,8 @@ export function reproIdentity(manifest, seed) {
 }
 
 export function buildBadges(manifest) {
-  const build = manifest?.build ?? {};
   const config = manifest?.config ?? {};
-  const badges = [
-    badge(build.id || "build unknown", "plain", build.id || undefined),
-    badge(build.mode || "mode unknown", "plain"),
-  ];
-  if (build.dirty) badges.push(badge("dirty", "warn", "The build had uncommitted changes."));
+  const badges = [];
   if (manifest?.complete === false) {
     badges.push(badge("incomplete", "warn", "The artifact writer did not finish."));
   }
@@ -283,31 +277,6 @@ export function buildBadges(manifest) {
     );
   }
   return badges;
-}
-
-export function buildContext(manifest) {
-  const build = manifest?.build ?? {};
-  const config = manifest?.config ?? {};
-  return frag(
-    el("span", { class: "build-context__label" }, "build"),
-    el("code", {}, build.id || "unknown"),
-    el("span", { class: "build-context__sep" }, "·"),
-    el("span", {}, build.mode || "—"),
-    el("span", { class: "build-context__sep" }, "·"),
-    el("code", {}, shortCommit(build.commit)),
-    config.verify ? el("span", { class: "badge badge--verify" }, "verify") : null,
-    build.dirty ? el("span", { class: "badge badge--warn" }, "dirty") : null,
-    manifest?.complete === false
-      ? el(
-          "span",
-          { class: "badge badge--warn", title: manifest.error || "The writer did not finish." },
-          "incomplete",
-        )
-      : null,
-    manifest?.error
-      ? el("span", { class: "badge badge--bad", title: manifest.error }, "write error")
-      : null,
-  );
 }
 
 export function kvList(items, { className = "" } = {}) {

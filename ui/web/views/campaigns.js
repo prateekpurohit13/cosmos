@@ -2,7 +2,6 @@ import { api } from "../lib/api.js";
 import { badge, emptyState, pageHeader, panel, statGrid } from "../lib/components.js";
 import { el, frag, link } from "../lib/dom.js";
 import { formatCount, formatUnixNs } from "../lib/format.js";
-import { setBuildContext } from "../lib/shell.js";
 
 function compareCampaigns(left, right) {
   const l = String(left?.campaign_id ?? "");
@@ -80,7 +79,6 @@ function cardContents(id, entry, config) {
 
 export async function campaignsView({ signal }) {
   const data = await api.campaigns(signal);
-  setBuildContext();
   const campaigns = [...(data.campaigns ?? [])]
     .filter((entry) => entry && typeof entry === "object")
     .sort(compareCampaigns);
