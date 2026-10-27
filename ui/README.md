@@ -18,7 +18,16 @@ nix develop -c just ui
 ```
 
 Open <http://127.0.0.1:8000/>. The default artifact root is `ui/fixtures`, which contains the
-checked-in `demo` campaign. To serve another artifact root:
+checked-in `demo` campaign. To generate and serve a replicated-KV campaign (the distributed
+example under the partition-plus-crash plan from `tests/test_distributed.cpp`):
+
+```sh
+nix develop -c just ui-rkv
+nix develop -c just ui root=build/ui-artifacts
+```
+
+The exporter writes `build/ui-artifacts/replicated-kv`, so the checked-in demo fixture remains
+the only campaign under `ui/fixtures`. To serve another artifact root:
 
 ```sh
 nix develop -c just ui root=/path/to/artifacts port=9000

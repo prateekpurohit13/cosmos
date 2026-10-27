@@ -3,6 +3,7 @@ set shell := ["bash", "-uc"]
 
 # Each devShell sets its own BUILD_DIR so toolchains never share a cmake cache.
 build_dir := env_var_or_default("BUILD_DIR", "build")
+rkv_artifacts := build_dir + "/ui-artifacts/replicated-kv"
 
 default:
     @just --list
@@ -47,6 +48,14 @@ ui-export dir="ui/fixtures/demo" id="demo" trials="4":
 ui-fixture:
     just ui-export ui/fixtures/demo demo 4
     python3 tools/normalise_ui_fixture.py ui/fixtures/demo
+
+# Export the replicated-KV distributed example as a UI campaign (partition + crash finding).
+# Written under the build directory so the checked-in demo fixture stays the only campaign the
+# UI contract tests see.
+ui-rkv dir=rkv_artifacts id="replicated-kv" trials="4":
+    cmake -B {{build_dir}} -DCOSMOS_BUILD_TESTS=ON
+    cmake --build {{build_dir}} --parallel --target replicated_kv_ui_export
+    {{build_dir}}/tools/replicated_kv_ui_export {{dir}} {{id}} {{trials}}
 
 # Format all C/C++ source and header files
 format:
