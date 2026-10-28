@@ -129,3 +129,6 @@ if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         "-Wl,--wrap=realloc"
     )
 endif()
+
+# Scripted single-universe demo driver (docs/demo/DEMO.md): one named fault plan per step.
+cosmos_add_replicated_kv_tool(cosmos_demo cosmos_demo.cpp)
