@@ -21,7 +21,6 @@ import { el, link } from "../lib/dom.js";
 import {
   findingSeeds,
   firstFindingSeed,
-  formatAt,
   formatCount,
   formatPercent,
   formatRatio,
@@ -249,8 +248,6 @@ function findingsBody(campaign, campaignId, manifest, seedIndex) {
             { class: "finding__meta" },
             finding.rare ? badge("rare", "warn") : null,
             seeds.length > 1 ? badge(`${formatCount(seeds.length)} seeds`, "plain") : null,
-            el("span", {}, formatAt(finding.at_ns)),
-            firstIndex !== undefined ? el("span", {}, `first #${formatCount(firstIndex)}`) : null,
           ),
         ),
         finding.detail
