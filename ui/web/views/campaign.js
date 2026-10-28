@@ -143,7 +143,7 @@ function vacuityBody(campaign) {
   if (vacuous.length === 0) {
     return emptyState({
       title: "No vacuous sites",
-      body: "Every site the configuration armed was reached and fired at least once. This is separate from findings.",
+      body: "Every site the configuration armed was reached and fired at least once.",
     });
   }
   const reasons = new Map();
@@ -216,12 +216,6 @@ function findingsBody(campaign, campaignId, manifest, seedIndex) {
   const findings = [...(campaign.findings ?? [])]
     .filter((finding) => finding && typeof finding === "object")
     .sort((left, right) => compareFindings(left, right, runs));
-  if (findings.length === 0) {
-    return emptyState({
-      title: "No findings",
-      body: "No assertion failed in this campaign. Check the vacuity group: a green campaign that armed nothing is not a clean one.",
-    });
-  }
   return el(
     "div",
     { class: "findings" },
@@ -364,7 +358,6 @@ export async function campaignView({ campaignId, signal }) {
       {
         label: "Failed",
         value: formatCount(campaign.failed_runs),
-        note: formatPercent(campaign.failed_runs, runs),
         tone: Number(campaign.failed_runs) > 0 ? "bad" : "ok",
       },
       Number(campaign.crashed_runs) > 0
@@ -381,7 +374,6 @@ export async function campaignView({ campaignId, signal }) {
       {
         label: "Vacuous sites",
         value: formatCount(vacuous.length),
-        note: "separate from findings",
         tone: vacuous.length > 0 ? "warn" : "ok",
       },
       Number(campaign.out_of_scope_assertions) > 0
@@ -398,7 +390,7 @@ export async function campaignView({ campaignId, signal }) {
     exploration.present || campaign.coverage?.enabled || explorationError
       ? panel({
           title: "Exploration",
-          subtitle: "Coverage corpus and fork-COW snapshot branches",
+          hint: "Coverage corpus and fork-COW snapshot branches.",
           count: Array.isArray(exploration.branches) ? exploration.branches.length : 0,
           actions: [
             link(`/campaigns/${encodeURIComponent(campaignId)}/exploration`, "Open exploration", {
@@ -436,12 +428,15 @@ export async function campaignView({ campaignId, signal }) {
         })
       : null;
 
-  const findingsPanel = panel({
-    title: "Findings",
-    hint: "Deduplicated by assertion id, ordered by prevalence then id.",
-    count: findings.length,
-    body: findingsBody(campaign, campaignId, manifest, seedIndex),
-  });
+  const findingsPanel =
+    findings.length > 0
+      ? panel({
+          title: "Findings",
+          hint: "Deduplicated by assertion id, ordered by prevalence then id.",
+          count: findings.length,
+          body: findingsBody(campaign, campaignId, manifest, seedIndex),
+        })
+      : null;
 
   const vacuityPanel = panel({
     title: "Vacuity",
@@ -451,42 +446,34 @@ export async function campaignView({ campaignId, signal }) {
     body: vacuityBody(campaign),
   });
 
-  const neverHitPanel = panel({
-    title: "Never hit",
-    subtitle: "Registered properties no universe reported as hit",
-    count: neverHit.length,
-    body:
-      neverHit.length > 0
-        ? el(
+  const neverHitPanel =
+    neverHit.length > 0
+      ? panel({
+          title: "Never hit",
+          hint: "Registered properties no universe reported as hit.",
+          count: neverHit.length,
+          className: "section-gap",
+          body: el(
             "ul",
             { class: "never-hit" },
             ...neverHit.map((id) => el("li", {}, badge(String(id), "info"))),
-          )
-        : emptyState({
-            title: "No never-hit properties",
-            body: "Every property that was registered in this campaign was hit at least once.",
-          }),
-  });
+          ),
+        })
+      : null;
 
   const configPanel = panel({
     title: "Launch configuration",
-    hint: "Template, not the per-universe realized config",
-    body: el(
-      "div",
-      {},
-      kvList([
-        ["Trials", formatCount(config.trials ?? campaign.runs)],
-        ["Base seed", String(config.base_seed ?? campaign.base_seed_dec ?? "—")],
-        ["Nodes", formatCount(config.node_count)],
-        ["Verify", config.verify ? "double-run" : "off"],
-      ]),
-      el(
-        "p",
-        { class: "notice notice--info" },
-        "Swarm sampling can vary the realized config per seed. Open a universe to see the config it actually ran.",
-      ),
-    ),
+    hint: "Template, not the per-universe realized config; swarm sampling can vary it per seed.",
+    className: "section-gap",
+    body: kvList([
+      ["Trials", formatCount(config.trials ?? campaign.runs)],
+      ["Base seed", String(config.base_seed ?? campaign.base_seed_dec ?? "—")],
+      ["Nodes", formatCount(config.node_count)],
+      ["Verify", config.verify ? "double-run" : "off"],
+    ]),
   });
+
+  const cockpit = [findingsPanel, vacuityPanel].filter(Boolean);
 
   return {
     title: `${campaignId} · Cosmos`,
@@ -496,20 +483,22 @@ export async function campaignView({ campaignId, signal }) {
       header,
       stats,
       explorationPanel,
-      el("div", { class: "cockpit" }, findingsPanel, vacuityPanel),
+      cockpit.length > 0
+        ? el(
+            "div",
+            { class: cockpit.length === 1 ? "cockpit cockpit--single" : "cockpit" },
+            ...cockpit,
+          )
+        : null,
       panel({
         title: "Site matrix",
-        subtitle: "Activated, eligible and fired across the campaign",
+        hint: "Activated, eligible and fired across the campaign.",
         body: siteMatrix(campaign),
         flush: true,
         className: "section-gap",
       }),
-      el(
-        "div",
-        { class: "grid-2 section-gap" },
-        neverHitPanel,
-        configPanel,
-      ),
+      neverHitPanel,
+      configPanel,
     ),
   };
 }

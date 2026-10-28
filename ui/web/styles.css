@@ -439,6 +439,14 @@ textarea {
   align-items: start;
 }
 
+.cockpit--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.panel + .cockpit {
+  margin-top: 1rem;
+}
+
 .stack {
   display: grid;
   gap: 1rem;
