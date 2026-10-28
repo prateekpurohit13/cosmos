@@ -9,7 +9,6 @@ import {
   emptyState,
   findingLink,
   kvList,
-  minimizationHref,
   notice,
   pageHeader,
   panel,
@@ -24,8 +23,6 @@ import {
   formatAt,
   formatCount,
   formatNs,
-  formatWallNs,
-  shortId,
 } from "../lib/format.js";
 import { compareSites, isEventSite, siteClass, siteStatus } from "../lib/faults.js";
 import { finiteTimeNs } from "../lib/trace.js";
@@ -78,6 +75,13 @@ function ledgerBody(universe) {
     });
   }
   const shown = ledger.slice(0, LEDGER_UI_LIMIT);
+  const ledgerColumns = {
+    outcome: shown.map((entry) => String(entry.outcome ?? "—")),
+    drew: shown.map((entry) => (entry.drew ? "yes" : "no")),
+    reason: shown.map((entry) => String(entry.reason ?? "—")),
+    persistent: shown.map((entry) => (entry.persistent ? "yes" : "no")),
+  };
+  const showLedgerColumn = (key) => new Set(ledgerColumns[key]).size > 1;
   const table = el(
     "div",
     { class: "table-wrap" },
@@ -94,12 +98,12 @@ function ledgerBody(universe) {
           el("th", { scope: "col", class: "num" }, "#"),
           el("th", { scope: "col", class: "num" }, "Virtual time"),
           el("th", { scope: "col" }, "Site"),
-          el("th", { scope: "col" }, "Outcome"),
+          showLedgerColumn("outcome") ? el("th", { scope: "col" }, "Outcome") : null,
           el("th", { scope: "col" }, "Status"),
-          el("th", { scope: "col" }, "Drew"),
+          showLedgerColumn("drew") ? el("th", { scope: "col" }, "Drew") : null,
           el("th", { scope: "col", class: "num" }, "Eligible"),
-          el("th", { scope: "col" }, "Reason"),
-          el("th", { scope: "col" }, "Persistent"),
+          showLedgerColumn("reason") ? el("th", { scope: "col" }, "Reason") : null,
+          showLedgerColumn("persistent") ? el("th", { scope: "col" }, "Persistent") : null,
         ),
       ),
       el(
@@ -112,7 +116,9 @@ function ledgerBody(universe) {
             el("td", { class: "num" }, formatCount(entry.fire_index)),
             el("td", { class: "num" }, formatAt(entry.at_ns)),
             el("td", {}, ledgerSiteCell(entry)),
-            el("td", {}, el("span", { class: "mono" }, entry.outcome ?? "—")),
+            showLedgerColumn("outcome")
+              ? el("td", {}, el("span", { class: "mono" }, entry.outcome ?? "—"))
+              : null,
             el(
               "td",
               {},
@@ -122,10 +128,14 @@ function ledgerBody(universe) {
                 entry.status ?? "—",
               ),
             ),
-            el("td", {}, entry.drew ? "yes" : "no"),
+            showLedgerColumn("drew") ? el("td", {}, entry.drew ? "yes" : "no") : null,
             el("td", { class: "num" }, formatCount(entry.eligible_index)),
-            el("td", {}, el("span", { class: "faint" }, entry.reason ?? "—")),
-            el("td", {}, entry.persistent ? "yes" : "no"),
+            showLedgerColumn("reason")
+              ? el("td", {}, el("span", { class: "faint" }, entry.reason ?? "—"))
+              : null,
+            showLedgerColumn("persistent")
+              ? el("td", {}, entry.persistent ? "yes" : "no")
+              : null,
           ),
         ),
       ),
@@ -172,6 +182,10 @@ function checksBody(universe, campaignId, seedValue, findingIds) {
       body: "This universe report has no check results.",
     });
   }
+  const checkTimes = new Set(
+    checks.map((check) => finiteTimeNs(check.at_ns)).filter((value) => value !== null),
+  );
+  const showCheckTime = checkTimes.size > 1;
   return el(
     "div",
     { class: "table-wrap" },
@@ -187,7 +201,7 @@ function checksBody(universe, campaignId, seedValue, findingIds) {
           {},
           el("th", { scope: "col" }, "Check"),
           el("th", { scope: "col" }, "Result"),
-          el("th", { scope: "col", class: "num" }, "Virtual time"),
+          showCheckTime ? el("th", { scope: "col", class: "num" }, "Virtual time") : null,
           el("th", { scope: "col" }, "Detail"),
         ),
       ),
@@ -214,25 +228,27 @@ function checksBody(universe, campaignId, seedValue, findingIds) {
               {},
               el("span", { class: `status status--${tone}` }, result),
             ),
-            el(
-              "td",
-              { class: "num" },
-              checkAt !== null
-                ? link(
-                    timelineHref(campaignId, seedValue, {
-                      checkId: failed ? check.id : null,
-                      atNs: checkAt,
-                    }),
-                    formatAt(checkAt),
-                    {
-                      class: "mono link--subtle",
-                      title: failed
-                        ? "Open the timeline at this failed check"
-                        : "Open the timeline at this check time",
-                    },
-                  )
-                : formatAt(check.at_ns),
-            ),
+            showCheckTime
+              ? el(
+                  "td",
+                  { class: "num" },
+                  checkAt !== null
+                    ? link(
+                        timelineHref(campaignId, seedValue, {
+                          checkId: failed ? check.id : null,
+                          atNs: checkAt,
+                        }),
+                        formatAt(checkAt),
+                        {
+                          class: "mono link--subtle",
+                          title: failed
+                            ? "Open the timeline at this failed check"
+                            : "Open the timeline at this check time",
+                        },
+                      )
+                    : formatAt(check.at_ns),
+                )
+              : null,
             el("td", { class: "text-soft" }, check.detail || "—"),
           );
         }),
@@ -300,69 +316,67 @@ function sitesBody(universe) {
       body: "This universe report does not carry per-site counters.",
     });
   }
+  const armed = sites.filter(([, row]) => Boolean(row?.activated));
+  const summary = armed.length
+    ? `${formatCount(armed.length)} armed · ${formatCount(sites.length - armed.length)} not activated in this universe`
+    : `No site was armed in this universe (${formatCount(sites.length)} not activated)`;
+  if (armed.length === 0) return el("p", { class: "sites-summary" }, summary);
   return el(
     "div",
-    { class: "table-wrap" },
+    {},
+    el("p", { class: "sites-summary" }, summary),
     el(
-      "table",
-      { class: "data data--sites" },
-      el("caption", { class: "sr-only" }, "Per-site counters in this universe"),
+      "div",
+      { class: "table-wrap" },
       el(
-        "thead",
-        {},
+        "table",
+        { class: "data data--sites" },
+        el("caption", { class: "sr-only" }, "Armed sites in this universe"),
         el(
-          "tr",
+          "thead",
           {},
-          el("th", { scope: "col" }, "Site"),
-          el("th", { scope: "col" }, "Class"),
-          el("th", { scope: "col" }, "Activated"),
-          el("th", { scope: "col", class: "num" }, "Eligible"),
-          el("th", { scope: "col", class: "num" }, "Fired"),
-          el("th", { scope: "col" }, "Status"),
-        ),
-      ),
-      el(
-        "tbody",
-        {},
-        ...sites.map(([site, row]) => {
-          const activated = Boolean(row?.activated);
-          const eligible = Number(row?.eligible ?? 0);
-          const fired = Number(row?.fired ?? 0);
-          const eventSite = isEventSite(site);
-          const state = eventSite
-            ? {
-                label: activated ? "armed" : "not activated",
-                tone: activated ? "ok" : "neutral",
-              }
-            : siteStatus(activated, eligible, fired);
-          const counterTitle = eventSite
-            ? "Episode site: starts and heals are recorded in the fault ledger and timeline, not in wrapper-call counters"
-            : undefined;
-          return el(
+          el(
             "tr",
             {},
-            el("td", {}, el("span", { class: "mono" }, site)),
-            el("td", {}, classChip(siteClass(site))),
-            el(
-              "td",
+            el("th", { scope: "col" }, "Site"),
+            el("th", { scope: "col" }, "Class"),
+            el("th", { scope: "col", class: "num" }, "Eligible"),
+            el("th", { scope: "col", class: "num" }, "Fired"),
+            el("th", { scope: "col" }, "Status"),
+          ),
+        ),
+        el(
+          "tbody",
+          {},
+          ...armed.map(([site, row]) => {
+            const eligible = Number(row?.eligible ?? 0);
+            const fired = Number(row?.fired ?? 0);
+            const eventSite = isEventSite(site);
+            const state = eventSite
+              ? { label: "armed", tone: "ok" }
+              : siteStatus(true, eligible, fired);
+            const counterTitle = eventSite
+              ? "Episode site: starts and heals are recorded in the fault ledger and timeline, not in wrapper-call counters"
+              : undefined;
+            return el(
+              "tr",
               {},
-              activated
-                ? el("span", { class: "status status--ok" }, "yes")
-                : el("span", { class: "status status--warn" }, "no"),
-            ),
-            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(eligible)),
-            el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(fired)),
-            el(
-              "td",
-              {},
+              el("td", {}, el("span", { class: "mono" }, site)),
+              el("td", {}, classChip(siteClass(site))),
+              el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(eligible)),
+              el("td", { class: "num", title: counterTitle }, eventSite ? "—" : formatCount(fired)),
               el(
-                "span",
-                { class: `status status--${state.tone}`, title: counterTitle },
-                state.label,
+                "td",
+                {},
+                el(
+                  "span",
+                  { class: `status status--${state.tone}`, title: counterTitle },
+                  state.label,
+                ),
               ),
-            ),
-          );
-        }),
+            );
+          }),
+        ),
       ),
     ),
   );
@@ -409,14 +423,6 @@ export async function universeView({ campaignId, seed, signal }) {
     universe.died ? badge(`signal ${formatCount(universe.signal)}`, "bad") : null,
     universe.threw ? badge("threw", "bad") : null,
   ].filter(Boolean);
-
-  const subtitle = el(
-    "span",
-    {},
-    "seed ",
-    el("code", { class: "inline-code" }, String(universe.seed ?? seed)),
-    universe.seed_hex ? el("span", { class: "faint" }, ` · ${universe.seed_hex}`) : null,
-  );
 
   const notices = [];
   if (!trace.present) {
@@ -472,9 +478,7 @@ export async function universeView({ campaignId, seed, signal }) {
   }
 
   const header = pageHeader({
-    eyebrow: `Campaign / ${campaignId} / universe`,
     title: `Universe #${formatCount(index)}`,
-    subtitle,
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
@@ -497,9 +501,6 @@ export async function universeView({ campaignId, seed, signal }) {
         firstFailedCheck ? "Open timeline at failure" : "Open timeline",
         { class: "btn btn--primary" },
       ),
-      link(`/campaigns/${encodeURIComponent(campaignId)}/universes`, "Back to universes", {
-        class: "btn btn--ghost",
-      }),
       link(compareHref(campaignId, seedValue), "Compare", {
         class: "btn btn--ghost",
         title: "Compare this universe with another universe in this campaign",
@@ -514,15 +515,6 @@ export async function universeView({ campaignId, seed, signal }) {
           title: "Inspect the captured scheduler, network, storage, memory and RNG state",
         },
       ),
-      link(minimizationHref(campaignId, seedValue), "Minimization", {
-        class: "btn btn--ghost",
-        title: "Open the exported MinimizeReport, or its explicit absence",
-      }),
-      copyButton(
-        invocation ?? identity,
-        invocation ? "Copy repro" : "Copy repro identity",
-        { class: "btn btn--ghost", title: invocation ?? identity },
-      ),
     ],
   });
 
@@ -533,7 +525,6 @@ export async function universeView({ campaignId, seed, signal }) {
       note: "simulation time",
       tone: "accent",
     },
-    { label: "Wall duration", value: formatWallNs(universe.wall_ns), note: "host time" },
     {
       label: "Checks",
       value: `${formatCount(failedChecks.length)} / ${formatCount(checks.length)}`,
@@ -546,47 +537,31 @@ export async function universeView({ campaignId, seed, signal }) {
       note: "fired / eligible calls",
       tone: fired > 0 ? "warn" : "neutral",
     },
-    {
-      label: "Active allocations",
-      value: formatCount(universe.active_allocations),
-      tone: Number(universe.active_allocations) > 0 ? "warn" : "ok",
-    },
-    {
-      label: "Out of scope",
-      value: formatCount(universe.out_of_scope_assertions),
-      tone: Number(universe.out_of_scope_assertions) > 0 ? "warn" : "neutral",
-    },
-    {
-      label: "Config hash",
-      value: shortId(universe.config_hash),
-      note: universe.config ? "realized config captured" : "no config",
-    },
-    {
-      label: "Trace",
-      value: trace.present ? shortId(trace.hash) : trace.traced ? "missing" : "not traced",
-      note: trace.present
-        ? Number.isInteger(trace.dropped)
-          ? trace.capacity
-            ? `capacity ${formatCount(trace.capacity)}`
-            : "no canonical bytes"
-          : "drop count not declared"
-        : "no canonical bytes",
-      tone: trace.present && Number.isInteger(trace.dropped) && trace.dropped === 0 ? "ok" : "warn",
-    },
-  ]);
+    Number(universe.active_allocations) > 0
+      ? {
+          label: "Active allocations",
+          value: formatCount(universe.active_allocations),
+          tone: "warn",
+        }
+      : null,
+    Number(universe.out_of_scope_assertions) > 0
+      ? {
+          label: "Out of scope",
+          value: formatCount(universe.out_of_scope_assertions),
+          tone: "warn",
+        }
+      : null,
+  ].filter(Boolean));
 
   const reproPanel = panel({
     title: "Repro",
-    subtitle: "Build-scoped identity; a command only when the artifact declares one",
+    hint: "Build-scoped identity; a command only when the artifact declares one",
     body: el(
       "div",
       {},
       kvList([
-        ["Program", manifest.program || "—"],
         ["Seed", String(seedValue)],
         ["Seed hex", universe.seed_hex || "—"],
-        ["Build id", manifest.build?.id || "—"],
-        ["Commit", manifest.build?.commit || "—"],
       ]),
       el(
         "div",
@@ -615,13 +590,12 @@ export async function universeView({ campaignId, seed, signal }) {
 
   const configPanel = panel({
     title: "Realized configuration",
-    subtitle: "The injector config this universe actually ran",
+    hint: "The injector config this universe actually ran",
     body: universe.config
       ? el(
           "div",
           {},
           kvList([
-            ["Config hash", universe.config_hash || "—"],
             ["Mode", universe.config.mode || "—"],
             [
               "Enabled classes",
@@ -657,7 +631,7 @@ export async function universeView({ campaignId, seed, signal }) {
 
   const rawPanel = panel({
     title: "Raw artifact",
-    subtitle: "The per-universe schema-v1 document",
+    hint: "The per-universe schema-v1 document",
     body: rawDetails(universe),
   });
 
@@ -674,20 +648,20 @@ export async function universeView({ campaignId, seed, signal }) {
         { class: "grid-2 section-gap" },
         panel({
           title: "Checks",
-          subtitle: "Assertions evaluated in this universe",
+          hint: "Assertions evaluated in this universe",
           count: checks.length,
           body: checksBody(universe, campaignId, seedValue, findingIds),
         }),
         panel({
           title: "Coverage",
-          subtitle: "Coverage notes reported by the application",
+          hint: "Coverage notes reported by the application",
           count: universe.coverage?.length ?? 0,
           body: coverageBody(universe),
         }),
       ),
       panel({
         title: "Fault ledger",
-        subtitle: "Canonical decision rows in decision order",
+        hint: "Canonical decision rows in decision order",
         count: universe.ledger?.length ?? 0,
         className: "section-gap",
         body: el(
@@ -705,7 +679,7 @@ export async function universeView({ campaignId, seed, signal }) {
       }),
       panel({
         title: "Sites",
-        subtitle: "Per-site counters captured at quiesce",
+        hint: "Per-site counters captured at quiesce",
         className: "section-gap",
         body: sitesBody(universe),
       }),

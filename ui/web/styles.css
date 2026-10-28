@@ -741,6 +741,13 @@ textarea {
   background: var(--green);
 }
 
+.sites-summary {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
 .vacuity-summary {
   margin: 0 0 0.6rem;
   color: var(--amber);
