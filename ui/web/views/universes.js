@@ -11,10 +11,7 @@ import {
 import { button, el, link } from "../lib/dom.js";
 import {
   formatCount,
-  formatNs,
   formatPercent,
-  formatWallNs,
-  shortId,
 } from "../lib/format.js";
 
 const PAGE_SIZE = 100;
@@ -43,7 +40,6 @@ function readState(params) {
   return {
     status: params.get("status") ?? "all",
     finding: params.get("finding") ?? "all",
-    verify: params.get("verify") ?? "all",
     q: params.get("q") ?? "",
     page: Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1),
   };
@@ -69,24 +65,14 @@ function normalizeState(state, rows, findings) {
   if (state.status !== "all" && !statuses.has(state.status)) state.status = "all";
   const findingIds = new Set(findings.map((finding) => String(finding.id)));
   if (state.finding !== "all" && !findingIds.has(state.finding)) state.finding = "all";
-  if (!["all", "ok", "failed", "off"].includes(state.verify)) state.verify = "all";
   return state;
 }
 
-function rowMatches(row, state, findingSeeds, campaign) {
+function rowMatches(row, state, findingSeeds) {
   if (state.status !== "all" && String(row.status) !== state.status) return false;
   if (state.finding !== "all") {
     const seeds = findingSeeds.get(state.finding);
     if (!seeds || !seeds.has(String(row.seed))) return false;
-  }
-  if (state.verify === "failed" && !(row.verify_failed || row.status === "verify_failed")) {
-    return false;
-  }
-  if (state.verify === "off" && campaign.verify) return false;
-  if (state.verify === "ok") {
-    if (!campaign.verify || row.verify_failed || row.status === "verify_failed") {
-      return false;
-    }
   }
   if (state.q) {
     const haystack = [
@@ -109,7 +95,6 @@ function updateUrl(state) {
   const params = new URLSearchParams();
   if (state.status !== "all") params.set("status", state.status);
   if (state.finding !== "all") params.set("finding", state.finding);
-  if (state.verify !== "all") params.set("verify", state.verify);
   if (state.q) params.set("q", state.q);
   if (state.page > 1) params.set("page", String(state.page));
   const query = params.toString();
@@ -117,39 +102,20 @@ function updateUrl(state) {
   window.history.replaceState(null, "", query ? `${path}?${query}` : path);
 }
 
-function th(label, className = "") {
-  return el("th", { scope: "col", class: className || undefined }, label);
+function th(label, className = "", hint) {
+  return el("th", { scope: "col", class: className || undefined, ...(hint ? { title: hint } : {}) }, label);
 }
 
-function traceCell(row) {
+// A trace is expected for every universe when the campaign traced, so a missing or truncated one is
+// an integrity gap worth flagging inline. Present hashes are opaque and live on the compare page.
+function traceWarning(row) {
   const trace = row.trace ?? {};
-  if (!trace.present) {
-    return el(
-      "span",
-      { class: "faint" },
-      trace.traced ? "missing" : "not traced",
-    );
-  }
-  const cell = el(
-    "span",
-    { class: "cluster" },
-    el("code", { class: "mono", title: String(trace.hash ?? "") }, shortId(trace.hash)),
-  );
-  if (Number(trace.dropped) > 0) {
-    cell.append(badge(`${formatCount(trace.dropped)} dropped`, "warn"));
-  }
-  return cell;
+  if (trace.traced && !trace.present) return badge("no trace", "warn");
+  if (Number(trace.dropped) > 0) return badge(`${formatCount(trace.dropped)} dropped`, "warn");
+  return null;
 }
 
-function verifyCell(row, campaign) {
-  if (!campaign.verify) return el("span", { class: "faint" }, "off");
-  if (row.verify_failed || row.status === "verify_failed") {
-    return statusBadge("verify_failed");
-  }
-  return el("span", { class: "status status--ok" }, "ok");
-}
-
-function universeTable(rows, campaign, campaignId) {
+function universeTable(rows, campaignId) {
   if (rows.length === 0) {
     return emptyState({
       title: "No universes match these filters",
@@ -169,17 +135,11 @@ function universeTable(rows, campaign, campaignId) {
         el(
           "tr",
           {},
-          th("Index", "num"),
-          th("Seed"),
-          th("Status"),
-          th("Virtual end", "num"),
-          th("Wall", "num"),
-          th("Checks", "num"),
-          th("Fired / eligible", "num"),
-          th("Active allocs", "num"),
-          th("Trace"),
-          th("Verify"),
-          th("Config", "num"),
+          th("Index", "num", "Universe index within the campaign; links to the universe"),
+          th("Seed", "", "Seed the universe ran with; links to the universe"),
+          th("Status", "", "Outcome of the universe: passed, failed, crashed, threw, vacuous"),
+          th("Checks", "num", "Failed checks / total checks"),
+          th("Fired / eligible", "num", "Fault injections fired / fault sites eligible to fire"),
         ),
       ),
       el(
@@ -200,9 +160,11 @@ function universeTable(rows, campaign, campaignId) {
               ),
             ),
             el("td", {}, seedLink(campaignId, row.seed)),
-            el("td", {}, statusBadge(row.status)),
-            el("td", { class: "num" }, formatNs(row.virtual_end_ns)),
-            el("td", { class: "num" }, formatWallNs(row.wall_ns)),
+            el(
+              "td",
+              {},
+              el("div", { class: "cluster" }, statusBadge(row.status), traceWarning(row)),
+            ),
             el(
               "td",
               { class: "num" },
@@ -219,18 +181,6 @@ function universeTable(rows, campaign, campaignId) {
               { class: "num" },
               `${formatCount(row.fired)} / ${formatCount(row.eligible)}`,
             ),
-            el("td", { class: "num" }, formatCount(row.active_allocations)),
-            el("td", {}, traceCell(row)),
-            el("td", {}, verifyCell(row, campaign)),
-            el(
-              "td",
-              { class: "num" },
-              el(
-                "code",
-                { class: "mono", title: String(row.config_hash ?? "") },
-                shortId(row.config_hash),
-              ),
-            ),
           );
         }),
       ),
@@ -245,8 +195,9 @@ function pager(state, totalPages, start, end, totalMatching, totalRows, onChange
     el(
       "span",
       {},
-      `${formatCount(start)}–${formatCount(end)} of ${formatCount(totalMatching)} matching ` +
-        `· ${formatCount(totalRows)} total · page ${formatCount(state.page)} of ${formatCount(totalPages)}`,
+      `${formatCount(start)}–${formatCount(end)} of ${formatCount(totalMatching)}` +
+        (totalMatching === totalRows ? "" : ` matching (${formatCount(totalRows)} total)`) +
+        ` · page ${formatCount(state.page)} of ${formatCount(totalPages)}`,
     ),
     el(
       "div",
@@ -315,28 +266,18 @@ export async function universesView({ campaignId, signal }) {
   );
   findingSelect.value = state.finding;
 
-  const verifySelect = el(
-    "select",
-    { id: "filter-verify", name: "verify" },
-    el("option", { value: "all" }, "All verify results"),
-    el("option", { value: "ok" }, "Verify ok (campaign enabled)"),
-    el("option", { value: "failed" }, "Verify mismatch"),
-    el("option", { value: "off" }, "Verify off (campaign)"),
-  );
-  verifySelect.value = state.verify;
-
   const searchInput = el("input", {
     id: "filter-search",
     name: "q",
     type: "search",
-    placeholder: "seed, index, status, hash…",
+    placeholder: "seed, index, status, finding…",
     autocomplete: "off",
     spellcheck: "false",
     value: state.q,
   });
 
   const summaryHost = el("div", {
-    class: "filter-summary",
+    class: "filter-summary sr-only",
     role: "status",
     "aria-live": "polite",
     tabindex: "-1",
@@ -347,7 +288,7 @@ export async function universesView({ campaignId, signal }) {
   const refresh = () => {
     const previousPager = document.activeElement?.closest?.("[data-pager-action]");
     const pagerAction = previousPager?.dataset.pagerAction;
-    const filtered = rows.filter((row) => rowMatches(row, state, seedsByFinding, campaign));
+    const filtered = rows.filter((row) => rowMatches(row, state, seedsByFinding));
     const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
     if (state.page > totalPages) state.page = totalPages;
     if (state.page < 1) state.page = 1;
@@ -368,9 +309,8 @@ export async function universesView({ campaignId, signal }) {
       `${formatCount(filtered.length)} matching of ${formatCount(rows.length)} universes` +
       (state.q ? ` · query ${JSON.stringify(state.q)}` : "") +
       (state.status !== "all" ? ` · status ${state.status}` : "") +
-      (state.finding !== "all" ? ` · finding ${state.finding}` : "") +
-      (state.verify !== "all" ? ` · verify ${state.verify}` : "");
-    const children = [universeTable(pageRows, campaign, campaignId)];
+      (state.finding !== "all" ? ` · finding ${state.finding}` : "");
+    const children = [universeTable(pageRows, campaignId)];
     if (filtered.length > 0) {
       children.push(
         pager(
@@ -401,7 +341,6 @@ export async function universesView({ campaignId, signal }) {
   const onFilterChange = () => {
     state.status = statusSelect.value;
     state.finding = findingSelect.value;
-    state.verify = verifySelect.value;
     state.q = searchInput.value;
     state.page = 1;
     refresh();
@@ -431,12 +370,6 @@ export async function universesView({ campaignId, signal }) {
     ),
     el(
       "div",
-      { class: "field" },
-      el("label", { for: "filter-verify" }, "Verify"),
-      verifySelect,
-    ),
-    el(
-      "div",
       { class: "field field--grow" },
       el("label", { for: "filter-search" }, "Search"),
       searchInput,
@@ -446,7 +379,6 @@ export async function universesView({ campaignId, signal }) {
       () => {
         statusSelect.value = "all";
         findingSelect.value = "all";
-        verifySelect.value = "all";
         searchInput.value = "";
         onFilterChange();
       },
@@ -454,7 +386,7 @@ export async function universesView({ campaignId, signal }) {
     ),
   );
 
-  for (const control of [statusSelect, findingSelect, verifySelect]) {
+  for (const control of [statusSelect, findingSelect]) {
     control.addEventListener("change", onFilterChange);
   }
   searchInput.addEventListener("input", onFilterChange);
@@ -468,13 +400,9 @@ export async function universesView({ campaignId, signal }) {
   const traceMissing = rows.filter(
     (row) => row.trace?.traced && !row.trace?.present,
   ).length;
-  const traceNotCaptured = rows.filter((row) => !row.trace?.traced).length;
 
   const header = pageHeader({
-    eyebrow: `Campaign / ${campaignId} / universes`,
     title: "Universe explorer",
-    subtitle:
-      "Every row is one replayable universe. Filters are client-side and the page is deep-linkable.",
     crumbs: [
       { label: "Campaigns", href: "/" },
       {
@@ -484,7 +412,7 @@ export async function universesView({ campaignId, signal }) {
       { label: "Universes" },
     ],
     actions: [
-      link(`/campaigns/${encodeURIComponent(campaignId)}`, "Campaign cockpit", {
+      link(`/campaigns/${encodeURIComponent(campaignId)}`, "Campaign", {
         class: "btn btn--primary",
       }),
     ],
@@ -492,36 +420,28 @@ export async function universesView({ campaignId, signal }) {
 
   const stats = statGrid([
     { label: "Universes", value: formatCount(rows.length), tone: "accent" },
-    { label: "Failed", value: formatCount(failed), tone: failed ? "bad" : "ok" },
-    { label: "Crashed / threw", value: formatCount(crashed), tone: crashed ? "bad" : "neutral" },
-    { label: "Vacuous", value: formatCount(vacuous), tone: vacuous ? "warn" : "neutral" },
     {
-      label: "Verify mismatch",
-      value: formatCount(verifyFailed),
-      tone: verifyFailed ? "verify" : "neutral",
-    },
-    {
-      label: "Trace missing",
-      value: formatCount(traceMissing),
-      note: traceMissing
-        ? "traced but absent"
-        : traceNotCaptured
-          ? "traces were off"
-          : "all traced",
-      tone: traceMissing ? "warn" : traceNotCaptured ? "neutral" : "ok",
-    },
-    {
-      label: "Prevalence",
-      value: formatPercent(failed, rows.length),
-      note: "failed / universes",
+      label: "Failed",
+      value: formatCount(failed),
+      note: formatPercent(failed, rows.length),
       tone: failed ? "bad" : "ok",
     },
-    {
-      label: "Configs",
-      value: formatCount(new Set(rows.map((row) => row.config_hash)).size),
-      note: "distinct realized hashes",
-    },
-  ]);
+    crashed > 0
+      ? { label: "Crashed / threw", value: formatCount(crashed), tone: "bad" }
+      : null,
+    vacuous > 0 ? { label: "Vacuous", value: formatCount(vacuous), tone: "warn" } : null,
+    verifyFailed > 0
+      ? { label: "Verify mismatch", value: formatCount(verifyFailed), tone: "verify" }
+      : null,
+    traceMissing > 0
+      ? {
+          label: "Trace missing",
+          value: formatCount(traceMissing),
+          note: "traced but absent",
+          tone: "warn",
+        }
+      : null,
+  ].filter(Boolean));
 
   refresh();
 
@@ -534,7 +454,7 @@ export async function universesView({ campaignId, signal }) {
       stats,
       panel({
         title: "Universes",
-        subtitle: "Ordered by universe index. The table is paginated; filters stay in the URL.",
+        hint: "Ordered by universe index. The table is paginated; filters stay in the URL.",
         body: el("div", {}, form, summaryHost, resultsHost),
         flush: true,
       }),
